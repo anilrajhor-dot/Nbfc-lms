@@ -660,7 +660,8 @@ const VERIFICATION_SERVICES = [
 const STAFF_HELP = [
   {section:"Getting Started", items:[
     {q:"How do I log in the first time?", a:"On first run, the Staff Login screen asks you to create the Super Admin account instead of logging in. After that, use the username/password you set. Only Super Admin can create further staff logins, under User Management."},
-    {q:"What do the different roles see?", a:"Every staff role can see Leads, Customers, Credit Appraisal, Sanction & Disbursement, Loan Accounts, Overdue & NPA/Recovery, Reminders, and AI Insights. Fund Management, Accounting, Loan Products, and Credit Policy are limited to Super Admin/Accounts/Operations Manager/Credit Manager. Only Super Admin sees User Management and Verification APIs."},
+    {q:"What do the different roles see?", a:"Every staff role can see Leads, Customers, Credit Appraisal, Sanction & Disbursement, Loan Accounts, Overdue & NPA/Recovery, Reminders, SHG/Rural Finance, and AI Insights. Fund Management, Accounting, Payroll & DSA, Loan Products, and Credit Policy are limited to Super Admin/Accounts/Operations Manager/Credit Manager. Only Super Admin sees User Management, Integrations, NBFC Profile, and Data Management."},
+    {q:"Is there help anywhere other than this tab?", a:"Yes — a 💬 button sits fixed in the corner of every screen (staff and borrower) for a quick question without navigating here. Same AI, works only inside Claude.ai until you connect your own key."},
   ]},
   {section:"Leads & Customers", items:[
     {q:"Where do borrower self-applications show up?", a:"When a borrower applies via the Borrower Portal, it creates a lead with source \"Mobile App / Website — Self Applied\" that appears on the Leads tab and the Dashboard's Recent Applications."},
@@ -682,9 +683,40 @@ const STAFF_HELP = [
     {q:"How do I assign a Recovery Officer?", a:"On the Overdue & NPA tab, use the dropdown in the Recovery Officer column for that account."},
   ]},
   {section:"Verification APIs & AI", items:[
-    {q:"Why do verification buttons say \"Not Configured\"?", a:"No KYC/fraud provider is wired in yet. Super Admin can set one up under Verification APIs — provider name, base URL, API key, and which checks are enabled."},
+    {q:"Why do verification buttons say \"Not Configured\"?", a:"No KYC/fraud provider is wired in yet. Super Admin can set one up under Integrations — provider name, base URL, API key, and which checks are enabled."},
     {q:"Is the AI Insights scoring a real ML model?", a:"No — it's a rule-based, fully explainable score built from data already in the system (bureau score, appraisal rating, loan classification, KYC flags). That's deliberate: every point is attributable, which matters for a regulated lender."},
-    {q:"Why does the AI Assistant say it can't connect?", a:"It calls Claude directly and only works while this file is running inside Claude.ai. Once deployed standalone (e.g. GitHub Pages), that tab needs your own API key/proxy to function."},
+    {q:"Why does the AI Assistant say it can't connect?", a:"It calls Claude directly and only works while this file is running inside Claude.ai. Once deployed standalone (e.g. GitHub Pages), that tab — and the floating help button in the corner — need your own API key/proxy to function."},
+  ]},
+  {section:"CMA Ratios & Auto-Sanction", items:[
+    {q:"What do the CMA ratio flags mean?", a:"On the Appraisal form's CMA section, Current Ratio, Debt-Equity, DSCR and FOIR each get a Good/Caution/High Risk flag against common Indian bank/NBFC rule-of-thumb bands — not a fixed regulatory standard. Your Credit Policy should set the final threshold for sanctioning."},
+    {q:"How does auto-sanction work?", a:"Super Admin can set rules per product (Loan Products tab) and enable \"auto-sanction.\" If an appraisal recommends Approve and every rule passes, the loan is sanctioned instantly, bypassing the human Maker-Checker step — logged distinctly as machine-decided. It still respects fund availability, product limits, and exposure caps."},
+    {q:"Why didn't disbursement happen automatically?", a:"Auto-sanction only auto-disburses if a real bank payout provider is configured under Integrations. Otherwise the loan sits Approved, waiting in the normal manual Disburse queue — nothing pretends money moved when it didn't."},
+  ]},
+  {section:"Accounting", items:[
+    {q:"Where do I record rent, salaries, or other office expenses?", a:"Accounting tab → Journal & Expenses. Each entry debits or credits a Fund Account, same as a disbursement or EMI collection."},
+    {q:"Why is my journal entry \"Pending Approval\" instead of posted?", a:"If the amount exceeds your role's self-authorized limit (set in Credit Policy → Journal/Expense Transaction Limits), it needs a different officer to approve before it posts — same Maker-Checker principle as Sanctions."},
+    {q:"What's the Trial Balance's \"Accumulated Surplus/Deficit\" line?", a:"It's a balancing figure, not a separately tracked account — cross-check it against Net Surplus on the Income Statement. A big gap usually means a Fund Account balance was manually adjusted outside a recorded transaction."},
+    {q:"How do I export for Tally?", a:"Accounting tab → \"Export to Tally\" — a CSV in a Tally-importable column layout, posted entries only. True Tally XML import needs your Tally version's exact schema; validate with your accountant."},
+  ]},
+  {section:"Ratios, Compliance & RBI Returns", items:[
+    {q:"Is the Capital Adequacy Proxy the real CRAR?", a:"No — real CRAR needs Tier I/II capital classification and risk-weighted assets per RBI's Scale Based Regulation, which this app doesn't track. The proxy assumes flat 100% risk weight. Never use it for a regulatory filing."},
+    {q:"What is the RBI Returns Tracker for?", a:"A self-managed log of filing periods and due dates against a reference list of typical non-deposit-taking NBFC returns (NBS-9, DNBS-10, etc.). It doesn't file anything with RBI — mark each as submitted once you've actually filed it. Overdue ones show on the Dashboard for Super Admin/Managing Director and in the Notifications bell."},
+    {q:"What's the difference between Compliance Checklist and Year-End Closing?", a:"Same checklist, different categories — Year-End Closing is specifically the post-audit tasks (Board approval, AGM, NPA provisioning finalization, RoC filings) that only apply once a year."},
+  ]},
+  {section:"Payroll & DSA", items:[
+    {q:"Why do I enter deduction amounts instead of PF/ESI percentages?", a:"PF, ESI and Professional Tax rates and caps vary by state and change over time. Entering wrong hardcoded percentages would be worse than not having them — enter the actual amount for each staff member."},
+    {q:"How does DSA commission get calculated?", a:"Set a commission % per product under Loan Products (Super Admin). Link a lead to a DSA when creating it. The moment that lead's loan is disbursed, commission accrues automatically into the DSA's ledger — \"Pay Commissions\" settles it."},
+    {q:"What happens if I run payroll without a payout provider configured?", a:"It still records the Salaries expense and deducts the fund account, but marks each as \"Manual — Pending Transfer\" instead of \"Paid\" — nothing is falsely marked as transferred."},
+  ]},
+  {section:"SHG / Rural Finance", items:[
+    {q:"What are RF and CIF?", a:"DAY-NRLM terms — Revolving Fund and Community Investment Fund, the two grant support amounts an SHG typically receives. Recorded on the SHG Group profile."},
+    {q:"Are SHG internal loans the same as regular loan accounts?", a:"No — they're informal lending from the group's own savings/corpus to a member, tracked separately from bank loans in Loan Accounts. No EMI schedule, just amount, purpose, and a \"Mark Repaid\" action."},
+    {q:"Can I edit the Micro Enterprise templates?", a:"Yes, Super Admin only — Edit or Delete on any row, or \"+ New Template\" to add one. They're illustrative starting assumptions for income assessment, not authoritative figures."},
+  ]},
+  {section:"Fund Management, Reports & Settings", items:[
+    {q:"What does the 15-Day Funds Projection actually predict?", a:"Only the collections side — today's Available Funds plus each day's scheduled EMI collections, assuming on-time payment. It doesn't assume any future disbursements, expenses, or payroll, since none of those have a scheduled future date anywhere in the app."},
+    {q:"How do I back up my data?", a:"Data Management tab (Super Admin) → \"Download Full Backup (JSON)\" — every collection in one file. \"Restore from File\" merges a backup back in; per-collection \"Clear\" requires typing DELETE to confirm."},
+    {q:"Where do I set up the NBFC's official details?", a:"NBFC Profile tab (Super Admin) — Name, Address, RBI Registration Number, CIN, GST, PAN, TAN. Once filled in, it appears as a letterhead at the top of every printed Sanction Letter."},
   ]},
 ];
 
