@@ -355,6 +355,50 @@ async function computePortfolioRisk(loanAccounts, payments){
 }
 
 /* ---------------------------------------------------------------------
+   Ratios & Compliance
+   ---------------------------------------------------------------------
+   Ratios are split into two honesty tiers:
+   - "solid": computed directly and reliably from data already in the app.
+   - "proxy": a labeled approximation of a real prudential ratio that this
+     app's data model cannot fully support (e.g. true CRAR needs Tier I/II
+     capital classification and risk-weighted assets per RBI's detailed
+     matrix — well beyond what's tracked here). These are never presented
+     without a warning, and must never be used for actual regulatory
+     reporting or decisions — verify with your statutory auditor.
+   --------------------------------------------------------------------- */
+async function computeFinancialRatios(){
+  const loanAccounts = await db.getAll("loanAccounts");
+  const payments = await db.getAll("payments");
+  const fundAccounts = await db.getAll("fundAccounts");
+  const riskPos = await computePortfolioRisk(loanAccounts, payments);
+  const acct = await computeAccountingSummary();
+
+  const grossPortfolio = riskPos.totalOutstanding;
+  const grossNpaRatio = grossPortfolio>0 ? (riskPos.npaAmount/grossPortfolio)*100 : 0;
+  const netNpaAmount = Math.max(0, riskPos.npaAmount - acct.npaProvision);
+  const netNpaRatio = grossPortfolio>0 ? (netNpaAmount/Math.max(1,(grossPortfolio-acct.npaProvision)))*100 : 0;
+  const provisioningCoverageRatio = riskPos.npaAmount>0 ? (acct.npaProvision/riskPos.npaAmount)*100 : 0;
+
+  const capital = fundAccounts.filter(a=>a.type==="Capital").reduce((s,a)=>s+a.balance,0);
+  const borrowings = fundAccounts.filter(a=>a.type==="Borrowing").reduce((s,a)=>s+a.balance,0);
+  const debtToEquity = capital>0 ? borrowings/capital : null;
+
+  const totalAssets = acct.cashBankBalance + acct.portfolioOutstanding;
+  const returnOnAssets = totalAssets>0 ? (acct.netSurplus/totalAssets)*100 : 0;
+  const yieldOnAdvances = grossPortfolio>0 ? (acct.interestIncome/grossPortfolio)*100 : 0;
+
+  // Capital Adequacy proxy — NOT statutory CRAR. Flat 100% risk-weight
+  // assumption on the loan book, capital = fund accounts typed "Capital".
+  const capitalAdequacyProxy = grossPortfolio>0 ? (capital/grossPortfolio)*100 : null;
+
+  return {
+    grossNpaRatio, netNpaRatio, provisioningCoverageRatio, par: riskPos.par,
+    collectionEfficiency: riskPos.collectionEfficiency, debtToEquity, returnOnAssets,
+    yieldOnAdvances, capitalAdequacyProxy, capital, borrowings, grossPortfolio, netNpaAmount
+  };
+}
+
+/* ---------------------------------------------------------------------
    Phase 7: Accounting (simplified single-entry ledger for MIS purposes)
    --------------------------------------------------------------------- */
 function installmentSplit(payment, loanAccount){
@@ -370,6 +414,7 @@ async function computeAccountingSummary(){
   const payments = await db.getAll("payments");
   const loanAccounts = await db.getAll("loanAccounts");
   const products = await db.getAll("products");
+  const journalEntries = await db.getAll("journalEntries");
   const productMap = {}; products.forEach(p=>productMap[p.name]=p);
   const loanMap = {}; loanAccounts.forEach(a=>loanMap[a.id]=a);
 
@@ -391,11 +436,21 @@ async function computeAccountingSummary(){
     return { date:p.date, particulars:"EMI Collected ("+(acc?acc.product:"—")+")", ref:p.id, debit:0, credit:p.amount, principal:split.principal, interest:split.interest };
   });
 
+  let otherIncome=0, operatingExpenses=0;
+  const postedJournalEntries = journalEntries.filter(j=> !j.status || j.status==="Posted");
+  const journalEntryRows = postedJournalEntries.map(j=>{
+    if(j.type==="Income") otherIncome += j.amount; else operatingExpenses += j.amount;
+    return {
+      date:j.date, particulars:(j.type==="Income"?"Income: ":"Expense: ")+j.category+(j.description?" — "+j.description:""),
+      ref:j.id, debit: j.type==="Expense"?j.amount:0, credit: j.type==="Income"?j.amount:0
+    };
+  });
+
   const riskPos = await computePortfolioRisk(loanAccounts, payments);
   const npaProvision = riskPos.analyzed.reduce((s,a)=>s+a.provisioningAmount,0);
 
-  const totalIncome = interestIncome + processingFeeIncome;
-  const netSurplus = totalIncome - npaProvision;
+  const totalIncome = interestIncome + processingFeeIncome + otherIncome;
+  const netSurplus = totalIncome - npaProvision - operatingExpenses;
 
   const fundAccounts = await db.getAll("fundAccounts");
   const cashBankBalance = fundAccounts.reduce((s,a)=>s+a.balance,0);
@@ -403,9 +458,11 @@ async function computeAccountingSummary(){
   const capitalAndBorrowings = fundAccounts.filter(a=>["Capital","Borrowing"].includes(a.type)).reduce((s,a)=>s+a.balance,0);
 
   return {
-    disbursementEntries, collectionEntries, principalDisbursed, principalCollected,
-    processingFeeIncome, gstOnFees, interestIncome, totalIncome, npaProvision, netSurplus,
-    cashBankBalance, portfolioOutstanding, capitalAndBorrowings, fundAccounts
+    disbursementEntries, collectionEntries, journalEntryRows, journalEntries,
+    principalDisbursed, principalCollected,
+    processingFeeIncome, gstOnFees, interestIncome, otherIncome, operatingExpenses,
+    totalIncome, npaProvision, netSurplus,
+    cashBankBalance, portfolioOutstanding, capitalAndBorrowings, fundAccounts, riskPos
   };
 }
 
@@ -418,6 +475,24 @@ function downloadCSV(filename, headers, rows){
   a.href = url; a.download = filename; document.body.appendChild(a); a.click();
   document.body.removeChild(a); URL.revokeObjectURL(url);
 }
+
+function downloadJSON(filename, obj){
+  const blob = new Blob([JSON.stringify(obj, null, 2)], {type:"application/json;charset=utf-8;"});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url; a.download = filename; document.body.appendChild(a); a.click();
+  document.body.removeChild(a); URL.revokeObjectURL(url);
+}
+
+/* ---------------------------------------------------------------------
+   Data Management: full registry of every collection this app uses,
+   for backup / restore / delete.
+   --------------------------------------------------------------------- */
+const ALL_COLLECTIONS = [
+  "staff","borrowers","leads","customers","products","appraisals","policyConfig",
+  "fundAccounts","sanctions","disbursements","loanAccounts","payments","reminders",
+  "recoveryVisits","apiConfig","journalEntries","complianceItems","rbiReturnFilings","auditLog","meta"
+];
 
 /* ---------------------------------------------------------------------
    Phase 8: AI Insights — rule-based, explainable scoring (no black-box
@@ -545,6 +620,8 @@ const VERIFICATION_SERVICES = [
   {key:"litigation", label:"Court / Litigation Search",    defaultEndpoint:"/api/v1/court/search"},
   {key:"bureau",     label:"Credit Bureau / Defaulter Check", defaultEndpoint:"/api/v1/bureau/check"},
   {key:"aml",        label:"AML / Sanctions & PEP Screening", defaultEndpoint:"/api/v1/aml/screen"},
+  {key:"whatsapp",   label:"WhatsApp Messaging",           defaultEndpoint:"/api/v1/whatsapp/send"},
+  {key:"email",      label:"Email Messaging",              defaultEndpoint:"/api/v1/email/send"},
 ];
 
 const STAFF_HELP = [
@@ -604,7 +681,7 @@ async function getApiConfig(){
 async function callVerificationApi(serviceKey, payload){
   const cfg = await getApiConfig();
   if(!cfg.baseUrl || !cfg.apiKey || !cfg[serviceKey+"Enabled"]){
-    return { ok:false, status:"Not Configured", raw:null, error:"No provider configured for this check yet — set it up under Verification APIs (Super Admin)." };
+    return { ok:false, status:"Not Configured", raw:null, error:"No provider configured for this yet — set it up under Integrations (Super Admin)." };
   }
   try{
     const url = cfg.baseUrl.replace(/\/$/,"") + cfg[serviceKey+"Endpoint"];
@@ -618,8 +695,17 @@ async function callVerificationApi(serviceKey, payload){
     const status = parseVerifyResponse(raw);
     return { ok:true, status, raw, error:null };
   } catch(err){
-    return { ok:false, status:"Error", raw:null, error: "Request failed — likely a CORS restriction (many verification APIs must be called from a backend, not a browser) or an unreachable endpoint. Network access from this environment may also be restricted." };
+    return { ok:false, status:"Error", raw:null, error: "Request failed — likely a CORS restriction (many provider APIs must be called from a backend, not a browser) or an unreachable endpoint. Network access from this environment may also be restricted." };
   }
+}
+
+/** Send a WhatsApp or Email message via whatever provider is configured
+ *  under Integrations. Payload shape is a best-effort common shape
+ *  (to, subject, message) — rename fields per your chosen vendor's docs
+ *  once one is picked. Falls back to a clear "not configured" result
+ *  rather than pretending to have sent anything. */
+async function sendMessage(channel, to, subject, message){
+  return await callVerificationApi(channel, { to, subject, message });
 }
 
 /** Best-effort status extraction — every vendor's response shape differs.
@@ -662,6 +748,10 @@ async function computeNotifications(){
   const npaCount = riskPos.analyzed.filter(a=>NPA_CLASSES.includes(a.classification)).length;
   if(npaCount>0) items.push({label:`${npaCount} account(s) classified NPA`, tab:"overdue"});
   if(emiPos.emiDueTodayCount>0) items.push({label:`${emiPos.emiDueTodayCount} EMI(s) due today (${fmtINR(emiPos.emiDueTodayAmount)})`, tab:"loanaccounts"});
+  const overdueReturns = await computeOverdueRbiReturns();
+  if(overdueReturns.length>0) items.push({label:`${overdueReturns.length} RBI return(s) overdue: ${overdueReturns.map(f=>f.code).join(", ")}`, tab:"ratios"});
+  const journalPending = (await db.getAll("journalEntries")).filter(j=>j.status==="Pending Approval").length;
+  if(journalPending>0) items.push({label:`${journalPending} journal/expense entr${journalPending===1?'y':'ies'} awaiting approval`, tab:"accounting"});
 
   return items;
 }
@@ -808,16 +898,16 @@ function analyzeLoanAccount(acc, productMap, policy){
 }
 
 function defaultProducts(){
-  const base = {tenureMin:6, tenureMax:36, emiFrequency:"Monthly", processingFeePct:1, insurancePct:0.5, penaltyRatePct:2, gstPct:18, moratoriumMonths:0, securityRequired:"No", active:true};
+  const base = {tenureMin:6, tenureMax:36, emiFrequency:"Monthly", processingFeePct:1, insurancePct:0.5, penaltyRatePct:2, gstPct:18, moratoriumMonths:0, securityRequired:"No", active:true, maxLoanAmount:200000};
   const overrides = {
-    "Business Loan": {interestRate:18, tenureMax:48, securityRequired:"Yes"},
-    "MSME Loan": {interestRate:16, tenureMax:60, securityRequired:"Yes"},
-    "SHG Loan": {interestRate:12, tenureMax:24},
-    "Joint Liability Group Loan": {interestRate:14, tenureMax:24},
-    "Gold Loan": {interestRate:11, tenureMax:12, securityRequired:"Yes", moratoriumMonths:0},
-    "Personal Loan": {interestRate:22, tenureMax:36},
-    "Consumer Loan": {interestRate:20, tenureMax:24},
-    "Emergency Loan": {interestRate:24, tenureMax:12, processingFeePct:0.5},
+    "Business Loan": {interestRate:18, tenureMax:48, securityRequired:"Yes", maxLoanAmount:1000000},
+    "MSME Loan": {interestRate:16, tenureMax:60, securityRequired:"Yes", maxLoanAmount:2000000},
+    "SHG Loan": {interestRate:12, tenureMax:24, maxLoanAmount:300000},
+    "Joint Liability Group Loan": {interestRate:14, tenureMax:24, maxLoanAmount:300000},
+    "Gold Loan": {interestRate:11, tenureMax:12, securityRequired:"Yes", moratoriumMonths:0, maxLoanAmount:1500000},
+    "Personal Loan": {interestRate:22, tenureMax:36, maxLoanAmount:200000},
+    "Consumer Loan": {interestRate:20, tenureMax:24, maxLoanAmount:150000},
+    "Emergency Loan": {interestRate:24, tenureMax:12, processingFeePct:0.5, maxLoanAmount:50000},
   };
   return LOAN_PRODUCTS.map(name=> ({ id: uid("prd"), name, ...base, ...(overrides[name]||{}), createdAt: nowISO() }));
 }
@@ -825,6 +915,7 @@ function defaultPolicyConfig(){
   return {
     id: "default",
     delegation: DELEGATION_ROLES.map((role,i)=>({role, maxAmount:[200000,1000000,2500000,5000000,10000000][i]})),
+    journalLimits: DELEGATION_ROLES.map((role,i)=>({role, maxAmount:[5000,25000,50000,100000,500000][i]})),
     exposure: { maxBorrowerExposure: 2500000, maxSectorExposurePct: 25, maxBranchExposurePct: 15 },
     ltv: LTV_PRODUCTS.map(p=>({product:p, maxLtvPct: p==="Gold Loan"?75:60})),
     pricing: [ {riskCategory:"Low", minRate:12, maxRate:16}, {riskCategory:"Medium", minRate:16, maxRate:22}, {riskCategory:"High", minRate:22, maxRate:28} ],
@@ -900,6 +991,32 @@ async function ensureSeedPhase4(){
   });
   await db.put("meta", {key:"seededPhase4", value:true});
   await logAudit("System", "System", "Fund Source Seeded", "Demo opening balance of ₹50,00,000 created — replace with actual capital/bank figures before real use");
+}
+
+async function ensureSeedCompliance(){
+  const flag = await db.get("meta","seededCompliance");
+  if(flag) return;
+  for(const it of DEFAULT_COMPLIANCE_ITEMS){
+    await db.put("complianceItems", {
+      id: uid("cmp"), category: it.category, item: it.item, status:"Not Started",
+      notes:"", updatedBy:null, updatedAt:null, createdAt: nowISO()
+    });
+  }
+  await db.put("meta", {key:"seededCompliance", value:true});
+  await logAudit("System", "System", "Compliance Checklist Seeded", `${DEFAULT_COMPLIANCE_ITEMS.length} default items created — a self-tracking checklist, not a regulatory filing system`);
+}
+
+async function ensureSeedYearEndClosing(){
+  const flag = await db.get("meta","seededYearEndClosing");
+  if(flag) return;
+  for(const it of YEAR_END_CLOSING_ITEMS){
+    await db.put("complianceItems", {
+      id: uid("cmp"), category: it.category, item: it.item, status:"Not Started",
+      notes:"", updatedBy:null, updatedAt:null, createdAt: nowISO()
+    });
+  }
+  await db.put("meta", {key:"seededYearEndClosing", value:true});
+  await logAudit("System", "System", "Year-End Closing Checklist Seeded", `${YEAR_END_CLOSING_ITEMS.length} post-audit closing items added`);
 }
 
 /* =========================================================================
@@ -1079,12 +1196,16 @@ async function renderStaffShell(){
     tabContent = await renderFundsTab();
   } else if(tab === "accounting" && canManageFunds){
     tabContent = await renderAccountingTab();
+  } else if(tab === "ratios" && canSeeReports){
+    tabContent = await renderRatiosComplianceTab();
   } else if(tab === "reports" && canSeeReports){
     tabContent = await renderReportsTab();
   } else if(tab === "ai"){
     tabContent = await renderAiInsightsTab(customers, appraisals, loanAccounts, products, payments);
   } else if(tab === "apiconfig" && u.role==="Super Admin"){
     tabContent = await renderApiConfigTab();
+  } else if(tab === "datamgmt" && u.role==="Super Admin"){
+    tabContent = await renderDataManagementTab();
   } else if(tab === "help"){
     tabContent = renderStaffHelpTab();
   } else if(tab === "products" && canManagePolicy){
@@ -1143,9 +1264,11 @@ async function renderStaffShell(){
         <button class="tab ${tab==='reminders'?'active':''}" data-tab="reminders">Reminders</button>
         ${canManageFunds ? `<button class="tab ${tab==='funds'?'active':''}" data-tab="funds">Fund Management</button>`:""}
         ${canManageFunds ? `<button class="tab ${tab==='accounting'?'active':''}" data-tab="accounting">Accounting</button>`:""}
+        ${canSeeReports ? `<button class="tab ${tab==='ratios'?'active':''}" data-tab="ratios">Ratios &amp; Compliance</button>`:""}
         ${canSeeReports ? `<button class="tab ${tab==='reports'?'active':''}" data-tab="reports">Reports &amp; MIS</button>`:""}
         <button class="tab ${tab==='ai'?'active':''}" data-tab="ai">AI Insights</button>
-        ${u.role==="Super Admin" ? `<button class="tab ${tab==='apiconfig'?'active':''}" data-tab="apiconfig">Verification APIs</button>`:""}
+        ${u.role==="Super Admin" ? `<button class="tab ${tab==='apiconfig'?'active':''}" data-tab="apiconfig">Integrations</button>`:""}
+        ${u.role==="Super Admin" ? `<button class="tab ${tab==='datamgmt'?'active':''}" data-tab="datamgmt">Data Management</button>`:""}
         <button class="tab ${tab==='help'?'active':''}" data-tab="help">Help</button>
         ${canManagePolicy ? `<button class="tab ${tab==='products'?'active':''}" data-tab="products">Loan Products</button>`:""}
         ${canManagePolicy ? `<button class="tab ${tab==='policy'?'active':''}" data-tab="policy">Credit Policy</button>`:""}
@@ -1180,7 +1303,18 @@ async function renderManagementDashboard(leads, borrowers, customers, staffCount
     {lbl:"Portfolio at Risk (PAR)", val: riskPos.par.toFixed(1)+"%"},
     {lbl:"Collection Efficiency", val: riskPos.collectionEfficiency.toFixed(1)+"%"},
   ];
+  const overdueReturns = ["Super Admin","Managing Director"].includes(session.user.role) ? await computeOverdueRbiReturns() : [];
   return `
+    ${overdueReturns.length>0 ? `
+    <div class="card" style="border:1px solid var(--danger); background:#FBE7E8;">
+      <div class="flex-between">
+        <div>
+          <h3 style="color:#7A1F27; margin:0;">⚠ ${overdueReturns.length} RBI return(s) overdue</h3>
+          <p class="small" style="color:#7A1F27; margin:6px 0 0;">${overdueReturns.map(f=>`${esc(f.code)} (${esc(f.period)}, due ${esc(f.dueDate)})`).join(" · ")}</p>
+        </div>
+        <button class="btn btn-danger btn-sm" id="btn-goto-rbi-returns">Go to RBI Returns</button>
+      </div>
+    </div>` : ""}
     <div class="card">
       <h2>Management Dashboard</h2>
       <p class="sub">Live where data exists today. Metrics tagged with a phase will populate as that module is built.</p>
@@ -1491,21 +1625,27 @@ function renderProductsTab(products){
   const subview = session.productSubview || "list";
   if(subview === "form") return renderProductForm(session.editingProduct);
   const sorted = products.slice().sort((a,b)=>a.name.localeCompare(b.name));
+  const isSuperAdmin = session.user.role==="Super Admin";
   return `
     <div class="card">
       <div class="flex-between">
-        <div><h2>Loan Products</h2><p class="sub">Every product's rate, tenure, fees and security requirement — configurable, not hard-coded.</p></div>
+        <div><h2>Loan Products</h2><p class="sub">Every product's rate, tenure, fees, security requirement, and lending limit — configurable, not hard-coded. ${isSuperAdmin?'':'Only Super Admin can activate a product or change its limit into effect — your changes save as Draft until activated.'}</p></div>
         <button class="btn btn-gold btn-sm" id="btn-open-new-product">+ New Product</button>
       </div>
       <table>
-        <thead><tr><th>Product</th><th>Rate</th><th>Tenure</th><th>EMI Freq</th><th>Processing Fee</th><th>Security</th><th>Status</th><th></th></tr></thead>
+        <thead><tr><th>Product</th><th>Rate</th><th>Tenure</th><th>Max Loan Amount</th><th>Security</th><th>Status</th><th></th></tr></thead>
         <tbody>
         ${sorted.map(p=>`
           <tr>
             <td>${esc(p.name)}</td><td>${p.interestRate}% p.a.</td><td>${p.tenureMin}–${p.tenureMax} mo</td>
-            <td>${esc(p.emiFrequency)}</td><td>${p.processingFeePct}%</td><td>${esc(p.securityRequired)}</td>
-            <td>${p.active ? `<span class="badge badge-approved">Active</span>` : `<span class="badge badge-rejected">Inactive</span>`}</td>
-            <td><button class="btn btn-outline btn-sm edit-product-btn" data-product="${p.id}">Edit</button></td>
+            <td>${fmtINR(p.maxLoanAmount)}</td><td>${esc(p.securityRequired)}</td>
+            <td>${p.active ? `<span class="badge badge-approved">Active</span>` : `<span class="badge badge-new">Draft</span>`}</td>
+            <td>
+              <div class="action-row">
+                <button class="btn btn-outline btn-sm edit-product-btn" data-product="${p.id}">Edit</button>
+                ${isSuperAdmin ? `<button class="btn ${p.active?'btn-danger':'btn-gold'} btn-sm activate-product-btn" data-product="${p.id}" data-activate="${p.active?'0':'1'}">${p.active?'Deactivate':'Activate'}</button>` : ""}
+              </div>
+            </td>
           </tr>`).join("")}
         </tbody>
       </table>
@@ -1514,7 +1654,8 @@ function renderProductsTab(products){
 }
 
 function renderProductForm(product){
-  const p = product || {name:"", interestRate:"", tenureMin:6, tenureMax:36, emiFrequency:"Monthly", processingFeePct:1, insurancePct:0.5, penaltyRatePct:2, gstPct:18, moratoriumMonths:0, securityRequired:"No", active:true};
+  const p = product || {name:"", interestRate:"", tenureMin:6, tenureMax:36, emiFrequency:"Monthly", processingFeePct:1, insurancePct:0.5, penaltyRatePct:2, gstPct:18, moratoriumMonths:0, securityRequired:"No", maxLoanAmount:200000, active:true};
+  const isSuperAdmin = session.user.role==="Super Admin";
   return `
     <div class="card">
       <div class="flex-between">
@@ -1527,13 +1668,16 @@ function renderProductForm(product){
         <div class="field"><label>EMI frequency</label><select id="pf-freq">${EMI_FREQUENCIES.map(f=>`<option ${f===p.emiFrequency?'selected':''}>${f}</option>`).join("")}</select></div>
         <div class="field"><label>Tenure min (months)</label><input id="pf-tenure-min" type="number" value="${p.tenureMin}"></div>
         <div class="field"><label>Tenure max (months)</label><input id="pf-tenure-max" type="number" value="${p.tenureMax}"></div>
+        <div class="field"><label>Max loan amount (₹)</label><input id="pf-max-amount" type="number" value="${p.maxLoanAmount||0}"></div>
         <div class="field"><label>Moratorium (months)</label><input id="pf-moratorium" type="number" value="${p.moratoriumMonths}"></div>
         <div class="field"><label>Processing fee (%)</label><input id="pf-processing" type="number" step="0.1" value="${p.processingFeePct}"></div>
         <div class="field"><label>Insurance (%)</label><input id="pf-insurance" type="number" step="0.1" value="${p.insurancePct}"></div>
         <div class="field"><label>Penalty rate (% p.a. on overdue)</label><input id="pf-penalty" type="number" step="0.1" value="${p.penaltyRatePct}"></div>
         <div class="field"><label>GST on fees (%)</label><input id="pf-gst" type="number" step="0.1" value="${p.gstPct}"></div>
         <div class="field"><label>Security required</label><select id="pf-security"><option value="No" ${p.securityRequired==='No'?'selected':''}>No</option><option value="Yes" ${p.securityRequired==='Yes'?'selected':''}>Yes</option></select></div>
-        <div class="field"><label>Status</label><select id="pf-active"><option value="true" ${p.active?'selected':''}>Active</option><option value="false" ${!p.active?'selected':''}>Inactive</option></select></div>
+        ${isSuperAdmin ? `
+        <div class="field"><label>Status</label><select id="pf-active"><option value="true" ${p.active?'selected':''}>Active</option><option value="false" ${!p.active?'selected':''}>Draft (Inactive)</option></select></div>
+        ` : `<div class="field"><label>Status</label><div class="small muted" style="padding-top:8px;">Only Super Admin can activate a product. This saves as Draft.</div></div>`}
       </div>
       <button class="btn btn-gold" id="btn-save-product" data-product="${product?product.id:''}">Save Product</button>
     </div>
@@ -1546,6 +1690,7 @@ function renderProductForm(product){
 async function renderPolicyTab(){
   let policy = await db.get("policyConfig","default");
   if(!policy) policy = defaultPolicyConfig();
+  if(!policy.journalLimits) policy.journalLimits = defaultPolicyConfig().journalLimits;
   return `
     <div class="card">
       <h2>Credit Policy Engine</h2>
@@ -1557,6 +1702,16 @@ async function renderPolicyTab(){
         <thead><tr><th>Role</th><th>Max Sanction Amount (₹)</th></tr></thead>
         <tbody>
         ${policy.delegation.map((d,i)=>`<tr><td>${esc(d.role)}</td><td><input class="policy-input" data-group="delegation" data-index="${i}" data-field="maxAmount" type="number" value="${d.maxAmount}" style="width:160px;padding:6px 8px;border:1px solid var(--line);border-radius:6px;"></td></tr>`).join("")}
+        <tr><td><b>Super Admin</b></td><td class="muted">Unlimited — system override, always logged</td></tr>
+        </tbody>
+      </table>
+
+      <h3 class="section-h">Journal / Expense Transaction Limits — Maximum Self-Authorized Amount by Role</h3>
+      <p class="sub" style="margin-top:-6px;">A journal/expense entry within the proposer's own limit posts immediately. Above it, the entry sits as "Pending Approval" until a <i>different</i> officer with sufficient authority approves it — same Maker-Checker discipline as Sanctions.</p>
+      <table>
+        <thead><tr><th>Role</th><th>Max Self-Authorized Amount (₹)</th></tr></thead>
+        <tbody>
+        ${policy.journalLimits.map((d,i)=>`<tr><td>${esc(d.role)}</td><td><input class="policy-input" data-group="journalLimits" data-index="${i}" data-field="maxAmount" type="number" value="${d.maxAmount}" style="width:160px;padding:6px 8px;border:1px solid var(--line);border-radius:6px;"></td></tr>`).join("")}
         <tr><td><b>Super Admin</b></td><td class="muted">Unlimited — system override, always logged</td></tr>
         </tbody>
       </table>
@@ -1827,6 +1982,11 @@ function getDelegationLimitForRole(policySnapshot, role){
   const row = policySnapshot.delegation.find(d=>d.role===role);
   return row ? row.maxAmount : 0;
 }
+function getJournalLimitForRole(policySnapshot, role){
+  if(!policySnapshot || !policySnapshot.journalLimits) return 0;
+  const row = policySnapshot.journalLimits.find(d=>d.role===role);
+  return row ? row.maxAmount : 0;
+}
 
 async function renderSanctionForm(leads, customers, products){
   const u = session.user;
@@ -1894,6 +2054,7 @@ async function refreshSanctionChecks(){
   const fundsOk = amount <= fundPos.available;
   const exposureOk = (borrowerExp + amount) <= policy.exposure.maxBorrowerExposure;
   const sectorOk = sector.pct <= policy.exposure.maxSectorExposurePct;
+  const productLimitOk = !prod || !prod.maxLoanAmount || amount <= prod.maxLoanAmount;
 
   box.innerHTML = `
     <h3 class="section-h">Fund &amp; Exposure Checks</h3>
@@ -1905,6 +2066,9 @@ async function refreshSanctionChecks(){
     </div>
     <div class="warn-banner" style="background:${fundsOk?'#E4F3E8':'#FBE7E8'};border-color:${fundsOk?'var(--ok)':'var(--danger)'};color:${fundsOk?'#1D4E33':'#7A1F27'};margin-top:12px;">
       ${fundsOk?'✓':'⚠'} Fund availability: ${fundsOk?'sufficient funds available.':'requested amount exceeds available funds — requires override.'}
+    </div>
+    <div class="warn-banner" style="background:${productLimitOk?'#E4F3E8':'#FBE7E8'};border-color:${productLimitOk?'var(--ok)':'var(--danger)'};color:${productLimitOk?'#1D4E33':'#7A1F27'};">
+      ${productLimitOk?'✓':'⚠'} Product limit: ${prod&&prod.maxLoanAmount ? (productLimitOk?'within':'exceeds')+' the '+esc(lead.product)+' maximum of '+fmtINR(prod.maxLoanAmount)+' set in Loan Products.' : 'no maximum configured for this product.'}
     </div>
     <div class="warn-banner" style="background:${exposureOk?'#E4F3E8':'#FBF1DC'};border-color:${exposureOk?'var(--ok)':'var(--warn)'};color:${exposureOk?'#1D4E33':'#5C4200'};">
       ${exposureOk?'✓':'⚠'} Borrower exposure: ${exposureOk?'within':'exceeds'} policy cap of ${fmtINR(policy.exposure.maxBorrowerExposure)}.
@@ -1948,11 +2112,28 @@ async function renderSanctionLetter(sanction, customers, products){
   if(!sanction) return `<div class="card">Sanction not found.</div>`;
   const cust = customers.find(c=>c.id===sanction.customerId);
   const prod = products.find(p=>p.name===sanction.product);
+  const sigStatus = sanction.signatureStatus || "Not Sent";
   return `
     <div class="card no-print" style="margin-bottom:0;">
       <div class="flex-between"><h2>Sanction Letter</h2>
-        <div class="action-row"><button class="btn btn-outline btn-sm" id="btn-close-letter">Close</button><button class="btn btn-gold btn-sm" id="btn-print-letter">Print</button></div>
+        <div class="action-row">
+          <button class="btn btn-outline btn-sm" id="btn-close-letter">Close</button>
+          <button class="btn btn-outline btn-sm send-letter-btn" data-sanction="${sanction.id}" data-channel="whatsapp">Send WhatsApp</button>
+          <button class="btn btn-outline btn-sm send-letter-btn" data-sanction="${sanction.id}" data-channel="email">Send Email</button>
+          <button class="btn btn-gold btn-sm" id="btn-print-letter">Print</button>
+        </div>
       </div>
+    </div>
+    <div class="card no-print">
+      <div class="flex-between">
+        <div><h3 class="section-h" style="margin:0; border:none;">Signature Procedure</h3><p class="small muted" style="margin:4px 0 0;">Status: <span class="badge ${sigStatus==='Signed'?'badge-approved':sigStatus==='Sent for Signature'?'badge-progress':'badge-new'}">${esc(sigStatus)}</span>${sanction.signedAt?" — "+fmtDate(sanction.signedAt):""}</p></div>
+        <div class="action-row">
+          ${sigStatus==="Not Sent" ? `<button class="btn btn-outline btn-sm" id="btn-mark-sent-signature" data-sanction="${sanction.id}">Mark Sent for Signature</button>` : ""}
+          ${sigStatus!=="Signed" ? `<label class="btn btn-outline btn-sm" style="cursor:pointer;">Upload Signed Copy<input type="file" accept="image/*,application/pdf" id="signed-doc-input" data-sanction="${sanction.id}" style="display:none;"></label>` : ""}
+        </div>
+      </div>
+      <p class="small muted" style="margin-top:8px;">Procedure: generate the letter above → send it (WhatsApp/Email once configured, or print/hand deliver) → borrower signs physically or via your e-sign provider → upload the signed scan here. Real e-signature (Aadhaar eSign, DocuSign-class) needs a licensed provider — this tracks the workflow and status, ready to plug one in later.</p>
+      ${sanction.signedDocumentBase64 ? `<div class="kyc-upload-box" style="margin-top:10px;"><div class="small">Signed Document</div>${sanction.signedDocumentBase64.startsWith('data:application/pdf') ? `<a href="${sanction.signedDocumentBase64}" download="signed-sanction-${sanction.id}.pdf" class="btn btn-outline btn-sm" style="margin-top:8px;">Download PDF</a>` : `<img src="${sanction.signedDocumentBase64}" style="display:block; margin-top:8px;">`}</div>` : ""}
     </div>
     <div class="card" id="printable-letter" style="border-top:4px solid var(--gold);">
       <div class="flex-between" style="align-items:flex-start;">
@@ -2236,7 +2417,8 @@ async function renderRemindersTab(loanAccounts, customers){
     </div>` : ""}
     <div class="card">
       <div class="flex-between">
-        <div><h2>Reminders Due</h2><p class="sub">Auto-generated from the EMI schedule (7/3/1 days before, due date, 1/7/15/30 days overdue). Sending is simulated — plug in an SMS/WhatsApp/Email gateway to deliver for real.</p></div>
+        <div><h2>Reminders Due</h2><p class="sub">Auto-generated from the EMI schedule (7/3/1 days before, due date, 1/7/15/30 days overdue). "Mark Sent" attempts a real send via WhatsApp/Email if configured under Integrations; otherwise it just logs the reminder. SMS/Push/Voice have no provider hook yet.</p></div>
+        ${session.user.role==="Super Admin" ? `<button class="btn btn-outline btn-sm" id="btn-open-messaging-config" style="margin-right:8px;">Configure Providers</button>` : ""}
         <button class="btn btn-gold btn-sm" id="btn-open-custom-reminder">+ Custom Reminder</button>
       </div>
       <table>
@@ -2426,21 +2608,69 @@ async function renderRecoveryVisitForm(acc, customers){
    --------------------------------------------------------------------- */
 async function renderAccountingTab(){
   const acct = await computeAccountingSummary();
-  const cashBank = [...acct.disbursementEntries.map(e=>({...e, kind:"out"})), ...acct.collectionEntries.map(e=>({...e, kind:"in"}))]
-    .sort((a,b)=> new Date(a.date) - new Date(b.date));
+  const cashBank = [
+    ...acct.disbursementEntries.map(e=>({...e, kind:"out"})),
+    ...acct.collectionEntries.map(e=>({...e, kind:"in"})),
+    ...acct.journalEntryRows.map(e=>({...e, kind: e.credit?"in":"out"})),
+  ].sort((a,b)=> new Date(a.date) - new Date(b.date));
   let running = 0;
   const cashBankRows = cashBank.map(e=>{ running += (e.credit - e.debit); return {...e, running}; });
+  const journalSorted = acct.journalEntries.slice().sort((a,b)=> new Date(b.date) - new Date(a.date));
+  const fundAccounts = acct.fundAccounts;
+  const policy = (await db.get("policyConfig","default")) || defaultPolicyConfig();
+  if(!policy.journalLimits) policy.journalLimits = defaultPolicyConfig().journalLimits;
 
   return `
     <div class="card">
       <h2>Accounting</h2>
-      <p class="sub">A simplified single-entry ledger built from disbursement, collection and provisioning data — enough for day-to-day MIS. It is not a statutory double-entry General Ledger; route final books through your accountant / Tally.</p>
+      <p class="sub">A simplified single-entry ledger built from disbursement, collection, provisioning and journal data — enough for day-to-day MIS. It is not a statutory double-entry General Ledger; route final books through your accountant / Tally.</p>
       <div class="grid grid-4">
         <div class="kpi"><div class="lbl">Interest Income</div><div class="val" style="font-size:18px;">${fmtINR(Math.round(acct.interestIncome))}</div></div>
         <div class="kpi"><div class="lbl">Processing Fee Income</div><div class="val" style="font-size:18px;">${fmtINR(Math.round(acct.processingFeeIncome))}</div></div>
-        <div class="kpi"><div class="lbl">NPA Provisioning</div><div class="val" style="font-size:18px;">${fmtINR(Math.round(acct.npaProvision))}</div></div>
-        <div class="kpi"><div class="lbl">Net Surplus (Income − Provisioning)</div><div class="val" style="font-size:18px;">${fmtINR(Math.round(acct.netSurplus))}</div></div>
+        <div class="kpi"><div class="lbl">Operating Expenses</div><div class="val" style="font-size:18px;">${fmtINR(Math.round(acct.operatingExpenses))}</div></div>
+        <div class="kpi"><div class="lbl">Net Surplus</div><div class="val" style="font-size:18px;">${fmtINR(Math.round(acct.netSurplus))}</div></div>
       </div>
+    </div>
+
+    <div class="card">
+      <div class="flex-between">
+        <div><h2 style="font-size:16px;">Journal &amp; Expenses</h2><p class="sub" style="margin-bottom:0;">Record day-to-day transactions that aren't tied to a loan — rent, salaries, utilities, or other income. Each entry debits or credits the fund account you choose, same as a disbursement or collection.</p></div>
+      </div>
+      <div class="grid grid-3">
+        <div class="field"><label>Type</label><select id="jf-type">
+          <option value="Expense">Expense</option><option value="Income">Income</option>
+        </select></div>
+        <div class="field"><label>Category</label><select id="jf-category"></select></div>
+        <div class="field"><label>Date</label><input id="jf-date" type="date" value="${todayStr()}"></div>
+        <div class="field"><label>Amount (₹)</label><input id="jf-amount" type="number"></div>
+        <div class="field"><label>Fund account</label><select id="jf-account">${fundAccounts.map(a=>`<option value="${a.id}">${esc(a.name)} — Balance ${fmtINR(a.balance)}</option>`).join("")}</select></div>
+        <div class="field"><label>Description (optional)</label><input id="jf-description" placeholder="e.g. July office rent"></div>
+      </div>
+      <button class="btn btn-gold btn-sm" id="btn-save-journal">Record Entry</button>
+      <div class="divider"></div>
+      <table>
+        <thead><tr><th>Date</th><th>Type</th><th>Category</th><th>Description</th><th>Amount</th><th>Fund Account</th><th>Status</th><th></th></tr></thead>
+        <tbody>
+        ${journalSorted.length===0 ? `<tr class="empty-row"><td colspan="8">No journal entries yet.</td></tr>` :
+          journalSorted.map(j=>{
+            const status = j.status || "Posted";
+            let statusBadgeHtml = status==="Posted" ? `<span class="badge badge-approved">Posted</span>` : status==="Rejected" ? `<span class="badge badge-rejected">Rejected</span>` : `<span class="badge badge-progress">Pending Approval</span>`;
+            let actions = "";
+            if(status==="Pending Approval"){
+              const canApprove = (DELEGATION_ROLES.includes(session.user.role) || session.user.role==="Super Admin") && session.user.name !== j.proposedBy;
+              const withinLimit = session.user.role==="Super Admin" || getJournalLimitForRole(policy, session.user.role) >= j.amount;
+              if(canApprove && withinLimit){
+                actions = `<div class="action-row"><button class="btn btn-outline btn-sm approve-journal-btn" data-entry="${j.id}">Approve</button><button class="btn btn-danger btn-sm reject-journal-btn" data-entry="${j.id}">Reject</button></div>`;
+              } else if(canApprove && !withinLimit){
+                actions = `<span class="small muted">Exceeds your limit</span>`;
+              } else {
+                actions = `<span class="small muted">Awaiting a different officer</span>`;
+              }
+            }
+            return `<tr><td>${esc(j.date)}</td><td>${j.type==='Income'?`<span class="badge badge-approved">Income</span>`:`<span class="badge badge-rejected">Expense</span>`}</td><td>${esc(j.category)}</td><td>${esc(j.description)||"—"}</td><td>${fmtINR(j.amount)}</td><td>${esc(j.fundAccountName)}</td><td>${statusBadgeHtml}</td><td>${actions}</td></tr>`;
+          }).join("")}
+        </tbody>
+      </table>
     </div>
 
     <div class="card">
@@ -2460,12 +2690,14 @@ async function renderAccountingTab(){
         <tbody>
           <tr><td>Interest Income</td><td style="text-align:right;">${fmtINR(Math.round(acct.interestIncome))}</td></tr>
           <tr><td>Processing Fee Income</td><td style="text-align:right;">${fmtINR(Math.round(acct.processingFeeIncome))}</td></tr>
+          <tr><td>Other Income</td><td style="text-align:right;">${fmtINR(Math.round(acct.otherIncome))}</td></tr>
           <tr><td><b>Total Income</b></td><td style="text-align:right;"><b>${fmtINR(Math.round(acct.totalIncome))}</b></td></tr>
+          <tr><td>Less: Operating Expenses</td><td style="text-align:right;">(${fmtINR(Math.round(acct.operatingExpenses))})</td></tr>
           <tr><td>Less: NPA Provisioning</td><td style="text-align:right;">(${fmtINR(Math.round(acct.npaProvision))})</td></tr>
           <tr><td><b>Net Surplus</b></td><td style="text-align:right;"><b>${fmtINR(Math.round(acct.netSurplus))}</b></td></tr>
         </tbody>
       </table>
-      <p class="small muted" style="margin-top:10px;">Excludes operating expenses, salaries, TDS and GST payable/input credit — a full P&amp;L needs your accounting team's chart of accounts.</p>
+      <p class="small muted" style="margin-top:10px;">Excludes TDS and GST payable/input credit — a full statutory P&amp;L needs your accounting team's chart of accounts.</p>
     </div>
 
     <div class="card">
@@ -2491,6 +2723,43 @@ async function renderAccountingTab(){
     </div>
 
     <div class="card">
+      <h2 style="font-size:16px;">Trial Balance</h2>
+      <p class="sub">This is a browser app with no backend server, so there's no literal midnight batch job — instead these figures are always live, recalculated fresh every time you open this tab, for whatever "today" is. That's arguably more useful than a fixed daily run, but note it currently reflects the position as of now, not a specific past date.</p>
+      ${(()=>{
+        const capital = acct.fundAccounts.filter(a=>a.type==="Capital").reduce((s,a)=>s+a.balance,0);
+        const borrowings = acct.fundAccounts.filter(a=>a.type==="Borrowing").reduce((s,a)=>s+a.balance,0);
+        const otherFunds = acct.fundAccounts.filter(a=>!["Capital","Borrowing"].includes(a.type)).reduce((s,a)=>s+a.balance,0);
+        const totalDr = acct.cashBankBalance + acct.portfolioOutstanding;
+        const knownCr = capital + borrowings + otherFunds + acct.npaProvision;
+        const plug = totalDr - knownCr;
+        return `
+        <div class="grid grid-2">
+          <div>
+            <h3 class="section-h">Debit</h3>
+            <table><tbody>
+              <tr><td>Loan Portfolio Outstanding</td><td style="text-align:right;">${fmtINR(Math.round(acct.portfolioOutstanding))}</td></tr>
+              <tr><td>Cash &amp; Bank Balance</td><td style="text-align:right;">${fmtINR(Math.round(acct.cashBankBalance))}</td></tr>
+              <tr><td><b>Total Debit</b></td><td style="text-align:right;"><b>${fmtINR(Math.round(totalDr))}</b></td></tr>
+            </tbody></table>
+          </div>
+          <div>
+            <h3 class="section-h">Credit</h3>
+            <table><tbody>
+              <tr><td>Capital</td><td style="text-align:right;">${fmtINR(Math.round(capital))}</td></tr>
+              <tr><td>Borrowings</td><td style="text-align:right;">${fmtINR(Math.round(borrowings))}</td></tr>
+              ${otherFunds ? `<tr><td>Other Fund Sources</td><td style="text-align:right;">${fmtINR(Math.round(otherFunds))}</td></tr>` : ""}
+              <tr><td>Provision for NPA</td><td style="text-align:right;">${fmtINR(Math.round(acct.npaProvision))}</td></tr>
+              <tr><td>Accumulated Surplus/Deficit <span class="small muted">(balancing figure)</span></td><td style="text-align:right;">${fmtINR(Math.round(plug))}</td></tr>
+              <tr><td><b>Total Credit</b></td><td style="text-align:right;"><b>${fmtINR(Math.round(knownCr+plug))}</b></td></tr>
+            </tbody></table>
+          </div>
+        </div>
+        <p class="small muted" style="margin-top:10px;">The Accumulated Surplus/Deficit line is a balancing figure, not a separately tracked account — cross-check it against Net Surplus on the Income Statement above (${fmtINR(Math.round(acct.netSurplus))}). A large, unexplained gap between the two usually means a Fund Account balance was adjusted manually (Fund Management → Adjust Balance) outside a recorded transaction — worth investigating before you rely on this Trial Balance. This is a simplified single-entry-derived Trial Balance for MIS purposes, not a substitute for your statutory books of account.</p>
+        `;
+      })()}
+    </div>
+
+    <div class="card">
       <div class="flex-between">
         <div><h2 style="font-size:16px;">Export to Tally</h2><p class="sub" style="margin-bottom:0;">Downloads a CSV of ledger entries in a Tally-importable column layout (Date, Voucher Type, Ledger, Amount). True Tally XML integration needs your Tally version's exact schema — validate with your accountant before import.</p></div>
         <button class="btn btn-gold btn-sm" id="btn-export-tally">Export CSV</button>
@@ -2500,8 +2769,196 @@ async function renderAccountingTab(){
 }
 
 /* ---------------------------------------------------------------------
+   Ratios & Compliance
+   --------------------------------------------------------------------- */
+async function renderRatiosComplianceTab(){
+  const r = await computeFinancialRatios();
+  const complianceItems = await db.getAll("complianceItems");
+  const byCategory = {};
+  complianceItems.forEach(c=>{ byCategory[c.category] = byCategory[c.category]||[]; byCategory[c.category].push(c); });
+  const doneCount = complianceItems.filter(c=>c.status==="Done").length;
+
+  const ratioCard = (label, value, opts={})=>`
+    <div class="kpi" ${opts.proxy?'style="border-top-color:var(--warn);"':''}>
+      <div class="lbl">${label}${opts.proxy?' <span class="small" style="color:var(--warn);">(proxy)</span>':''}</div>
+      <div class="val" style="font-size:18px;">${value}</div>
+    </div>`;
+
+  return `
+    <div class="card">
+      <h2>Ratios &amp; Compliance</h2>
+      <p class="sub">Ratios below are split into two groups. The first are computed directly and reliably from your data. The second — marked "(proxy)" — approximate a real prudential ratio this app cannot fully calculate; never use those for actual regulatory reporting.</p>
+
+      <h3 class="section-h">Portfolio &amp; Provisioning Ratios</h3>
+      <div class="grid grid-4">
+        ${ratioCard("Gross NPA Ratio", r.grossNpaRatio.toFixed(2)+"%")}
+        ${ratioCard("Net NPA Ratio", r.netNpaRatio.toFixed(2)+"%")}
+        ${ratioCard("Provisioning Coverage Ratio", r.provisioningCoverageRatio.toFixed(1)+"%")}
+        ${ratioCard("Portfolio at Risk (PAR)", r.par.toFixed(1)+"%")}
+      </div>
+
+      <h3 class="section-h">Profitability &amp; Structure</h3>
+      <div class="grid grid-4">
+        ${ratioCard("Collection Efficiency", r.collectionEfficiency.toFixed(1)+"%")}
+        ${ratioCard("Return on Assets", r.returnOnAssets.toFixed(2)+"%")}
+        ${ratioCard("Yield on Advances", r.yieldOnAdvances.toFixed(1)+"%")}
+        ${ratioCard("Debt-to-Equity", r.debtToEquity===null?"—":r.debtToEquity.toFixed(2)+"x")}
+      </div>
+
+      <h3 class="section-h">Capital Adequacy</h3>
+      <div class="warn-banner" style="background:#FBE7E8;border-color:var(--danger);color:#7A1F27;">
+        ⚠ "Capital Adequacy Proxy" below is <b>not</b> the statutory CRAR. Real CRAR requires Tier I/Tier II capital classification and risk-weighted assets per RBI's Scale Based Regulation matrix — this app doesn't track either. It assumes a flat 100% risk weight on the loan book and treats every "Capital"-type Fund Source as capital. Never use this figure for a regulatory filing or a lending decision — get your statutory auditor to compute the real CRAR.
+      </div>
+      <div class="grid grid-3">
+        ${ratioCard("Capital Adequacy Proxy", r.capitalAdequacyProxy===null?"—":r.capitalAdequacyProxy.toFixed(1)+"%", {proxy:true})}
+        <div class="kpi"><div class="lbl">Capital (Fund Sources typed Capital)</div><div class="val" style="font-size:18px;">${fmtINR(Math.round(r.capital))}</div></div>
+        <div class="kpi"><div class="lbl">Borrowings (Fund Sources typed Borrowing)</div><div class="val" style="font-size:18px;">${fmtINR(Math.round(r.borrowings))}</div></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="flex-between">
+        <div><h2 style="font-size:16px;">Compliance Checklist</h2><p class="sub" style="margin-bottom:0;">A self-tracking checklist for your team — not a regulatory filing system and not legal advice. Each item is a prompt to verify with your Company Secretary, statutory auditor, or legal counsel; marking something "Done" here has no effect outside this app.</p></div>
+        <span class="badge badge-approved">${doneCount}/${complianceItems.length} Done</span>
+      </div>
+      ${Object.entries(byCategory).map(([cat, items])=>`
+        <h3 class="section-h">${esc(cat)}</h3>
+        <table>
+          <thead><tr><th>Item</th><th>Status</th><th>Notes</th><th>Updated</th></tr></thead>
+          <tbody>
+          ${items.map(c=>`
+            <tr>
+              <td style="max-width:260px;">${esc(c.item)}</td>
+              <td>
+                <select class="compliance-status-select" data-item="${c.id}" style="padding:5px 8px; border-radius:6px; border:1px solid var(--line); font-size:12.5px;">
+                  ${COMPLIANCE_STATUSES.map(s=>`<option ${s===c.status?'selected':''}>${s}</option>`).join("")}
+                </select>
+              </td>
+              <td><input class="compliance-notes-input" data-item="${c.id}" value="${esc(c.notes)}" placeholder="Notes / evidence reference" style="font-size:12.5px; padding:5px 8px; border:1px solid var(--line); border-radius:6px; width:100%;"></td>
+              <td class="small muted">${c.updatedAt ? fmtDate(c.updatedAt) : "—"}</td>
+            </tr>`).join("")}
+          </tbody>
+        </table>
+      `).join("")}
+    </div>
+
+    ${await renderRbiReturnsSection()}
+  `;
+}
+
+async function renderRbiReturnsSection(){
+  const filings = await db.getAll("rbiReturnFilings");
+  const today = todayStr();
+  const withStatus = filings.map(f=>{
+    let status;
+    if(f.submittedDate) status = "Submitted";
+    else if(f.dueDate < today) status = "Overdue";
+    else status = "Upcoming";
+    return {...f, computedStatus: status};
+  }).sort((a,b)=> new Date(a.dueDate) - new Date(b.dueDate));
+  const overdueCount = withStatus.filter(f=>f.computedStatus==="Overdue").length;
+
+  return `
+    <div class="card">
+      <h2 style="font-size:16px;">RBI Returns — Reference (Non-Deposit-Taking NBFC)</h2>
+      <div class="warn-banner" style="background:#FBE7E8;border-color:var(--danger);color:#7A1F27;">⚠ Illustrative starting point, not a definitive filing calendar. The exact forms, thresholds, and due dates depend on your NBFC's layer under Scale Based Regulation, asset size, and the current RBI Master Direction — and RBI has been shifting filings from the COSMOS portal to the XBRL portal. Verify every row with your Company Secretary or compliance officer before relying on it.</div>
+      <table>
+        <thead><tr><th>Return</th><th>Purpose</th><th>Periodicity</th><th>Typical Due Date Rule</th></tr></thead>
+        <tbody>
+        ${RBI_RETURN_REFERENCE.map(r=>`<tr><td class="mono">${esc(r.code)}</td><td>${esc(r.name)}</td><td>${esc(r.periodicity)}</td><td>${esc(r.dueRule)}</td></tr>`).join("")}
+        </tbody>
+      </table>
+    </div>
+
+    <div class="card">
+      <div class="flex-between">
+        <div><h2 style="font-size:16px;">RBI Returns Tracker</h2><p class="sub" style="margin-bottom:0;">Log each filing period against a return above, set its due date, and record the submission date once filed. Anything overdue shows here, in Notifications, and as a banner on the Dashboard for Super Admin/Managing Director.</p></div>
+        ${overdueCount>0 ? `<span class="badge badge-rejected">${overdueCount} Overdue</span>` : `<span class="badge badge-approved">All Current</span>`}
+      </div>
+      <div class="grid grid-4">
+        <div class="field"><label>Return</label><select id="rf-code">${RBI_RETURN_REFERENCE.map(r=>`<option value="${esc(r.code)}">${esc(r.code)}</option>`).join("")}<option value="Other">Other</option></select></div>
+        <div class="field"><label>Period (e.g. Q1 FY 2026-27)</label><input id="rf-period" placeholder="e.g. FY 2025-26"></div>
+        <div class="field"><label>Due date</label><input id="rf-duedate" type="date"></div>
+        <div class="field"><label>&nbsp;</label><button class="btn btn-gold btn-block" id="btn-add-rbi-filing">+ Track This Filing</button></div>
+      </div>
+      <table>
+        <thead><tr><th>Return</th><th>Period</th><th>Due Date</th><th>Status</th><th>Submitted</th><th></th></tr></thead>
+        <tbody>
+        ${withStatus.length===0 ? `<tr class="empty-row"><td colspan="6">No filings tracked yet.</td></tr>` :
+          withStatus.map(f=>`
+          <tr>
+            <td class="mono">${esc(f.code)}</td><td>${esc(f.period)}</td><td>${esc(f.dueDate)}</td>
+            <td>${f.computedStatus==="Submitted"?`<span class="badge badge-approved">Submitted</span>`:f.computedStatus==="Overdue"?`<span class="badge badge-rejected">Overdue</span>`:`<span class="badge badge-new">Upcoming</span>`}</td>
+            <td>${f.submittedDate||"—"}</td>
+            <td>${!f.submittedDate ? `<button class="btn btn-outline btn-sm mark-rbi-submitted-btn" data-filing="${f.id}">Mark Submitted</button>` : ""}</td>
+          </tr>`).join("")}
+        </tbody>
+      </table>
+    </div>
+  `;
+}
+
+/* ---------------------------------------------------------------------
    Reports & MIS (Phase 7)
    --------------------------------------------------------------------- */
+const JOURNAL_EXPENSE_CATEGORIES = ["Salaries","Rent","Electricity","Office Supplies","Professional Fees","Travel","Insurance Premium","Interest on Borrowings","Other Expense"];
+const JOURNAL_INCOME_CATEGORIES = ["Other Income","Investment Income","Miscellaneous Income"];
+const COMPLIANCE_STATUSES = ["Not Started","In Progress","Done","Not Applicable"];
+const DEFAULT_COMPLIANCE_ITEMS = [
+  {category:"Registration & Governance", item:"NBFC Certificate of Registration (CoR) on file and valid"},
+  {category:"Registration & Governance", item:"Board-approved Fair Practices Code in place"},
+  {category:"Registration & Governance", item:"Board meeting cadence and minutes maintained per Companies Act"},
+  {category:"Registration & Governance", item:"Statutory Auditor appointed for current financial year"},
+  {category:"Policy", item:"Board-approved Credit Policy in place (this app's Credit Policy tab can serve as a working copy)"},
+  {category:"Policy", item:"KYC / AML / PMLA Policy on file"},
+  {category:"Policy", item:"IT & Cybersecurity policy in place per applicable RBI framework"},
+  {category:"Operational", item:"Fraud monitoring and reporting mechanism in place"},
+  {category:"Operational", item:"Grievance Redressal Officer designated and contact details published"},
+  {category:"Operational", item:"Internal / concurrent audit conducted for the period"},
+  {category:"Prudential", item:"CRAR maintained above regulatory minimum (verify with statutory auditor)"},
+  {category:"Prudential", item:"NPA provisioning follows RBI IRAC norms (cross-check with auditor)"},
+  {category:"Filings", item:"Periodic RBI returns (e.g. NBS/DNBS returns) filed and up to date"},
+  {category:"Filings", item:"Annual financial statements and returns filed with RoC"},
+];
+
+const YEAR_END_CLOSING_ITEMS = [
+  {category:"Year-End Closing (Post-Audit)", item:"Statutory audit completed and signed audit report received"},
+  {category:"Year-End Closing (Post-Audit)", item:"Board approved the audited financial statements"},
+  {category:"Year-End Closing (Post-Audit)", item:"AGM held and financial statements adopted by members"},
+  {category:"Year-End Closing (Post-Audit)", item:"NPA provisioning finalized to match audited figures (IRAC norms)"},
+  {category:"Year-End Closing (Post-Audit)", item:"Year-end CRAR computed and certified"},
+  {category:"Year-End Closing (Post-Audit)", item:"Opening balances for the new financial year rolled forward and verified in books"},
+  {category:"Year-End Closing (Post-Audit)", item:"Fixed deposit / borrowing balance confirmations obtained from lenders"},
+  {category:"Year-End Closing (Post-Audit)", item:"Related Party Transactions disclosure finalized for the year"},
+  {category:"Year-End Closing (Post-Audit)", item:"Board's Report / Directors' Report finalized"},
+  {category:"Year-End Closing (Post-Audit)", item:"ROC filing: AOC-4 (financial statements) filed"},
+  {category:"Year-End Closing (Post-Audit)", item:"ROC filing: MGT-7/MGT-7A (annual return) filed"},
+  {category:"Year-End Closing (Post-Audit)", item:"Income tax return and tax audit report (if applicable) filed"},
+  {category:"Year-End Closing (Post-Audit)", item:"Statutory registers updated for the year (charges, members, etc.)"},
+];
+
+/* ---------------------------------------------------------------------
+   RBI Returns reference — illustrative starting point for a
+   non-deposit-taking NBFC (NBFC-ND), NOT a definitive filing calendar.
+   Exact forms, thresholds, and due dates depend on your layer under
+   Scale Based Regulation (Base/Middle/Upper), asset size, and the
+   current Master Direction — verify every row with your Company
+   Secretary/compliance officer before relying on it. RBI has also
+   been moving return filing from the COSMOS portal to the XBRL portal;
+   confirm which platform applies to your NBFC.
+   --------------------------------------------------------------------- */
+const RBI_RETURN_REFERENCE = [
+  {code:"NBS-9", name:"Annual Return — NBFC-ND (assets below ₹100 Cr)", periodicity:"Annual", dueRule:"Within 60 days of financial year end (typically 30 May)"},
+  {code:"DNBS-10", name:"Statutory Auditor's Certificate", periodicity:"Annual", dueRule:"Within one month of finalizing the balance sheet; cannot be filed after 31 December"},
+  {code:"DNBS-13", name:"Overseas Investment Details (Nil return if none)", periodicity:"Quarterly", dueRule:"Within 15 days of quarter end"},
+  {code:"DNBS-02", name:"Important Financial Parameters", periodicity:"Quarterly", dueRule:"Within 15 days of quarter end — confirm applicability to your NBFC-ND category"},
+  {code:"DNBS-04A", name:"Short Term Dynamic Liquidity (ALM)", periodicity:"Quarterly", dueRule:"Typically for asset size above ₹100 Cr — confirm threshold currently in force"},
+  {code:"DNBS-04B", name:"Structural Liquidity & Interest Rate Sensitivity (ALM)", periodicity:"Monthly/Half-Yearly", dueRule:"Typically for asset size above ₹100 Cr — confirm periodicity currently in force"},
+  {code:"CRILC", name:"Central Repository of Information on Large Credits", periodicity:"Monthly/Quarterly", dueRule:"Applicable if exposure to a single borrower is ₹5 Cr or more — confirm applicability"},
+  {code:"FLA Return", name:"Annual Return on Foreign Liabilities and Assets (RBI, not just company)", periodicity:"Annual", dueRule:"By 15 July — only if the NBFC has foreign investment or foreign liabilities"},
+  {code:"AOC-4 / MGT-7", name:"RoC filings (Companies Act, not RBI, but usually tracked together)", periodicity:"Annual", dueRule:"Per Companies Act timelines after AGM"},
+];
+
 const REPORT_DEFS = [
   {id:"loan-register", label:"Loan Register"},
   {id:"disbursement-register", label:"Disbursement Register"},
@@ -2777,8 +3234,8 @@ async function renderApiConfigTab(){
   const cfg = await getApiConfig();
   return `
     <div class="card">
-      <h2>Verification APIs</h2>
-      <p class="sub">Plug in a licensed KYC/fraud-check provider (Surepass, Signzy, HyperVerge, IDfy, Karza/Perfios, Digio, Deepvue, etc.). No vendor is connected yet — this just wires the plumbing so Aadhaar/PAN/CKYC verification and litigation/bureau/AML checks work the moment credentials are added.</p>
+      <h2>Integrations</h2>
+      <p class="sub">Plug in licensed providers for KYC/fraud checks and outbound messaging. No vendor is connected yet — this wires the plumbing so verification checks, reminders, and sanction letters can actually be sent the moment credentials are added. WhatsApp/Email here send the instant someone in the app clicks — for messages to go out automatically on a schedule with nobody logged in, you'd also need a server-side scheduler (Firebase Cloud Functions + Cloud Scheduler, which needs the paid Blaze plan) — ask if you want help setting that up.</p>
       <div class="warn-banner" style="background:#FBF1DC;border-color:var(--gold);color:#5C4200;">⚠ Most verification providers block direct browser calls (CORS) and expect server-side integration for security. If a check below fails with a network/CORS error once configured, you'll likely need a small backend relay rather than calling the vendor straight from this page — flag that to me and I can help design one.</div>
       <div class="grid grid-3">
         <div class="field"><label>Provider name</label><input id="api-provider" value="${esc(cfg.provider)}" placeholder="e.g. Surepass"></div>
@@ -2828,6 +3285,44 @@ function renderStaffHelpTab(){
   `;
 }
 
+/* ---------------------------------------------------------------------
+   Data Management: backup, restore, delete (Super Admin only)
+   --------------------------------------------------------------------- */
+async function renderDataManagementTab(){
+  const counts = {};
+  for(const c of ALL_COLLECTIONS){
+    counts[c] = (await db.getAll(c)).length;
+  }
+  return `
+    <div class="card">
+      <h2>Backup</h2>
+      <p class="sub">Downloads every collection in this NBFC's database as a single JSON file — leads, customers, KYC, appraisals, sanctions, loan accounts, payments, fund accounts, policy, staff, and audit trail. Keep it somewhere safe; it contains customer PII.</p>
+      <button class="btn btn-gold" id="btn-full-backup">Download Full Backup (JSON)</button>
+    </div>
+
+    <div class="card">
+      <h2>Restore</h2>
+      <p class="sub">Upload a backup JSON file to restore data. This <b>merges</b> — records with matching IDs are overwritten with the backup's version; records that exist now but aren't in the backup are left untouched. It does not first wipe your current data.</p>
+      <label class="btn btn-outline" style="cursor:pointer; display:inline-block;">Choose Backup File<input type="file" accept="application/json" id="restore-file-input" style="display:none;"></label>
+      <span id="restore-filename" class="small muted" style="margin-left:10px;"></span>
+      <div style="margin-top:12px;"><button class="btn btn-gold" id="btn-run-restore" disabled>Restore from File</button></div>
+    </div>
+
+    <div class="card">
+      <h2>Delete Data</h2>
+      <p class="sub">Clears an entire collection. This cannot be undone — export a backup first. Each clear requires typing DELETE to confirm.</p>
+      <table>
+        <thead><tr><th>Collection</th><th>Records</th><th></th></tr></thead>
+        <tbody>
+        ${ALL_COLLECTIONS.filter(c=>c!=="meta").map(c=>`
+          <tr><td class="mono">${c}</td><td>${counts[c]}</td>
+          <td><button class="btn btn-danger btn-sm clear-collection-btn" data-collection="${c}" ${counts[c]===0?'disabled':''}>Clear</button></td></tr>`).join("")}
+        </tbody>
+      </table>
+    </div>
+  `;
+}
+
 async function renderUserManagement(){
   const staff = await db.getAll("staff");
   return `
@@ -2853,6 +3348,12 @@ async function renderUserManagement(){
         ${staff.map(s=>`<tr><td>${esc(s.name)}</td><td class="mono">${esc(s.username)}</td><td><span class="badge badge-role">${esc(s.role)}</span></td><td>${esc(s.branch)||"—"}</td><td>${fmtDate(s.createdAt)}</td></tr>`).join("")}
         </tbody>
       </table>
+    </div>
+    <div class="card">
+      <div class="flex-between">
+        <div><h2>Demo Data</h2><p class="sub" style="margin-bottom:0;">One-click sample data — 3 customers, leads at different stages, a full sanction → disbursement → EMI collection cycle — so you can click through every menu with something real to look at. Safe to run once; running it again adds more sample records rather than duplicating exact ones.</p></div>
+        <button class="btn btn-outline btn-sm" id="btn-load-demo-data">Load Demo Data</button>
+      </div>
     </div>
   `;
 }
@@ -3039,6 +3540,8 @@ function bindEvents(){
 
   const addStaffBtn = document.getElementById("btn-add-staff");
   if(addStaffBtn) addStaffBtn.onclick = handleAddStaff;
+  const loadDemoBtn = document.getElementById("btn-load-demo-data");
+  if(loadDemoBtn) loadDemoBtn.onclick = handleLoadDemoData;
 
   const submitAppBtn = document.getElementById("btn-submit-application");
   if(submitAppBtn) submitAppBtn.onclick = handleSubmitApplication;
@@ -3094,6 +3597,9 @@ function bindEvents(){
   });
   const saveProductBtn = document.getElementById("btn-save-product");
   if(saveProductBtn) saveProductBtn.onclick = handleSaveProduct;
+  document.querySelectorAll(".activate-product-btn").forEach(btn=>{
+    btn.onclick = ()=> handleToggleProductActive(btn.dataset.product, btn.dataset.activate==="1");
+  });
 
   // Credit Policy
   const savePolicyBtn = document.getElementById("btn-save-policy");
@@ -3147,6 +3653,13 @@ function bindEvents(){
   if(closeLetterBtn) closeLetterBtn.onclick = ()=>{ session.sanctionSubview="list"; render(); };
   const printLetterBtn = document.getElementById("btn-print-letter");
   if(printLetterBtn) printLetterBtn.onclick = ()=> window.print();
+  document.querySelectorAll(".send-letter-btn").forEach(btn=>{
+    btn.onclick = ()=> handleSendSanctionLetter(btn.dataset.sanction, btn.dataset.channel);
+  });
+  const markSentSigBtn = document.getElementById("btn-mark-sent-signature");
+  if(markSentSigBtn) markSentSigBtn.onclick = ()=> handleMarkSentForSignature(markSentSigBtn.dataset.sanction);
+  const signedDocInput = document.getElementById("signed-doc-input");
+  if(signedDocInput) signedDocInput.onchange = (e)=> handleUploadSignedDoc(e, signedDocInput.dataset.sanction);
 
   // Fund Management
   const openNewFund = document.getElementById("btn-open-new-fund");
@@ -3188,6 +3701,10 @@ function bindEvents(){
   const saveCustomReminderBtn = document.getElementById("btn-save-custom-reminder");
   if(saveCustomReminderBtn) saveCustomReminderBtn.onclick = handleSaveCustomReminder;
   document.querySelectorAll(".mark-reminder-sent-btn").forEach(btn=> btn.onclick = ()=> handleMarkReminderSent(btn.dataset.reminder));
+  const openMsgConfig = document.getElementById("btn-open-messaging-config");
+  if(openMsgConfig) openMsgConfig.onclick = ()=>{ session.staffTab="apiconfig"; render(); };
+  const gotoRbiReturnsBtn = document.getElementById("btn-goto-rbi-returns");
+  if(gotoRbiReturnsBtn) gotoRbiReturnsBtn.onclick = ()=>{ session.staffTab="ratios"; render(); };
 
   // Overdue & NPA / Recovery
   document.querySelectorAll(".recovery-officer-select").forEach(sel=>{
@@ -3214,6 +3731,33 @@ function bindEvents(){
   if(exportCashbookBtn) exportCashbookBtn.onclick = handleExportCashbook;
   const exportTallyBtn = document.getElementById("btn-export-tally");
   if(exportTallyBtn) exportTallyBtn.onclick = handleExportTally;
+  const jfType = document.getElementById("jf-type");
+  const jfCategory = document.getElementById("jf-category");
+  if(jfType && jfCategory){
+    const paintCategories = ()=>{
+      const opts = jfType.value==="Income" ? JOURNAL_INCOME_CATEGORIES : JOURNAL_EXPENSE_CATEGORIES;
+      jfCategory.innerHTML = opts.map(c=>`<option>${c}</option>`).join("");
+    };
+    jfType.onchange = paintCategories;
+    paintCategories();
+  }
+  const saveJournalBtn = document.getElementById("btn-save-journal");
+  if(saveJournalBtn) saveJournalBtn.onclick = handleSaveJournalEntry;
+  document.querySelectorAll(".approve-journal-btn").forEach(btn=> btn.onclick = ()=> handleApproveJournalEntry(btn.dataset.entry));
+  document.querySelectorAll(".reject-journal-btn").forEach(btn=> btn.onclick = ()=> handleRejectJournalEntry(btn.dataset.entry));
+
+  // Ratios & Compliance
+  document.querySelectorAll(".compliance-status-select").forEach(sel=>{
+    sel.onchange = ()=> handleUpdateCompliance(sel.dataset.item, "status", sel.value);
+  });
+  document.querySelectorAll(".compliance-notes-input").forEach(inp=>{
+    inp.onchange = ()=> handleUpdateCompliance(inp.dataset.item, "notes", inp.value);
+  });
+  const addRbiFilingBtn = document.getElementById("btn-add-rbi-filing");
+  if(addRbiFilingBtn) addRbiFilingBtn.onclick = handleAddRbiFiling;
+  document.querySelectorAll(".mark-rbi-submitted-btn").forEach(btn=>{
+    btn.onclick = ()=> handleMarkRbiSubmitted(btn.dataset.filing);
+  });
 
   // Reports
   const reportSelect = document.getElementById("report-select");
@@ -3243,6 +3787,23 @@ function bindEvents(){
   document.querySelectorAll(".run-appraisal-verify-btn").forEach(btn=>{
     btn.onclick = ()=> handleRunAppraisalVerification(btn.dataset.appraisal, btn.dataset.service, btn.dataset.field);
   });
+
+  // Data Management
+  const fullBackupBtn = document.getElementById("btn-full-backup");
+  if(fullBackupBtn) fullBackupBtn.onclick = handleFullBackup;
+  const restoreFileInput = document.getElementById("restore-file-input");
+  if(restoreFileInput){
+    restoreFileInput.onchange = ()=>{
+      const f = restoreFileInput.files[0];
+      document.getElementById("restore-filename").textContent = f ? f.name : "";
+      document.getElementById("btn-run-restore").disabled = !f;
+    };
+  }
+  const runRestoreBtn = document.getElementById("btn-run-restore");
+  if(runRestoreBtn) runRestoreBtn.onclick = handleRestoreBackup;
+  document.querySelectorAll(".clear-collection-btn").forEach(btn=>{
+    btn.onclick = ()=> handleClearCollection(btn.dataset.collection);
+  });
 }
 
 /* ---------------------------------------------------------------------
@@ -3250,6 +3811,8 @@ function bindEvents(){
    --------------------------------------------------------------------- */
 async function handleSaveProduct(){
   const existingId = document.getElementById("btn-save-product").dataset.product;
+  const isSuperAdmin = session.user.role==="Super Admin";
+  const activeEl = document.getElementById("pf-active");
   const rec = {
     id: existingId || uid("prd"),
     name: document.getElementById("pf-name").value.trim(),
@@ -3257,20 +3820,32 @@ async function handleSaveProduct(){
     emiFrequency: document.getElementById("pf-freq").value,
     tenureMin: Number(document.getElementById("pf-tenure-min").value)||0,
     tenureMax: Number(document.getElementById("pf-tenure-max").value)||0,
+    maxLoanAmount: Number(document.getElementById("pf-max-amount").value)||0,
     moratoriumMonths: Number(document.getElementById("pf-moratorium").value)||0,
     processingFeePct: Number(document.getElementById("pf-processing").value)||0,
     insurancePct: Number(document.getElementById("pf-insurance").value)||0,
     penaltyRatePct: Number(document.getElementById("pf-penalty").value)||0,
     gstPct: Number(document.getElementById("pf-gst").value)||0,
     securityRequired: document.getElementById("pf-security").value,
-    active: document.getElementById("pf-active").value === "true",
+    active: isSuperAdmin && activeEl ? (activeEl.value === "true") : false,
     createdAt: nowISO()
   };
   if(!rec.name){ toast("Product name is required."); return; }
   await db.put("products", rec);
-  await logAudit(session.user.name, session.user.role, existingId?"Product Updated":"Product Created", `${rec.name} — ${rec.interestRate}% p.a.`);
-  toast("Product saved: "+rec.name);
+  await logAudit(session.user.name, session.user.role, existingId?"Product Updated":"Product Created", `${rec.name} — ${rec.interestRate}% p.a. — Max ${fmtINR(rec.maxLoanAmount)}${!isSuperAdmin ? ' — saved as Draft, awaiting Super Admin activation' : ''}`);
+  toast(isSuperAdmin ? "Product saved: "+rec.name : "Saved as Draft — a Super Admin needs to activate it.");
   session.productSubview = "list";
+  render();
+}
+
+async function handleToggleProductActive(productId, makeActive){
+  const u = session.user;
+  const product = await db.get("products", productId);
+  if(!product) return;
+  product.active = makeActive;
+  await db.put("products", product);
+  await logAudit(u.name, u.role, makeActive ? "Product Activated" : "Product Deactivated", `${product.name} — Max ${fmtINR(product.maxLoanAmount)}`);
+  toast(product.name+(makeActive?" activated.":" deactivated."));
   render();
 }
 
@@ -3279,6 +3854,7 @@ async function handleSaveProduct(){
    --------------------------------------------------------------------- */
 async function handleSavePolicy(){
   const policy = (await db.get("policyConfig","default")) || defaultPolicyConfig();
+  if(!policy.journalLimits) policy.journalLimits = defaultPolicyConfig().journalLimits;
   document.querySelectorAll(".policy-input").forEach(inp=>{
     const group = inp.dataset.group, idx = Number(inp.dataset.index), field = inp.dataset.field;
     if(policy[group] && policy[group][idx]) policy[group][idx][field] = Number(inp.value)||0;
@@ -3412,6 +3988,13 @@ async function handleSubmitSanction(){
   const tenure = Number(document.getElementById("sf-tenure").value);
   if(!amount || amount<=0){ toast("Enter a valid sanctioned amount."); return; }
 
+  const products = await db.getAll("products");
+  const prod = products.find(p=>p.name===lead.product);
+  if(prod && prod.maxLoanAmount && amount > prod.maxLoanAmount){
+    toast(`Exceeds the ${lead.product} maximum of ${fmtINR(prod.maxLoanAmount)} set in Loan Products. Only Super Admin can raise that limit — this cannot be overridden here.`);
+    return;
+  }
+
   const fundPos = await computeFundPosition();
   const fundsOk = amount <= fundPos.available;
   const overrideBox = document.getElementById("sf-override");
@@ -3531,6 +4114,54 @@ async function handleConfirmDisbursement(sanctionId){
   toast("Disbursed. Loan account created — EMI schedule and collection arrive in Phase 5.");
   session.sanctionSubview = "list";
   render();
+}
+
+/* ---------------------------------------------------------------------
+   Sanction Letter: send + signature procedure
+   --------------------------------------------------------------------- */
+async function handleSendSanctionLetter(sanctionId, channel){
+  const u = session.user;
+  const sanction = await db.get("sanctions", sanctionId);
+  if(!sanction) return;
+  const customer = await db.get("customers", sanction.customerId);
+  const to = channel==="email" ? (customer?customer.personal.email:"") : (customer?customer.personal.mobile:"");
+  if(!to){ toast("No "+(channel==="email"?"email address":"mobile number")+" on file for this customer."); return; }
+  const message = `Dear ${customer.personal.name}, your ${sanction.product} of ${fmtINR(sanction.sanctionedAmount)} has been sanctioned at ${sanction.interestRate}% p.a. over ${sanction.tenureMonths} months. Please contact your branch for the full sanction letter and next steps.`;
+  const result = await sendMessage(channel, to, "Loan Sanction Letter", message);
+  await logAudit(u.name, u.role, "Sanction Letter Send Attempted", `${customer?customer.personal.name:sanctionId} — ${channel} — ${result.status}`);
+  toast(result.ok ? "Sent via "+channel+": "+result.status : result.error);
+}
+
+async function handleMarkSentForSignature(sanctionId){
+  const u = session.user;
+  const sanction = await db.get("sanctions", sanctionId);
+  if(!sanction) return;
+  sanction.signatureStatus = "Sent for Signature";
+  sanction.signatureSentAt = nowISO();
+  await db.put("sanctions", sanction);
+  await logAudit(u.name, u.role, "Sanction Letter Sent for Signature", sanctionId);
+  toast("Marked sent for signature.");
+  render();
+}
+
+async function handleUploadSignedDoc(e, sanctionId){
+  const file = e.target.files[0];
+  if(!file) return;
+  const u = session.user;
+  const reader = new FileReader();
+  reader.onload = async ()=>{
+    const sanction = await db.get("sanctions", sanctionId);
+    if(!sanction) return;
+    sanction.signedDocumentBase64 = reader.result;
+    sanction.signatureStatus = "Signed";
+    sanction.signedAt = nowISO();
+    sanction.signedBy = u.name;
+    await db.put("sanctions", sanction);
+    await logAudit(u.name, u.role, "Signed Sanction Document Uploaded", sanctionId);
+    toast("Signed copy uploaded.");
+    render();
+  };
+  reader.readAsDataURL(file);
 }
 
 /* ---------------------------------------------------------------------
@@ -3655,12 +4286,25 @@ async function handleMarkReminderSent(reminderId){
   const u = session.user;
   const r = await db.get("reminders", reminderId);
   if(!r) return;
+  const message = r.ruleLabel.startsWith("Custom:") ? r.ruleLabel.replace("Custom: ","") :
+    `Reminder: your EMI installment #${r.installmentIndex} of ${r.dueDate ? "due "+r.dueDate : ""} needs attention. Please contact your branch.`;
+
+  let sendResults = [];
+  for(const channel of (r.channels||[])){
+    const key = channel==="WhatsApp" ? "whatsapp" : channel==="Email" ? "email" : null;
+    if(!key) continue; // SMS/Push/Voice have no configured provider hook yet
+    const result = await sendMessage(key, r.customerMobile, "Payment Reminder", message);
+    sendResults.push(`${channel}: ${result.status}`);
+  }
+
   r.status = "Sent";
   r.sentAt = nowISO();
   r.sentBy = u.name;
+  r.sendResults = sendResults;
   await db.put("reminders", r);
-  await logAudit(u.name, u.role, "Reminder Sent (simulated)", `${r.customerName} — ${r.ruleLabel} via ${(r.channels||[]).join(", ")}`);
-  toast("Marked as sent.");
+  const detail = sendResults.length ? sendResults.join("; ") : "no configured channel — logged only";
+  await logAudit(u.name, u.role, "Reminder Sent", `${r.customerName} — ${r.ruleLabel} — ${detail}`);
+  toast(sendResults.length ? "Send attempted: "+sendResults.join(", ") : "Marked as sent (no provider configured for these channels).");
   render();
 }
 
@@ -3790,10 +4434,145 @@ async function handleExportTally(){
   const rows = [
     ...acct.disbursementEntries.map(e=>[e.date, "Payment", "Loan Account", e.debit]),
     ...acct.collectionEntries.map(e=>[e.date, "Receipt", "Loan Account", e.credit]),
+    ...acct.journalEntries.filter(j=> !j.status || j.status==="Posted").map(j=>[j.date, j.type==="Income"?"Receipt":"Payment", j.category, j.amount]),
   ];
   downloadCSV("tally-export.csv", ["Date","Voucher Type","Ledger","Amount"], rows);
-  await logAudit(session.user.name, session.user.role, "Report Exported", "Tally-style ledger CSV");
+  await logAudit(session.user.name, session.user.role, "Report Exported", "Tally-style ledger CSV (posted entries only)");
 }
+
+/* ---------------------------------------------------------------------
+   Handlers: Journal & Expenses
+   --------------------------------------------------------------------- */
+async function handleSaveJournalEntry(){
+  const u = session.user;
+  const type = document.getElementById("jf-type").value;
+  const category = document.getElementById("jf-category").value;
+  const date = document.getElementById("jf-date").value;
+  const amount = Number(document.getElementById("jf-amount").value);
+  const fundAccountId = document.getElementById("jf-account").value;
+  const description = document.getElementById("jf-description").value.trim();
+  if(!amount || amount<=0){ toast("Enter a valid amount."); return; }
+  const fundAccount = await db.get("fundAccounts", fundAccountId);
+  if(!fundAccount){ toast("Select a fund account."); return; }
+  if(type==="Expense" && amount > fundAccount.balance){ toast("Amount exceeds the selected account's balance."); return; }
+
+  const policy = (await db.get("policyConfig","default")) || defaultPolicyConfig();
+  const ownLimit = getJournalLimitForRole(policy, u.role);
+  const withinOwnLimit = u.role==="Super Admin" || amount <= ownLimit;
+
+  const entry = {
+    id: uid("jnl"), type, category, date, amount, description,
+    fundAccountId, fundAccountName: fundAccount.name, createdAt: nowISO(), createdBy: u.name,
+    proposedBy: u.name, proposedByRole: u.role,
+    status: withinOwnLimit ? "Posted" : "Pending Approval",
+    approvedBy: withinOwnLimit ? u.name : null, approvedAt: withinOwnLimit ? nowISO() : null
+  };
+  await db.put("journalEntries", entry);
+
+  if(withinOwnLimit){
+    fundAccount.balance += (type==="Income" ? amount : -amount);
+    await db.put("fundAccounts", fundAccount);
+    await logAudit(u.name, u.role, "Journal Entry Posted", `${type}: ${category} — ${fmtINR(amount)}${description?" — "+description:""}`);
+    toast("Entry recorded.");
+  } else {
+    await logAudit(u.name, u.role, "Journal Entry Proposed (Pending Approval)", `${type}: ${category} — ${fmtINR(amount)} exceeds your self-authorized limit of ${fmtINR(ownLimit)} — needs a different officer's approval`);
+    toast("Above your authorized limit — sent for approval by another officer.");
+  }
+  render();
+}
+
+async function handleApproveJournalEntry(entryId){
+  const u = session.user;
+  const entry = await db.get("journalEntries", entryId);
+  if(!entry) return;
+  if(entry.proposedBy === u.name){ toast("Maker-Checker: you cannot approve your own entry."); return; }
+  const policy = (await db.get("policyConfig","default")) || defaultPolicyConfig();
+  const limit = getJournalLimitForRole(policy, u.role);
+  if(u.role!=="Super Admin" && limit < entry.amount){ toast("This amount exceeds your authorized limit."); return; }
+  const fundAccount = await db.get("fundAccounts", entry.fundAccountId);
+  if(!fundAccount){ toast("Fund account not found."); return; }
+  if(entry.type==="Expense" && entry.amount > fundAccount.balance){ toast("Amount now exceeds the account's balance — cannot approve."); return; }
+
+  entry.status = "Posted";
+  entry.approvedBy = u.name;
+  entry.approvedAt = nowISO();
+  await db.put("journalEntries", entry);
+  fundAccount.balance += (entry.type==="Income" ? entry.amount : -entry.amount);
+  await db.put("fundAccounts", fundAccount);
+  await logAudit(u.name, u.role, "Journal Entry Approved", `${entry.type}: ${entry.category} — ${fmtINR(entry.amount)} (Maker: ${entry.proposedBy})`);
+  toast("Entry approved and posted.");
+  render();
+}
+
+async function handleRejectJournalEntry(entryId){
+  const u = session.user;
+  const entry = await db.get("journalEntries", entryId);
+  if(!entry) return;
+  if(entry.proposedBy === u.name){ toast("Maker-Checker: you cannot reject your own entry."); return; }
+  const reason = window.prompt("Reason for rejecting this entry:", "");
+  if(reason===null) return;
+  entry.status = "Rejected";
+  entry.rejectedBy = u.name;
+  entry.rejectedAt = nowISO();
+  entry.rejectionReason = reason;
+  await db.put("journalEntries", entry);
+  await logAudit(u.name, u.role, "Journal Entry Rejected", `${entry.type}: ${entry.category} — ${fmtINR(entry.amount)} — ${reason||"no reason given"}`);
+  toast("Entry rejected.");
+  render();
+}
+
+/* ---------------------------------------------------------------------
+   Handlers: Compliance Checklist
+   --------------------------------------------------------------------- */
+async function handleUpdateCompliance(itemId, field, value){
+  const u = session.user;
+  const item = await db.get("complianceItems", itemId);
+  if(!item) return;
+  item[field] = value;
+  item.updatedBy = u.name;
+  item.updatedAt = nowISO();
+  await db.put("complianceItems", item);
+  await logAudit(u.name, u.role, "Compliance Item Updated", `${item.item} — ${field}: ${value}`);
+  if(field==="status") toast("Status updated.");
+}
+
+/* ---------------------------------------------------------------------
+   RBI Returns Tracker
+   --------------------------------------------------------------------- */
+async function handleAddRbiFiling(){
+  const u = session.user;
+  const code = document.getElementById("rf-code").value;
+  const period = document.getElementById("rf-period").value.trim();
+  const dueDate = document.getElementById("rf-duedate").value;
+  if(!period || !dueDate){ toast("Enter a period and a due date."); return; }
+  await db.put("rbiReturnFilings", {
+    id: uid("rbf"), code, period, dueDate, submittedDate:null, submittedBy:null,
+    createdAt: nowISO(), createdBy: u.name
+  });
+  await logAudit(u.name, u.role, "RBI Return Filing Tracked", `${code} — ${period} — due ${dueDate}`);
+  toast("Filing tracked.");
+  render();
+}
+
+async function handleMarkRbiSubmitted(filingId){
+  const u = session.user;
+  const filing = await db.get("rbiReturnFilings", filingId);
+  if(!filing) return;
+  filing.submittedDate = todayStr();
+  filing.submittedBy = u.name;
+  await db.put("rbiReturnFilings", filing);
+  await logAudit(u.name, u.role, "RBI Return Marked Submitted", `${filing.code} — ${filing.period}`);
+  toast("Marked submitted.");
+  render();
+}
+
+async function computeOverdueRbiReturns(){
+  const filings = await db.getAll("rbiReturnFilings");
+  const today = todayStr();
+  return filings.filter(f=> !f.submittedDate && f.dueDate < today);
+}
+
+
 
 async function handleExportReport(){
   const selected = session.selectedReport || REPORT_DEFS[0].id;
@@ -3910,8 +4689,68 @@ async function handleSaveApiConfig(){
   cfg.updatedAt = nowISO();
   cfg.updatedBy = u.name;
   await db.put("apiConfig", cfg);
-  await logAudit(u.name, u.role, "Verification API Configured", `Provider: ${cfg.provider||"(unnamed)"} — services enabled: ${VERIFICATION_SERVICES.filter(s=>cfg[s.key+"Enabled"]).map(s=>s.label).join(", ")||"none"}`);
+  await logAudit(u.name, u.role, "Integrations Configured", `Provider: ${cfg.provider||"(unnamed)"} — services enabled: ${VERIFICATION_SERVICES.filter(s=>cfg[s.key+"Enabled"]).map(s=>s.label).join(", ")||"none"}`);
   toast("Configuration saved.");
+  render();
+}
+
+/* ---------------------------------------------------------------------
+   Data Management: backup, restore, delete
+   --------------------------------------------------------------------- */
+async function handleFullBackup(){
+  const u = session.user;
+  toast("Preparing backup…");
+  const backup = { _meta: { exportedAt: nowISO(), exportedBy: u.name, app: "NBFC LMS" } };
+  for(const c of ALL_COLLECTIONS){
+    backup[c] = await db.getAll(c);
+  }
+  downloadJSON(`nbfc-lms-backup-${todayStr()}.json`, backup);
+  await logAudit(u.name, u.role, "Full Backup Downloaded", `${ALL_COLLECTIONS.length} collections`);
+  toast("Backup downloaded.");
+}
+
+async function handleRestoreBackup(){
+  const u = session.user;
+  const input = document.getElementById("restore-file-input");
+  const file = input.files[0];
+  if(!file) return;
+  if(!window.confirm(`Restore from "${file.name}"? This will overwrite any existing records that share an ID with the backup. This cannot be undone. Continue?`)) return;
+
+  const reader = new FileReader();
+  reader.onload = async ()=>{
+    try{
+      const backup = JSON.parse(reader.result);
+      let totalRestored = 0;
+      for(const c of ALL_COLLECTIONS){
+        const records = backup[c];
+        if(!Array.isArray(records)) continue;
+        for(const rec of records){
+          if(!rec || !rec.id) continue;
+          await db.put(c, rec);
+          totalRestored++;
+        }
+      }
+      await logAudit(u.name, u.role, "Backup Restored", `${totalRestored} records from ${file.name}`);
+      toast(`Restore complete — ${totalRestored} records written.`);
+      render();
+    } catch(err){
+      toast("Restore failed — the file doesn't look like a valid backup JSON.");
+    }
+  };
+  reader.readAsText(file);
+}
+
+async function handleClearCollection(collectionName){
+  const u = session.user;
+  const records = await db.getAll(collectionName);
+  if(records.length===0) return;
+  const typed = window.prompt(`Type DELETE to permanently clear all ${records.length} record(s) in "${collectionName}". This cannot be undone — download a backup first if you haven't.`, "");
+  if(typed !== "DELETE"){ toast("Cancelled — nothing was deleted."); return; }
+  for(const rec of records){
+    await firestoreDb.collection(collectionName).doc(rec.id).delete();
+  }
+  await logAudit(u.name, u.role, "Collection Cleared", `${collectionName} — ${records.length} record(s) deleted`);
+  toast(`Cleared ${records.length} record(s) from ${collectionName}.`);
   render();
 }
 
@@ -4069,6 +4908,146 @@ async function handleAddStaff(){
   render();
 }
 
+async function handleLoadDemoData(){
+  const u = session.user;
+  toast("Loading demo data…");
+  try{
+    const products = await db.getAll("products");
+    const prod = products.find(p=>p.name==="Business Loan") || products[0];
+    const fundAccounts = await db.getAll("fundAccounts");
+    const fundAccount = fundAccounts[0] || null;
+
+    // --- Lead 1: fresh walk-in, no customer yet ---
+    await db.put("leads", {
+      id: uid("led"), applicantName:"Ramesh Patil", mobile:"9876543210", aadhaar:"234567890123", pan:"ABCDP1234R",
+      location:"Nagpur, Maharashtra", borrowerId:null, product: prod.name, amountRequested:80000,
+      purpose:"Purchase inventory for kirana store", occupation:"Kirana store owner", monthlyIncome:22000,
+      existingLoan:"No", source:"Walk-in", status:"New", createdAt: nowISO(), customerId:null, sanctionId:null
+    });
+
+    // --- Customer 2 + Lead: converted to customer, Eligible, no sanction yet ---
+    const cust2 = {
+      id: uid("cus"), personal:{name:"Meena Joshi", dob:"1985-04-12", gender:"Female", maritalStatus:"Married", mobile:"9823456701", email:""},
+      family:{name:"Suresh Joshi", dependents:"2"},
+      address:{current:"14 Shivaji Nagar, Pune, Maharashtra", permanent:"14 Shivaji Nagar, Pune, Maharashtra"},
+      business:{name:"Meena Tailoring Unit", type:"Tailoring", years:"5"},
+      income:{monthly:18000, annual:216000, source:"Tailoring business"},
+      bank:{name:"Bank of Maharashtra", account:"60123456789", ifsc:"MAHB0001234"},
+      nominee:{name:"Suresh Joshi", relationship:"Spouse", mobile:"9823456702"},
+      references:["Anita Deshmukh, 9812345678, Neighbour","Ravi Kulkarni, 9812345679, Relative"],
+      existingLoans:"", previousLoans:"", creditScore:702, riskCategory:"Medium",
+      kyc:{aadhaar:"345678901234", pan:"BCDEF2345M", otherIdType:"", otherIdNumber:"", photoBase64:null, docImageBase64:null, signatureBase64:null, gpsLat:null, gpsLng:null},
+      duplicateFlag:false, duplicateReason:"", leadId:null, createdAt: nowISO(), createdBy: u.name
+    };
+    await db.put("customers", cust2);
+    const lead2 = {
+      id: uid("led"), applicantName:"Meena Joshi", mobile:"9823456701", aadhaar:"345678901234", pan:"BCDEF2345M",
+      location:"Pune, Maharashtra", borrowerId:null, product: prod.name, amountRequested:120000,
+      purpose:"Buy new sewing machines", occupation:"Tailoring", monthlyIncome:18000, existingLoan:"No",
+      source:"Referral", status:"Eligible", createdAt: nowISO(), customerId:cust2.id, sanctionId:null
+    };
+    await db.put("leads", lead2);
+    cust2.leadId = lead2.id;
+    await db.put("customers", cust2);
+
+    // --- Customer 3: full cycle — customer, appraisal, approved sanction, disbursed, 1 EMI collected ---
+    const cust3 = {
+      id: uid("cus"), personal:{name:"Sunita Devi", dob:"1980-08-20", gender:"Female", maritalStatus:"Married", mobile:"9811122233", email:""},
+      family:{name:"Ram Devi", dependents:"3"},
+      address:{current:"Ward 5, Wardha, Maharashtra", permanent:"Ward 5, Wardha, Maharashtra"},
+      business:{name:"Sunita General Store", type:"Retail / Kirana", years:"8"},
+      income:{monthly:26000, annual:312000, source:"General store"},
+      bank:{name:"Central Bank of India", account:"3312345678901", ifsc:"CBIN0281234"},
+      nominee:{name:"Ram Devi", relationship:"Spouse", mobile:"9811122234"},
+      references:["Kavita Rao, 9800011122, Neighbour","Ganesh Pawar, 9800011123, Supplier"],
+      existingLoans:"", previousLoans:"Closed gold loan with local cooperative bank, 2021", creditScore:748, riskCategory:"Low",
+      kyc:{aadhaar:"456789012345", pan:"CDEFG3456N", otherIdType:"", otherIdNumber:"", photoBase64:null, docImageBase64:null, signatureBase64:null, gpsLat:null, gpsLng:null},
+      duplicateFlag:false, duplicateReason:"", leadId:null, createdAt: nowISO(), createdBy: u.name
+    };
+    await db.put("customers", cust3);
+
+    const lead3 = {
+      id: uid("led"), applicantName:"Sunita Devi", mobile:"9811122233", aadhaar:"456789012345", pan:"CDEFG3456N",
+      location:"Wardha, Maharashtra", borrowerId:null, product: prod.name, amountRequested:150000,
+      purpose:"Expand store — add cold storage", occupation:"Retail / Kirana", monthlyIncome:26000, existingLoan:"No",
+      source:"Field Officer", status:"Converted into Loan Application", createdAt: nowISO(), customerId:cust3.id, sanctionId:null
+    };
+    await db.put("leads", lead3);
+    cust3.leadId = lead3.id;
+    await db.put("customers", cust3);
+
+    await db.put("appraisals", {
+      id: uid("apr"), customerId:cust3.id, leadId:lead3.id, collateralValue:null,
+      businessVerification:"Store visited — active retail operation, consistent footfall, GST registered.",
+      residenceVerification:"Owned residence, stable for 8+ years.",
+      neighbourVerification:"Well regarded locally, no adverse remarks.",
+      creditBureauReport:"Bureau score 748, one closed gold loan, no defaults.",
+      incomeAssessment:"Store ledgers show consistent monthly turnover supporting declared income.",
+      cashFlowAssessment:"Positive cash flow after household expenses.",
+      householdExpenses:12000, repaymentCapacity:9000,
+      riskRating:"Low", recommendation:"Approve",
+      photoBase64:null, gpsLat:null, gpsLng:null,
+      officerName: u.name, appraisalDate: todayStr(), status:"Submitted", createdAt: nowISO(), createdBy: u.name
+    });
+
+    const sanction3 = {
+      id: uid("snc"), leadId:lead3.id, customerId:cust3.id, product: prod.name,
+      sanctionedAmount:150000, interestRate: prod.interestRate, tenureMonths: prod.tenureMax,
+      proposedBy: u.name, proposedByRole: u.role, createdAt: nowISO(),
+      status:"Approved", approvedBy: u.name, approvedByRole: u.role, approvedAt: nowISO(),
+      disbursementId:null, loanAccountId:null, overrideUsed:false, overrideReason:""
+    };
+    await db.put("sanctions", sanction3);
+
+    const loanAccount3 = {
+      id: uid("loa"), sanctionId: sanction3.id, customerId: cust3.id, product: sanction3.product,
+      principal: sanction3.sanctionedAmount, interestRate: sanction3.interestRate, tenureMonths: sanction3.tenureMonths,
+      emiFrequency: prod.emiFrequency, disbursedDate: todayStr(), status:"Active", createdAt: nowISO(), createdBy: u.name
+    };
+    const gen = generateEmiSchedule(loanAccount3);
+    loanAccount3.schedule = gen.schedule;
+    loanAccount3.emiAmount = gen.emiAmount;
+    loanAccount3.totalInstallments = gen.totalInstallments;
+    loanAccount3.principalOutstanding = loanAccount3.principal;
+    await db.put("loanAccounts", loanAccount3);
+
+    const disbursement3 = {
+      id: uid("dsb"), sanctionId: sanction3.id, customerId: cust3.id, amount: sanction3.sanctionedAmount,
+      mode:"Bank Transfer", date: todayStr(), utr:"DEMO"+Date.now(),
+      fundAccountId: fundAccount?fundAccount.id:null, fundAccountName: fundAccount?fundAccount.name:"—",
+      createdAt: nowISO(), createdBy: u.name
+    };
+    await db.put("disbursements", disbursement3);
+    if(fundAccount){ fundAccount.balance -= sanction3.sanctionedAmount; await db.put("fundAccounts", fundAccount); }
+
+    sanction3.disbursementId = disbursement3.id;
+    sanction3.loanAccountId = loanAccount3.id;
+    await db.put("sanctions", sanction3);
+
+    const firstInst = loanAccount3.schedule[0];
+    await db.put("payments", {
+      id: uid("pay"), loanAccountId: loanAccount3.id, customerId: cust3.id, installmentIndex: firstInst.index,
+      amount: firstInst.emiAmount, mode:"UPI", date: todayStr(), referenceNumber:"DEMOPAY1", collectedBy: u.name,
+      createdAt: nowISO(), fundAccountId: fundAccount?fundAccount.id:null, fundAccountName: fundAccount?fundAccount.name:null
+    });
+    if(fundAccount){
+      const freshFund = await db.get("fundAccounts", fundAccount.id);
+      freshFund.balance += firstInst.emiAmount;
+      await db.put("fundAccounts", freshFund);
+    }
+    firstInst.status = "Paid"; firstInst.paidAmount = firstInst.emiAmount; firstInst.paidDate = todayStr();
+    loanAccount3.principalOutstanding = loanAccount3.schedule.filter(i=>i.status!=="Paid").reduce((s,i)=>s+i.principalComponent,0);
+    await db.put("loanAccounts", loanAccount3);
+
+    await logAudit(u.name, u.role, "Demo Data Loaded", "3 sample customers/leads created; one full sanction→disbursement→EMI cycle (Sunita Devi)");
+    toast("Demo data loaded — explore the menus now.");
+    render();
+  } catch(err){
+    console.error(err);
+    toast("Demo data failed to load: "+(err.message||err));
+  }
+}
+
 async function handleSubmitApplication(){
   const u = session.user;
   const product = document.getElementById("ap-product").value;
@@ -4221,6 +5200,8 @@ async function handleSaveCustomer(){
     await ensureSeed();
     await ensureSeedPhase3();
     await ensureSeedPhase4();
+    await ensureSeedCompliance();
+    await ensureSeedYearEndClosing();
     await backfillLoanSchedules();
     if("serviceWorker" in navigator){
       navigator.serviceWorker.register("sw.js").catch(()=>{ /* fine if unavailable, e.g. opened via file:// */ });
