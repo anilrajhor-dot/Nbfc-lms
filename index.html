@@ -1167,40 +1167,46 @@ async function ensureSeedPhase4(){
 async function ensureSeedCompliance(){
   const flag = await db.get("meta","seededCompliance");
   if(flag) return;
+  const existing = new Set((await db.getAll("complianceItems")).map(c=>c.category+"||"+c.item));
   for(const it of DEFAULT_COMPLIANCE_ITEMS){
+    if(existing.has(it.category+"||"+it.item)) continue;
     await db.put("complianceItems", {
       id: uid("cmp"), category: it.category, item: it.item, status:"Not Started",
       notes:"", updatedBy:null, updatedAt:null, createdAt: nowISO()
     });
   }
   await db.put("meta", {key:"seededCompliance", value:true});
-  await logAudit("System", "System", "Compliance Checklist Seeded", `${DEFAULT_COMPLIANCE_ITEMS.length} default items created — a self-tracking checklist, not a regulatory filing system`);
+  await logAudit("System", "System", "Compliance Checklist Seeded", `${DEFAULT_COMPLIANCE_ITEMS.length} default items checked/created — a self-tracking checklist, not a regulatory filing system`);
 }
 
 async function ensureSeedYearEndClosing(){
   const flag = await db.get("meta","seededYearEndClosing");
   if(flag) return;
+  const existing = new Set((await db.getAll("complianceItems")).map(c=>c.category+"||"+c.item));
   for(const it of YEAR_END_CLOSING_ITEMS){
+    if(existing.has(it.category+"||"+it.item)) continue;
     await db.put("complianceItems", {
       id: uid("cmp"), category: it.category, item: it.item, status:"Not Started",
       notes:"", updatedBy:null, updatedAt:null, createdAt: nowISO()
     });
   }
   await db.put("meta", {key:"seededYearEndClosing", value:true});
-  await logAudit("System", "System", "Year-End Closing Checklist Seeded", `${YEAR_END_CLOSING_ITEMS.length} post-audit closing items added`);
+  await logAudit("System", "System", "Year-End Closing Checklist Seeded", `${YEAR_END_CLOSING_ITEMS.length} post-audit closing items checked/created`);
 }
 
 async function ensureSeedMicroEnterpriseTemplates(){
   const flag = await db.get("meta","seededMicroEnterprise");
   if(flag) return;
+  const existing = new Set((await db.getAll("microEnterpriseTemplates")).map(t=>t.businessType));
   for(const t of DEFAULT_MICRO_ENTERPRISE_TEMPLATES){
+    if(existing.has(t.businessType)) continue;
     const monthlyProfit = t.monthlyRevenue - t.monthlyExpenses;
     await db.put("microEnterpriseTemplates", {
       id: uid("met"), ...t, monthlyProfit, createdAt: nowISO(), createdBy:"system"
     });
   }
   await db.put("meta", {key:"seededMicroEnterprise", value:true});
-  await logAudit("System", "System", "Micro Enterprise Templates Seeded", `${DEFAULT_MICRO_ENTERPRISE_TEMPLATES.length} illustrative business-type reference templates added`);
+  await logAudit("System", "System", "Micro Enterprise Templates Seeded", `${DEFAULT_MICRO_ENTERPRISE_TEMPLATES.length} illustrative business-type reference templates checked/created`);
 }
 
 /* =========================================================================
@@ -3120,7 +3126,10 @@ async function renderRatiosComplianceTab(){
     <div class="card">
       <div class="flex-between">
         <div><h2 style="font-size:16px;">Compliance Checklist</h2><p class="sub" style="margin-bottom:0;">A self-tracking checklist for your team — not a regulatory filing system and not legal advice. Each item is a prompt to verify with your Company Secretary, statutory auditor, or legal counsel; marking something "Done" here has no effect outside this app.</p></div>
-        <span class="badge badge-approved">${doneCount}/${complianceItems.length} Done</span>
+        <div class="action-row">
+          <span class="badge badge-approved">${doneCount}/${complianceItems.length} Done</span>
+          ${session.user.role==="Super Admin" ? `<button class="btn btn-outline btn-sm" id="btn-dedupe-compliance">Remove Duplicates</button>` : ""}
+        </div>
       </div>
       ${Object.entries(byCategory).map(([cat, items])=>`
         <h3 class="section-h">${esc(cat)}</h3>
@@ -4412,6 +4421,8 @@ function bindEvents(){
   document.querySelectorAll(".compliance-notes-input").forEach(inp=>{
     inp.onchange = ()=> handleUpdateCompliance(inp.dataset.item, "notes", inp.value);
   });
+  const dedupeComplianceBtn = document.getElementById("btn-dedupe-compliance");
+  if(dedupeComplianceBtn) dedupeComplianceBtn.onclick = handleDedupeCompliance;
   const addRbiFilingBtn = document.getElementById("btn-add-rbi-filing");
   if(addRbiFilingBtn) addRbiFilingBtn.onclick = handleAddRbiFiling;
   document.querySelectorAll(".mark-rbi-submitted-btn").forEach(btn=>{
@@ -5580,6 +5591,40 @@ async function handleUpdateCompliance(itemId, field, value){
   await db.put("complianceItems", item);
   await logAudit(u.name, u.role, "Compliance Item Updated", `${item.item} — ${field}: ${value}`);
   if(field==="status") toast("Status updated.");
+}
+
+async function handleDedupeCompliance(){
+  const u = session.user;
+  const items = await db.getAll("complianceItems");
+  const groups = {};
+  items.forEach(it=>{
+    const key = it.category+"||"+it.item;
+    groups[key] = groups[key] || [];
+    groups[key].push(it);
+  });
+  const statusRank = {"Done":3, "In Progress":2, "Not Started":1, "Not Applicable":1};
+  let removed = 0;
+  for(const key in groups){
+    const group = groups[key];
+    if(group.length<=1) continue;
+    // Keep whichever copy has the most progress (or has notes); ties broken by earliest created.
+    group.sort((a,b)=>{
+      const rankDiff = (statusRank[b.status]||0) - (statusRank[a.status]||0);
+      if(rankDiff!==0) return rankDiff;
+      const notesDiff = (b.notes?1:0) - (a.notes?1:0);
+      if(notesDiff!==0) return notesDiff;
+      return new Date(a.createdAt) - new Date(b.createdAt);
+    });
+    const keep = group[0];
+    const toRemove = group.slice(1);
+    for(const dupe of toRemove){
+      await firestoreDb.collection("complianceItems").doc(dupe.id).delete();
+      removed++;
+    }
+  }
+  await logAudit(u.name, u.role, "Compliance Duplicates Removed", `${removed} duplicate item(s) removed, keeping the most-progressed copy of each`);
+  toast(removed>0 ? `Removed ${removed} duplicate(s).` : "No duplicates found.");
+  render();
 }
 
 /* ---------------------------------------------------------------------
