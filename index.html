@@ -315,6 +315,35 @@ async function computeFundPosition(){
   return { accounts, sanctions, totalFunds, committed, available, undisbursedCount: undisbursed.length, approvedTotal };
 }
 
+/** Day-by-day projection of available funds for the next N days, adding
+ *  each day's scheduled EMI collections (assuming on-time payment) to
+ *  today's Available Funds. Doesn't assume any future disbursements or
+ *  expenses since neither is scheduled in advance anywhere in this app —
+ *  this is a collections-side projection only, not a full cash forecast. */
+async function computeFundsProjection(days){
+  const fundPos = await computeFundPosition();
+  const loanAccounts = await db.getAll("loanAccounts");
+  const startDate = new Date(todayStr());
+  let runningBalance = fundPos.available;
+  const projection = [];
+  for(let i=0; i<days; i++){
+    const d = new Date(startDate);
+    d.setDate(d.getDate()+i);
+    const dateStr = d.toISOString().slice(0,10);
+    let expectedCollection = 0;
+    for(const acc of loanAccounts){
+      if(acc.status!=="Active") continue;
+      for(const inst of (acc.schedule||[])){
+        if(inst.status==="Paid") continue;
+        if(inst.dueDate===dateStr) expectedCollection += (inst.emiAmount - (inst.paidAmount||0));
+      }
+    }
+    runningBalance += expectedCollection;
+    projection.push({ date: dateStr, expectedCollection, projectedBalance: runningBalance });
+  }
+  return projection;
+}
+
 async function computeBorrowerExposure(customerId, excludeSanctionId){
   const sanctions = await db.getAll("sanctions");
   return sanctions.filter(s=> s.customerId===customerId && s.status==="Approved" && s.id!==excludeSanctionId)
@@ -2434,6 +2463,8 @@ async function renderSanctionLetter(sanction, customers, products){
 async function renderFundsTab(){
   const fundPos = await computeFundPosition();
   const disbursements = await db.getAll("disbursements");
+  const projection = await computeFundsProjection(15);
+  const maxProjected = Math.max(...projection.map(p=>Math.abs(p.projectedBalance)), 1);
   return `
     <div class="card">
       <h2>Fund Position</h2>
@@ -2444,6 +2475,36 @@ async function renderFundsTab(){
         <div class="kpi"><div class="lbl">Available Funds</div><div class="val">${fmtINR(fundPos.available)}</div></div>
         <div class="kpi"><div class="lbl">Total Disbursed to Date</div><div class="val">${fmtINR(disbursements.reduce((s,d)=>s+d.amount,0))}</div></div>
       </div>
+      <h3 class="section-h">Where to record daily transactions</h3>
+      <table>
+        <tbody>
+          <tr><td style="width:220px;"><b>Capital / Borrowing</b></td><td>Fund Sources below — "+ Add Fund Source" for a new capital/borrowing account, or "Adjust Balance" on an existing one for a top-up or repayment.</td></tr>
+          <tr><td><b>Loan Disbursement</b></td><td><b>Sanction &amp; Disbursement</b> tab — "Disburse" on an approved sanction. Deducts the fund account automatically and creates the loan account.</td></tr>
+          <tr><td><b>Loan Recovery (EMI)</b></td><td><b>Loan Accounts</b> tab → open an account → "Collect EMI". Credits the fund account you choose automatically.</td></tr>
+          <tr><td><b>Operating Expenses</b></td><td><b>Accounting</b> tab → Journal &amp; Expenses — record rent, salaries, utilities, etc. against a fund account.</td></tr>
+          <tr><td><b>Payroll / DSA Commission</b></td><td><b>Payroll &amp; DSA</b> tab — "Run Payroll" or "Pay Commissions"; both post to Journal &amp; Expenses automatically.</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="card">
+      <h2 style="font-size:16px;">Projected Available Funds — Next 15 Days</h2>
+      <p class="sub">Starts from today's Available Funds and adds each day's scheduled EMI collections, assuming on-time payment — this is a projection, not a guarantee; actual collections will run behind it if some installments come in late or are missed. It doesn't assume any future disbursements or expenses, since those aren't scheduled in advance in this app.</p>
+      <table>
+        <thead><tr><th>Date</th><th>Expected Collections</th><th>Projected Available Balance</th><th></th></tr></thead>
+        <tbody>
+        ${projection.map(p=>{
+          const barPct = Math.max(2, Math.min(100, (Math.abs(p.projectedBalance)/maxProjected)*100));
+          const negative = p.projectedBalance < 0;
+          return `<tr>
+            <td>${esc(p.date)}</td>
+            <td>${p.expectedCollection>0?fmtINR(p.expectedCollection):"—"}</td>
+            <td><b>${fmtINR(p.projectedBalance)}</b></td>
+            <td style="min-width:120px;"><div style="background:${negative?'var(--danger)':'var(--gold)'}; height:8px; border-radius:4px; width:${barPct}%;"></div></td>
+          </tr>`;
+        }).join("")}
+        </tbody>
+      </table>
     </div>
     <div class="card">
       <div class="flex-between">
@@ -3775,17 +3836,39 @@ async function renderShgInternalLoans(){
 async function renderMicroEnterpriseTemplatesTab(){
   const templates = await db.getAll("microEnterpriseTemplates");
   const isSuperAdmin = session.user.role==="Super Admin";
+  const editing = session.editingMicroTemplate;
+  const showForm = session.showMicroTemplateForm;
+  const t = editing || {businessType:"", monthlyRevenue:"", monthlyExpenses:"", workingCapitalCycleDays:"", notes:""};
   return `
     <div class="card">
-      <h2 style="font-size:16px;">Micro Enterprise Reference Templates</h2>
+      <div class="flex-between">
+        <h2 style="font-size:16px;">Micro Enterprise Reference Templates</h2>
+        ${isSuperAdmin ? `<button class="btn btn-gold btn-sm" id="btn-open-new-micro-template">+ New Template</button>` : ""}
+      </div>
       <div class="warn-banner" style="background:#FBF1DC;border-color:var(--gold);color:#5C4200;">⚠ Illustrative starting assumptions to speed up income assessment during appraisal — not authoritative figures. Actual revenue/expenses vary hugely by location, scale, and season; always verify against the applicant's own books, bank statements, or field visit.</div>
+
+      ${showForm ? `
+      <div class="divider"></div>
+      <div class="grid grid-3">
+        <div class="field"><label>Business type</label><input id="met-type" value="${esc(t.businessType)}"></div>
+        <div class="field"><label>Monthly revenue (₹)</label><input id="met-revenue" type="number" value="${t.monthlyRevenue}"></div>
+        <div class="field"><label>Monthly expenses (₹)</label><input id="met-expenses" type="number" value="${t.monthlyExpenses}"></div>
+        <div class="field"><label>Working capital cycle (days)</label><input id="met-cycle" type="number" value="${t.workingCapitalCycleDays}"></div>
+        <div class="field" style="grid-column:span 2;"><label>Notes</label><input id="met-notes" value="${esc(t.notes)||''}"></div>
+      </div>
+      <div class="action-row">
+        <button class="btn btn-gold btn-sm" id="btn-save-micro-template" data-template="${editing?editing.id:''}">Save Template</button>
+        <button class="btn btn-outline btn-sm" id="btn-cancel-micro-template">Cancel</button>
+      </div>
+      ` : ""}
+
       <table>
-        <thead><tr><th>Business Type</th><th>Monthly Revenue</th><th>Monthly Expenses</th><th>Monthly Profit</th><th>Working Capital Cycle</th><th>Notes</th></tr></thead>
+        <thead><tr><th>Business Type</th><th>Monthly Revenue</th><th>Monthly Expenses</th><th>Monthly Profit</th><th>Working Capital Cycle</th><th>Notes</th>${isSuperAdmin?'<th></th>':''}</tr></thead>
         <tbody>
-        ${templates.map(t=>`<tr><td>${esc(t.businessType)}</td><td>${fmtINR(t.monthlyRevenue)}</td><td>${fmtINR(t.monthlyExpenses)}</td><td>${fmtINR(t.monthlyProfit)}</td><td>${t.workingCapitalCycleDays} days</td><td class="small muted">${esc(t.notes)}</td></tr>`).join("")}
+        ${templates.map(t=>`<tr><td>${esc(t.businessType)}</td><td>${fmtINR(t.monthlyRevenue)}</td><td>${fmtINR(t.monthlyExpenses)}</td><td>${fmtINR(t.monthlyProfit)}</td><td>${t.workingCapitalCycleDays} days</td><td class="small muted">${esc(t.notes)}</td>
+          ${isSuperAdmin?`<td><div class="action-row"><button class="btn btn-outline btn-sm edit-micro-template-btn" data-template="${t.id}">Edit</button><button class="btn btn-danger btn-sm delete-micro-template-btn" data-template="${t.id}">Delete</button></div></td>`:''}</tr>`).join("")}
         </tbody>
       </table>
-      ${isSuperAdmin ? `<p class="small muted" style="margin-top:10px;">Editing these templates isn't wired up yet — ask if you'd like that added; for now this is a reference table your credit officers can consult manually.</p>` : ""}
     </div>
   `;
 }
@@ -4381,7 +4464,7 @@ function bindEvents(){
 
   // SHG / Rural Finance
   document.querySelectorAll(".tab[data-shgtab]").forEach(el=>{
-    el.onclick = ()=>{ session.shgSubTab = el.getAttribute("data-shgtab"); session.showShgGroupForm=false; session.showShgMemberForm=false; render(); };
+    el.onclick = ()=>{ session.shgSubTab = el.getAttribute("data-shgtab"); session.showShgGroupForm=false; session.showShgMemberForm=false; session.showMicroTemplateForm=false; session.editingMicroTemplate=null; render(); };
   });
   const openNewShg = document.getElementById("btn-open-new-shg");
   if(openNewShg) openNewShg.onclick = ()=>{ session.showShgGroupForm=true; render(); };
@@ -4396,6 +4479,17 @@ function bindEvents(){
   const saveShgLoanBtn = document.getElementById("btn-save-shg-loan");
   if(saveShgLoanBtn) saveShgLoanBtn.onclick = handleSaveShgInternalLoan;
   document.querySelectorAll(".mark-shg-loan-repaid-btn").forEach(btn=> btn.onclick = ()=> handleMarkShgLoanRepaid(btn.dataset.loan));
+
+  const openNewMicroTemplate = document.getElementById("btn-open-new-micro-template");
+  if(openNewMicroTemplate) openNewMicroTemplate.onclick = ()=>{ session.showMicroTemplateForm=true; session.editingMicroTemplate=null; render(); };
+  const cancelMicroTemplate = document.getElementById("btn-cancel-micro-template");
+  if(cancelMicroTemplate) cancelMicroTemplate.onclick = ()=>{ session.showMicroTemplateForm=false; session.editingMicroTemplate=null; render(); };
+  document.querySelectorAll(".edit-micro-template-btn").forEach(btn=>{
+    btn.onclick = async ()=>{ session.editingMicroTemplate = await db.get("microEnterpriseTemplates", btn.dataset.template); session.showMicroTemplateForm=true; render(); };
+  });
+  document.querySelectorAll(".delete-micro-template-btn").forEach(btn=> btn.onclick = ()=> handleDeleteMicroTemplate(btn.dataset.template));
+  const saveMicroTemplateBtn = document.getElementById("btn-save-micro-template");
+  if(saveMicroTemplateBtn) saveMicroTemplateBtn.onclick = handleSaveMicroTemplate;
 
   const exportTallyBtn = document.getElementById("btn-export-tally");
   if(exportTallyBtn) exportTallyBtn.onclick = handleExportTally;
@@ -5483,6 +5577,42 @@ async function handleMarkShgLoanRepaid(loanId){
   const member = await db.get("shgMembers", loan.memberId);
   await logAudit(u.name, u.role, "SHG Internal Loan Repaid", `${member?member.name:loan.memberId} — ${fmtINR(loan.amount)}`);
   toast("Marked repaid.");
+  render();
+}
+
+async function handleSaveMicroTemplate(){
+  const u = session.user;
+  if(u.role!=="Super Admin"){ toast("Only Super Admin can edit these templates."); return; }
+  const existingId = document.getElementById("btn-save-micro-template").dataset.template;
+  const businessType = document.getElementById("met-type").value.trim();
+  if(!businessType){ toast("Business type is required."); return; }
+  const monthlyRevenue = Number(document.getElementById("met-revenue").value)||0;
+  const monthlyExpenses = Number(document.getElementById("met-expenses").value)||0;
+  const rec = {
+    id: existingId || uid("met"),
+    businessType, monthlyRevenue, monthlyExpenses,
+    monthlyProfit: monthlyRevenue - monthlyExpenses,
+    workingCapitalCycleDays: Number(document.getElementById("met-cycle").value)||0,
+    notes: document.getElementById("met-notes").value.trim(),
+    createdAt: nowISO(), createdBy: u.name
+  };
+  await db.put("microEnterpriseTemplates", rec);
+  await logAudit(u.name, u.role, existingId?"Micro Enterprise Template Updated":"Micro Enterprise Template Created", `${businessType} — Revenue ${fmtINR(monthlyRevenue)}, Expenses ${fmtINR(monthlyExpenses)}`);
+  toast("Template saved.");
+  session.showMicroTemplateForm = false;
+  session.editingMicroTemplate = null;
+  render();
+}
+
+async function handleDeleteMicroTemplate(templateId){
+  const u = session.user;
+  if(u.role!=="Super Admin"){ toast("Only Super Admin can delete these templates."); return; }
+  const template = await db.get("microEnterpriseTemplates", templateId);
+  if(!template) return;
+  if(!window.confirm(`Delete the "${template.businessType}" template? This can't be undone.`)) return;
+  await firestoreDb.collection("microEnterpriseTemplates").doc(templateId).delete();
+  await logAudit(u.name, u.role, "Micro Enterprise Template Deleted", template.businessType);
+  toast("Template deleted.");
   render();
 }
 
