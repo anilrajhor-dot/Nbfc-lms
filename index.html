@@ -908,6 +908,40 @@ function estimateMonthlyEmi(principal, annualRatePct, tenureMonths){
   return principal * r * Math.pow(1+r, tenureMonths) / (Math.pow(1+r, tenureMonths) - 1);
 }
 
+/* ---------------------------------------------------------------------
+   Applicant-level CMA calculator (FOIR / DSCR / Debt-Equity / Current
+   Ratio / Net Worth) — standard banking ratios computed from figures
+   the appraising officer enters. Flag bands below are common rule-of-
+   thumb thresholds used in Indian bank/NBFC lending practice (Tandon
+   Committee current-ratio benchmark, typical DSCR/FOIR comfort levels)
+   — NOT a fixed regulatory standard. Your Credit Policy should set the
+   final thresholds; treat these as a starting reference, not a verdict.
+   --------------------------------------------------------------------- */
+function computeCmaRatios(cma, monthlyIncome, proposedEmi){
+  const netWorth = (cma.totalAssets||0) - (cma.totalLiabilities||0);
+  const currentRatio = cma.currentLiabilities>0 ? cma.currentAssets/cma.currentLiabilities : null;
+  const debtEquityRatio = netWorth>0 ? (cma.totalLiabilities||0)/netWorth : null;
+  const totalMonthlyObligation = (cma.existingEmi||0) + (proposedEmi||0);
+  const foirPct = monthlyIncome>0 ? (totalMonthlyObligation/monthlyIncome*100) : null;
+  const annualDebtService = totalMonthlyObligation*12;
+  const dscr = annualDebtService>0 ? ((cma.netOperatingIncome||0)/annualDebtService) : null;
+
+  const flag = (value, good, caution, higherIsBetter)=>{
+    if(value===null) return null;
+    if(higherIsBetter) return value>=good ? "Good" : value>=caution ? "Caution" : "High Risk";
+    return value<=good ? "Good" : value<=caution ? "Caution" : "High Risk";
+  };
+  return {
+    netWorth, currentRatio, debtEquityRatio, foirPct, dscr, proposedEmi, totalMonthlyObligation,
+    flags: {
+      currentRatio: flag(currentRatio, 1.33, 1.0, true),
+      debtEquityRatio: flag(debtEquityRatio, 2, 4, false),
+      foirPct: flag(foirPct, 50, 65, false),
+      dscr: flag(dscr, 1.5, 1.0, true),
+    }
+  };
+}
+
 async function generateLoanAccountNumber(){
   const existing = new Set((await db.getAll("loanAccounts")).map(a=>a.accountNumber).filter(Boolean));
   let candidate;
@@ -1967,6 +2001,17 @@ async function renderAppraisalForm(customers, leads){
         <div class="field"><label>Assessed repayment capacity (₹/month)</label><input id="af-repayment-capacity" type="number"></div>
       </div>
 
+      <h3 class="section-h">CMA / Financial Ratios</h3>
+      <p class="small muted" style="margin-top:-6px;">Optional but recommended — computes FOIR, DSCR, Current Ratio, Debt-Equity and Net Worth from figures below. Leave blank to skip; ratios needing a blank field just won't show.</p>
+      <div class="grid grid-3">
+        <div class="field"><label>Total Assets (₹)</label><input id="af-cma-assets" type="number"></div>
+        <div class="field"><label>Total Liabilities (₹, outside)</label><input id="af-cma-liabilities" type="number"></div>
+        <div class="field"><label>Current Assets (₹)</label><input id="af-cma-cur-assets" type="number"></div>
+        <div class="field"><label>Current Liabilities (₹)</label><input id="af-cma-cur-liabilities" type="number"></div>
+        <div class="field"><label>Net Operating Income (₹/year)</label><input id="af-cma-noi" type="number" placeholder="Profit before interest, annual"></div>
+        <div class="field"><label>Existing EMI Obligations (₹/month)</label><input id="af-cma-existing-emi" type="number" placeholder="Other loans, if any"></div>
+      </div>
+
       <h3 class="section-h">Risk Rating &amp; Recommendation</h3>
       <div class="grid grid-2">
         <div class="field"><label>Risk rating</label><select id="af-risk">${RISK_CATEGORIES.map(r=>`<option>${r}</option>`).join("")}</select></div>
@@ -1992,6 +2037,38 @@ async function renderAppraisalForm(customers, leads){
 
       <div class="divider"></div>
       <button class="btn btn-gold" id="btn-save-appraisal">Submit Appraisal</button>
+    </div>
+  `;
+}
+
+function flagBadgeClass(flag){
+  if(flag==="Good") return "badge-approved";
+  if(flag==="Caution") return "badge-progress";
+  if(flag==="High Risk") return "badge-rejected";
+  return "badge-new";
+}
+
+function renderCmaRatiosBlock(r){
+  const row = (label, value, flag, hint)=>`
+    <div class="kpi" ${flag?`style="border-top-color:${flag==='Good'?'var(--ok)':flag==='Caution'?'var(--warn)':flag==='High Risk'?'var(--danger)':'var(--gold)'};"`:''}>
+      <div class="lbl">${label}</div>
+      <div class="val" style="font-size:18px;">${value}</div>
+      ${flag ? `<span class="badge ${flagBadgeClass(flag)}" style="margin-top:6px;">${flag}</span>` : ""}
+      ${hint ? `<div class="small muted" style="margin-top:4px;">${hint}</div>` : ""}
+    </div>`;
+  return `
+    <h3 class="section-h">CMA / Financial Ratios</h3>
+    <div class="warn-banner" style="background:#FBF1DC;border-color:var(--gold);color:#5C4200;">⚠ Flag bands (Good/Caution/High Risk) are common rule-of-thumb thresholds in Indian bank/NBFC lending practice, not a fixed regulatory standard — your Credit Policy should set the final thresholds for sanctioning decisions.</div>
+    <div class="grid grid-4">
+      ${row("Net Worth", fmtINR(r.netWorth))}
+      ${row("Current Ratio", r.currentRatio===null?"—":r.currentRatio.toFixed(2), r.flags.currentRatio, "Benchmark ≥1.33 (Tandon Committee)")}
+      ${row("Debt-Equity Ratio", r.debtEquityRatio===null?"—":r.debtEquityRatio.toFixed(2)+":1", r.flags.debtEquityRatio, "Rule of thumb ≤2:1")}
+      ${row("DSCR", r.dscr===null?"—":r.dscr.toFixed(2), r.flags.dscr, "Comfortable ≥1.5")}
+    </div>
+    <div class="grid grid-3" style="margin-top:12px;">
+      ${row("FOIR", r.foirPct===null?"—":r.foirPct.toFixed(1)+"%", r.flags.foirPct, "Existing + proposed EMI ÷ income")}
+      <div class="kpi"><div class="lbl">Proposed EMI (estimated)</div><div class="val" style="font-size:18px;">${fmtINR(Math.round(r.proposedEmi||0))}</div></div>
+      <div class="kpi"><div class="lbl">Total Monthly Obligation</div><div class="val" style="font-size:18px;">${fmtINR(Math.round(r.totalMonthlyObligation||0))}</div></div>
     </div>
   `;
 }
@@ -2030,6 +2107,7 @@ async function renderAppraisalDetail(a, customers){
       <p><b>Income:</b> ${esc(a.incomeAssessment)||"—"}</p>
       <p><b>Cash flow:</b> ${esc(a.cashFlowAssessment)||"—"}</p>
       <p><b>Household expenses:</b> ${fmtINR(a.householdExpenses)} · <b>Repayment capacity:</b> ${fmtINR(a.repaymentCapacity)}</p>
+      ${a.cmaRatios ? renderCmaRatiosBlock(a.cmaRatios) : ""}
       <h3 class="section-h">Recommendation</h3>
       <p>${esc(a.recommendation)||"—"}</p>
       <h3 class="section-h">Litigation, Bureau &amp; Fraud Checks</h3>
@@ -4287,6 +4365,27 @@ async function handleSaveAppraisal(){
   const customerId = document.getElementById("af-customer").value;
   if(!customerId){ toast("Select a customer."); return; }
   const leadId = document.getElementById("af-lead").value || null;
+  const cust = await db.get("customers", customerId);
+
+  const cma = {
+    totalAssets: Number(document.getElementById("af-cma-assets").value)||0,
+    totalLiabilities: Number(document.getElementById("af-cma-liabilities").value)||0,
+    currentAssets: Number(document.getElementById("af-cma-cur-assets").value)||0,
+    currentLiabilities: Number(document.getElementById("af-cma-cur-liabilities").value)||0,
+    netOperatingIncome: Number(document.getElementById("af-cma-noi").value)||0,
+    existingEmi: Number(document.getElementById("af-cma-existing-emi").value)||0,
+  };
+  let proposedEmi = 0;
+  if(leadId){
+    const lead = await db.get("leads", leadId);
+    if(lead && lead.amountRequested){
+      const products = await db.getAll("products");
+      const prod = products.find(p=>p.name===lead.product);
+      if(prod) proposedEmi = estimateMonthlyEmi(lead.amountRequested, prod.interestRate, prod.tenureMax);
+    }
+  }
+  const cmaRatios = computeCmaRatios(cma, cust?cust.income.monthly:0, proposedEmi);
+
   const rec = {
     id: uid("apr"),
     customerId, leadId,
@@ -4299,6 +4398,7 @@ async function handleSaveAppraisal(){
     cashFlowAssessment: document.getElementById("af-cashflow").value.trim(),
     householdExpenses: Number(document.getElementById("af-hh-expenses").value)||null,
     repaymentCapacity: Number(document.getElementById("af-repayment-capacity").value)||null,
+    cma, cmaRatios,
     riskRating: document.getElementById("af-risk").value,
     recommendation: document.getElementById("af-recommendation").value,
     photoBase64: appraisalDraft.photoBase64,
@@ -4309,7 +4409,6 @@ async function handleSaveAppraisal(){
     createdAt: nowISO(), createdBy: session.user.name
   };
   await db.put("appraisals", rec);
-  const cust = await db.get("customers", customerId);
   await logAudit(session.user.name, session.user.role, "Credit Appraisal Submitted", `${cust?cust.personal.name:customerId} — Risk: ${rec.riskRating}, Recommendation: ${rec.recommendation}`);
 
   let autoSanctionResult = null;
