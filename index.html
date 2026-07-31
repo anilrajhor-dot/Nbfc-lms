@@ -491,7 +491,8 @@ function downloadJSON(filename, obj){
 const ALL_COLLECTIONS = [
   "staff","borrowers","leads","customers","products","appraisals","policyConfig",
   "fundAccounts","sanctions","disbursements","loanAccounts","payments","reminders",
-  "recoveryVisits","apiConfig","journalEntries","complianceItems","rbiReturnFilings","auditLog","meta"
+  "recoveryVisits","apiConfig","journalEntries","complianceItems","rbiReturnFilings",
+  "staffSalaries","payrollRuns","dsaAgents","dsaCommissions","auditLog","meta"
 ];
 
 /* ---------------------------------------------------------------------
@@ -838,6 +839,8 @@ function evaluateProductRules(product, context){
 
 const RISK_CATEGORY_SCORE = {Low:1, Medium:2, High:3};
 
+const PAYROLL_DEDUCTION_LABELS = ["Provident Fund (PF)","Professional Tax","TDS","ESI","Other Deduction"];
+
 const LEAD_STATUSES = ["New","Contacted","Documents Pending","KYC Pending","Under Verification","Eligible","Rejected","Converted into Loan Application"];
 const LEAD_SOURCES_STAFF = ["Walk-in","Referral","Business Correspondent","DSA","Bank Sakhi","Vitta Sakhi","Field Officer"];
 const ID_TYPES = ["CKYC","Voter ID","Passport","Driving Licence"];
@@ -913,6 +916,29 @@ async function generateLoanAccountNumber(){
     candidate = "LN"+new Date().getFullYear()+digits;
   } while(existing.has(candidate));
   return candidate;
+}
+
+/** Accrues a DSA commission (does not pay it — that's a separate "Pay
+ *  Commissions" run) when a lead sourced via a DSA is disbursed and
+ *  that product carries a commission %. Safe to call unconditionally;
+ *  it's a no-op if there's no DSA on the lead or no commission % set. */
+async function accrueDsaCommission(leadId, sanction, disbursedAmount, actorName){
+  if(!leadId) return;
+  const lead = await db.get("leads", leadId);
+  if(!lead || !lead.dsaId) return;
+  const dsa = await db.get("dsaAgents", lead.dsaId);
+  if(!dsa) return;
+  const products = await db.getAll("products");
+  const product = products.find(p=>p.name===sanction.product);
+  const pct = product ? (product.dsaCommissionPct||0) : 0;
+  if(pct<=0) return;
+  const commissionAmount = disbursedAmount * (pct/100);
+  await db.put("dsaCommissions", {
+    id: uid("dsc"), dsaId: dsa.id, dsaName: dsa.name, leadId, sanctionId: sanction.id,
+    disbursedAmount, commissionPct: pct, commissionAmount: Math.round(commissionAmount),
+    status:"Accrued", paidDate:null, createdAt: nowISO(), createdBy: actorName
+  });
+  await logAudit(actorName, "System", "DSA Commission Accrued", `${dsa.name} — ${fmtINR(Math.round(commissionAmount))} (${pct}% of ${fmtINR(disbursedAmount)})`);
 }
 
 async function backfillLoanSchedules(){
@@ -1261,7 +1287,7 @@ async function renderStaffShell(){
   if(tab === "dashboard"){
     tabContent = await renderManagementDashboard(leads, borrowers, customers, staffCount, appraisals, sanctions, loanAccounts, payments);
   } else if(tab === "leads"){
-    tabContent = renderLeadsQueue(leads, products);
+    tabContent = renderLeadsQueue(leads, products, await db.getAll("dsaAgents"));
   } else if(tab === "customers"){
     tabContent = await renderCustomersTab(customers);
   } else if(tab === "appraisal"){
@@ -1278,6 +1304,8 @@ async function renderStaffShell(){
     tabContent = await renderFundsTab();
   } else if(tab === "accounting" && canManageFunds){
     tabContent = await renderAccountingTab();
+  } else if(tab === "payrolldsa" && canManageFunds){
+    tabContent = await renderPayrollDsaTab();
   } else if(tab === "ratios" && canSeeReports){
     tabContent = await renderRatiosComplianceTab();
   } else if(tab === "reports" && canSeeReports){
@@ -1346,6 +1374,7 @@ async function renderStaffShell(){
         <button class="tab ${tab==='reminders'?'active':''}" data-tab="reminders">Reminders</button>
         ${canManageFunds ? `<button class="tab ${tab==='funds'?'active':''}" data-tab="funds">Fund Management</button>`:""}
         ${canManageFunds ? `<button class="tab ${tab==='accounting'?'active':''}" data-tab="accounting">Accounting</button>`:""}
+        ${canManageFunds ? `<button class="tab ${tab==='payrolldsa'?'active':''}" data-tab="payrolldsa">Payroll &amp; DSA</button>`:""}
         ${canSeeReports ? `<button class="tab ${tab==='ratios'?'active':''}" data-tab="ratios">Ratios &amp; Compliance</button>`:""}
         ${canSeeReports ? `<button class="tab ${tab==='reports'?'active':''}" data-tab="reports">Reports &amp; MIS</button>`:""}
         <button class="tab ${tab==='ai'?'active':''}" data-tab="ai">AI Insights</button>
@@ -1436,11 +1465,11 @@ function statusBadge(status){
 /* ---------------------------------------------------------------------
    Leads tab (Phase 2: staff-created leads with full field set + convert)
    --------------------------------------------------------------------- */
-function renderLeadsQueue(leads, products){
+function renderLeadsQueue(leads, products, dsaAgents){
   const sorted = leads.slice().sort((a,b)=>new Date(b.createdAt)-new Date(a.createdAt));
   const showForm = session.showNewLeadForm;
   return `
-    ${showForm ? renderNewLeadForm(products) : ""}
+    ${showForm ? renderNewLeadForm(products, dsaAgents) : ""}
     <div class="card">
       <div class="flex-between">
         <div><h2>Leads &amp; Loan Applications</h2><p class="sub">Includes self-service applications and leads logged by staff from any channel.</p></div>
@@ -1470,9 +1499,10 @@ function renderLeadsQueue(leads, products){
   `;
 }
 
-function renderNewLeadForm(products){
+function renderNewLeadForm(products, dsaAgents){
   const active = (products||[]).filter(p=>p.active);
   const opts = active.length ? active.map(p=>`<option>${esc(p.name)}</option>`).join("") : LOAN_PRODUCTS.map(p=>`<option>${p}</option>`).join("");
+  const dsaOpts = (dsaAgents||[]).filter(d=>d.active).map(d=>`<option value="${d.id}">${esc(d.name)}</option>`).join("");
   return `
     <div class="card">
       <h2>New Lead</h2>
@@ -1490,6 +1520,7 @@ function renderNewLeadForm(products){
         <div class="field"><label>Loan amount required (₹)</label><input id="nl-amount" type="number" placeholder="e.g. 100000"></div>
         <div class="field"><label>Loan purpose</label><input id="nl-purpose" placeholder="e.g. Purchase raw material"></div>
         <div class="field"><label>Source of lead</label><select id="nl-source">${LEAD_SOURCES_STAFF.map(s=>`<option>${s}</option>`).join("")}</select></div>
+        <div class="field"><label>DSA (if sourced via one)</label><select id="nl-dsa"><option value="">— None —</option>${dsaOpts}</select></div>
       </div>
       <button class="btn btn-gold" id="btn-save-new-lead">Save Lead</button>
     </div>
@@ -1778,6 +1809,9 @@ function renderProductForm(product){
       <label style="display:flex; align-items:center; gap:8px; margin-bottom:12px;"><input type="checkbox" id="pf-auto-sanction" ${p.autoSanctionEnabled?'checked':''} style="width:auto;"> Enable auto-sanction for this product when every rule below passes</label>
       <p class="small muted">Applies when an appraisal recommends "Approve" for this product. Leave a rule row's field as "— Not used —" to skip it. All configured rules must pass.</p>
       ${[0,1,2,3,4].map(ruleRow).join("")}
+
+      <h3 class="section-h">DSA Commission</h3>
+      <div class="field" style="max-width:260px;"><label>Commission (% of disbursed amount)</label><input id="pf-dsa-commission" type="number" step="0.1" value="${p.dsaCommissionPct||0}"></div>
       ` : ""}
 
       <button class="btn btn-gold" id="btn-save-product" data-product="${product?product.id:''}">Save Product</button>
@@ -3045,7 +3079,7 @@ async function renderRbiReturnsSection(){
 /* ---------------------------------------------------------------------
    Reports & MIS (Phase 7)
    --------------------------------------------------------------------- */
-const JOURNAL_EXPENSE_CATEGORIES = ["Salaries","Rent","Electricity","Office Supplies","Professional Fees","Travel","Insurance Premium","Interest on Borrowings","Other Expense"];
+const JOURNAL_EXPENSE_CATEGORIES = ["Salaries","DSA Commission","Rent","Electricity","Office Supplies","Professional Fees","Travel","Insurance Premium","Interest on Borrowings","Other Expense"];
 const JOURNAL_INCOME_CATEGORIES = ["Other Income","Investment Income","Miscellaneous Income"];
 const COMPLIANCE_STATUSES = ["Not Started","In Progress","Done","Not Applicable"];
 const DEFAULT_COMPLIANCE_ITEMS = [
@@ -3432,6 +3466,134 @@ function renderStaffHelpTab(){
 /* ---------------------------------------------------------------------
    Data Management: backup, restore, delete (Super Admin only)
    --------------------------------------------------------------------- */
+/* ---------------------------------------------------------------------
+   Payroll & DSA
+   --------------------------------------------------------------------- */
+async function renderPayrollDsaTab(){
+  const sub = session.payrollSubTab || "payroll";
+  return `
+    <div class="card">
+      <h2>Payroll &amp; DSA</h2>
+      <div class="tabs" style="margin-bottom:0; border-bottom:none;">
+        <button class="tab ${sub==='payroll'?'active':''}" data-paytab="payroll">Payroll</button>
+        <button class="tab ${sub==='dsa'?'active':''}" data-paytab="dsa">DSA Commissions</button>
+      </div>
+    </div>
+    ${sub==='payroll' ? await renderPayrollSection() : await renderDsaSection()}
+  `;
+}
+
+async function renderPayrollSection(){
+  const staffList = await db.getAll("staff");
+  const salaries = await db.getAll("staffSalaries");
+  const runs = (await db.getAll("payrollRuns")).sort((a,b)=> b.month.localeCompare(a.month) || new Date(b.createdAt)-new Date(a.createdAt));
+  const fundAccounts = await db.getAll("fundAccounts");
+  const showForm = session.showSalaryForm;
+  const deductionRow = (i)=>`
+    <div class="grid grid-2" style="margin-bottom:6px;">
+      <select class="ded-label" data-idx="${i}"><option value="">— Not used —</option>${PAYROLL_DEDUCTION_LABELS.map(l=>`<option>${l}</option>`).join("")}</select>
+      <input class="ded-amount" data-idx="${i}" type="number" placeholder="Amount (₹)">
+    </div>`;
+  return `
+    <div class="card">
+      <div class="flex-between">
+        <div><h2 style="font-size:16px;">Salary Structures</h2><p class="sub" style="margin-bottom:0;">Deductions are entered as actual amounts, not auto-computed percentages — PF/ESI/Professional Tax caps and slabs vary by state and change over time; confirm figures with your payroll consultant.</p></div>
+        <button class="btn btn-gold btn-sm" id="btn-open-new-salary">+ New Structure</button>
+      </div>
+      ${showForm ? `
+      <div class="divider"></div>
+      <div class="grid grid-3">
+        <div class="field"><label>Staff member</label><select id="sf-staff">${staffList.map(s=>`<option value="${s.id}">${esc(s.name)}</option>`).join("")}</select></div>
+        <div class="field"><label>Basic (₹)</label><input id="sf-basic" type="number"></div>
+        <div class="field"><label>HRA (₹)</label><input id="sf-hra" type="number"></div>
+        <div class="field"><label>Other allowances (₹)</label><input id="sf-allowances" type="number"></div>
+        <div class="field"><label>Effective from</label><input id="sf-effective" type="date" value="${todayStr()}"></div>
+      </div>
+      <h3 class="section-h">Deductions</h3>
+      ${[0,1,2,3].map(deductionRow).join("")}
+      <button class="btn btn-gold btn-sm" id="btn-save-salary">Save Structure</button>
+      ` : ""}
+      <table>
+        <thead><tr><th>Staff</th><th>Gross</th><th>Deductions</th><th>Net Pay</th><th>Status</th></tr></thead>
+        <tbody>
+        ${salaries.length===0 ? `<tr class="empty-row"><td colspan="5">No salary structures yet.</td></tr>` :
+          salaries.map(s=>`<tr><td>${esc(s.staffName)}</td><td>${fmtINR(s.grossSalary)}</td><td>${fmtINR(s.totalDeductions)}</td><td><b>${fmtINR(s.netSalary)}</b></td><td>${s.active?`<span class="badge badge-approved">Active</span>`:`<span class="badge badge-new">Inactive</span>`}</td></tr>`).join("")}
+        </tbody>
+      </table>
+    </div>
+
+    <div class="card">
+      <h2 style="font-size:16px;">Run Payroll</h2>
+      <p class="sub">Processes every active salary structure for the month, records each as a Salaries expense, and attempts a real bank transfer only if a payout provider is configured under Integrations — otherwise it's logged as needing manual payment.</p>
+      <div class="grid grid-3">
+        <div class="field"><label>Month</label><input id="payroll-month" type="month" value="${todayStr().slice(0,7)}"></div>
+        <div class="field"><label>Pay from fund account</label><select id="payroll-account">${fundAccounts.map(a=>`<option value="${a.id}">${esc(a.name)} — ${fmtINR(a.balance)}</option>`).join("")}</select></div>
+        <div class="field" style="align-self:end;"><button class="btn btn-gold btn-block" id="btn-run-payroll">Run Payroll</button></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2 style="font-size:16px;">Payroll History</h2>
+      <table>
+        <thead><tr><th>Month</th><th>Staff</th><th>Net Pay</th><th>Status</th><th>Date</th></tr></thead>
+        <tbody>
+        ${runs.length===0 ? `<tr class="empty-row"><td colspan="5">No payroll runs yet.</td></tr>` :
+          runs.map(r=>`<tr><td>${esc(r.month)}</td><td>${esc(r.staffName)}</td><td>${fmtINR(r.netSalary)}</td><td>${r.payoutStatus==='Paid'?`<span class="badge badge-approved">Paid</span>`:`<span class="badge badge-progress">Manual — Pending Transfer</span>`}</td><td>${esc(r.paidDate)}</td></tr>`).join("")}
+        </tbody>
+      </table>
+    </div>
+  `;
+}
+
+async function renderDsaSection(){
+  const agents = await db.getAll("dsaAgents");
+  const commissions = await db.getAll("dsaCommissions");
+  const showForm = session.showDsaForm;
+  return `
+    <div class="card">
+      <div class="flex-between">
+        <div><h2 style="font-size:16px;">DSA Agents</h2><p class="sub" style="margin-bottom:0;">Commission % is set per product under Loan Products (Super Admin). Link a DSA to a lead when creating it, under "New Lead."</p></div>
+        <button class="btn btn-gold btn-sm" id="btn-open-new-dsa">+ New DSA</button>
+      </div>
+      ${showForm ? `
+      <div class="divider"></div>
+      <div class="grid grid-3">
+        <div class="field"><label>Name</label><input id="dsa-name"></div>
+        <div class="field"><label>Mobile</label><input id="dsa-mobile" maxlength="10"></div>
+        <div class="field"><label>Email</label><input id="dsa-email" type="email"></div>
+        <div class="field"><label>Bank account</label><input id="dsa-account"></div>
+        <div class="field"><label>IFSC</label><input id="dsa-ifsc" style="text-transform:uppercase;"></div>
+      </div>
+      <button class="btn btn-gold btn-sm" id="btn-save-dsa">Save DSA</button>
+      ` : ""}
+      <table>
+        <thead><tr><th>Name</th><th>Mobile</th><th>Bank A/c</th><th>Accrued (Unpaid)</th><th></th></tr></thead>
+        <tbody>
+        ${agents.length===0 ? `<tr class="empty-row"><td colspan="5">No DSAs added yet.</td></tr>` :
+          agents.map(d=>{
+            const unpaid = commissions.filter(c=>c.dsaId===d.id && c.status==="Accrued").reduce((s,c)=>s+c.commissionAmount,0);
+            return `<tr><td>${esc(d.name)}</td><td class="mono">${esc(d.mobile)||"—"}</td><td class="mono">${esc(d.bankAccount)||"—"}</td><td>${fmtINR(unpaid)}</td>
+              <td>${unpaid>0 ? `<button class="btn btn-outline btn-sm pay-dsa-btn" data-dsa="${d.id}">Pay Commissions</button>` : ""}</td></tr>`;
+          }).join("")}
+        </tbody>
+      </table>
+    </div>
+
+    <div class="card">
+      <h2 style="font-size:16px;">Commission Ledger</h2>
+      <table>
+        <thead><tr><th>DSA</th><th>Disbursed Amount</th><th>Commission %</th><th>Commission</th><th>Status</th><th>Paid</th></tr></thead>
+        <tbody>
+        ${commissions.length===0 ? `<tr class="empty-row"><td colspan="6">No commissions accrued yet.</td></tr>` :
+          commissions.slice().sort((a,b)=>new Date(b.createdAt)-new Date(a.createdAt)).map(c=>`
+          <tr><td>${esc(c.dsaName)}</td><td>${fmtINR(c.disbursedAmount)}</td><td>${c.commissionPct}%</td><td>${fmtINR(c.commissionAmount)}</td>
+          <td>${c.status==='Paid'?`<span class="badge badge-approved">Paid</span>`:`<span class="badge badge-progress">Accrued</span>`}</td><td>${esc(c.paidDate)||"—"}</td></tr>`).join("")}
+        </tbody>
+      </table>
+    </div>
+  `;
+}
+
 async function renderDataManagementTab(){
   const counts = {};
   for(const c of ALL_COLLECTIONS){
@@ -3671,6 +3833,7 @@ function bindEvents(){
       session.custSubview="list"; session.showNewLeadForm=false;
       session.productSubview="list"; session.appraisalSubview="list"; session.sanctionSubview="list";
       session.loanSubview="list"; session.showCustomReminderForm=false; session.recoverySubview="list";
+      session.showSalaryForm=false; session.showDsaForm=false;
       render();
     };
   });
@@ -3877,6 +4040,22 @@ function bindEvents(){
   if(accrualMonthInput) accrualMonthInput.onchange = ()=>{ session.accrualMonth = accrualMonthInput.value; render(); };
   const logAccrualBtn = document.getElementById("btn-log-accrual");
   if(logAccrualBtn) logAccrualBtn.onclick = handleLogInterestAccrual;
+
+  // Payroll & DSA
+  document.querySelectorAll(".tab[data-paytab]").forEach(el=>{
+    el.onclick = ()=>{ session.payrollSubTab = el.getAttribute("data-paytab"); session.showSalaryForm=false; session.showDsaForm=false; render(); };
+  });
+  const openNewSalary = document.getElementById("btn-open-new-salary");
+  if(openNewSalary) openNewSalary.onclick = ()=>{ session.showSalaryForm=true; render(); };
+  const saveSalaryBtn = document.getElementById("btn-save-salary");
+  if(saveSalaryBtn) saveSalaryBtn.onclick = handleSaveSalaryStructure;
+  const runPayrollBtn = document.getElementById("btn-run-payroll");
+  if(runPayrollBtn) runPayrollBtn.onclick = handleRunPayroll;
+  const openNewDsa = document.getElementById("btn-open-new-dsa");
+  if(openNewDsa) openNewDsa.onclick = ()=>{ session.showDsaForm=true; render(); };
+  const saveDsaBtn = document.getElementById("btn-save-dsa");
+  if(saveDsaBtn) saveDsaBtn.onclick = handleSaveDsaAgent;
+  document.querySelectorAll(".pay-dsa-btn").forEach(btn=> btn.onclick = ()=> handlePayDsaCommissions(btn.dataset.dsa));
   const exportTallyBtn = document.getElementById("btn-export-tally");
   if(exportTallyBtn) exportTallyBtn.onclick = handleExportTally;
   const jfType = document.getElementById("jf-type");
@@ -3976,6 +4155,8 @@ async function handleSaveProduct(){
     const autoEl = document.getElementById("pf-auto-sanction");
     autoSanctionEnabled = autoEl ? autoEl.checked : false;
   }
+  const dsaCommissionEl = document.getElementById("pf-dsa-commission");
+  const dsaCommissionPct = isSuperAdmin && dsaCommissionEl ? (Number(dsaCommissionEl.value)||0) : undefined;
   const rec = {
     id: existingId || uid("prd"),
     name: document.getElementById("pf-name").value.trim(),
@@ -3993,12 +4174,13 @@ async function handleSaveProduct(){
     active: isSuperAdmin && activeEl ? (activeEl.value === "true") : false,
     rules: isSuperAdmin ? rules : (existingId ? undefined : []),
     autoSanctionEnabled: isSuperAdmin ? autoSanctionEnabled : undefined,
+    dsaCommissionPct: dsaCommissionPct,
     createdAt: nowISO()
   };
   if(existingId && !isSuperAdmin){
     // Non-Super-Admin editors shouldn't blank out an existing rule config they can't see.
     const existing = await db.get("products", existingId);
-    if(existing){ rec.rules = existing.rules; rec.autoSanctionEnabled = existing.autoSanctionEnabled; }
+    if(existing){ rec.rules = existing.rules; rec.autoSanctionEnabled = existing.autoSanctionEnabled; rec.dsaCommissionPct = existing.dsaCommissionPct; }
   }
   if(!rec.name){ toast("Product name is required."); return; }
   await db.put("products", rec);
@@ -4239,6 +4421,7 @@ async function attemptAutoSanction(lead, customer, appraisal){
     sanction.loanAccountId = loanAccount.id;
     await db.put("sanctions", sanction);
     await logAudit("System (Rule Engine)", "System", "Loan Auto-Disbursed", `${customer.personal.name} — ${fmtINR(sanction.sanctionedAmount)} to A/c ${loanAccount.accountNumber} — ${payoutResult.status}`);
+    await accrueDsaCommission(lead.id, sanction, sanction.sanctionedAmount, "System (Rule Engine)");
     return { sanctioned:true, disbursed:true, sanction, loanAccount };
   } else {
     await logAudit("System (Rule Engine)", "System", "Auto-Disbursement Pending", `${customer.personal.name} — ${fmtINR(sanction.sanctionedAmount)} sanctioned but not transferred — no payout provider configured under Integrations. Complete the transfer manually from Sanction & Disbursement.`);
@@ -4381,8 +4564,9 @@ async function handleConfirmDisbursement(sanctionId){
 
   await logAudit(u.name, u.role, "Loan Disbursed", `${sanction.product} — ${fmtINR(amount)} via ${mode} (UTR: ${utr||"—"})`);
   await logAudit(u.name, u.role, "Loan Account Created", `${loanAccount.id} for sanction ${sanction.id}`);
+  await accrueDsaCommission(sanction.leadId, sanction, amount, u.name);
 
-  toast("Disbursed. Loan account created — EMI schedule and collection arrive in Phase 5.");
+  toast("Disbursed. Loan account created.");
   session.sanctionSubview = "list";
   render();
 }
@@ -4718,6 +4902,127 @@ async function handleLogInterestAccrual(){
   const { accrued, installmentCount } = await computeMonthlyInterestAccrual(monthLabel);
   await logAudit(u.name, u.role, "Month-End Interest Accrual Logged", `${monthLabel} — ${fmtINR(Math.round(accrued))} across ${installmentCount} installment(s) — memo only, no fund balance affected`);
   toast(`Logged: ${fmtINR(Math.round(accrued))} accrued interest for ${monthLabel}.`);
+  render();
+}
+
+/* ---------------------------------------------------------------------
+   Payroll handlers
+   --------------------------------------------------------------------- */
+async function handleSaveSalaryStructure(){
+  const u = session.user;
+  const staffId = document.getElementById("sf-staff").value;
+  const staffRec = await db.get("staff", staffId);
+  if(!staffRec){ toast("Select a staff member."); return; }
+  const basic = Number(document.getElementById("sf-basic").value)||0;
+  const hra = Number(document.getElementById("sf-hra").value)||0;
+  const allowances = Number(document.getElementById("sf-allowances").value)||0;
+  const grossSalary = basic + hra + allowances;
+  const deductions = [];
+  document.querySelectorAll(".ded-label").forEach(sel=>{
+    const idx = sel.dataset.idx;
+    const label = sel.value;
+    if(!label) return;
+    const amount = Number(document.querySelector(`.ded-amount[data-idx="${idx}"]`).value) || 0;
+    if(amount>0) deductions.push({label, amount});
+  });
+  const totalDeductions = deductions.reduce((s,d)=>s+d.amount,0);
+  const netSalary = grossSalary - totalDeductions;
+  await db.put("staffSalaries", {
+    id: uid("sal"), staffId, staffName: staffRec.name, basic, hra, allowances, grossSalary,
+    deductions, totalDeductions, netSalary, effectiveFrom: document.getElementById("sf-effective").value,
+    active: true, createdAt: nowISO(), createdBy: u.name
+  });
+  await logAudit(u.name, u.role, "Salary Structure Saved", `${staffRec.name} — Gross ${fmtINR(grossSalary)} — Net ${fmtINR(netSalary)}`);
+  toast("Salary structure saved.");
+  session.showSalaryForm = false;
+  render();
+}
+
+async function handleRunPayroll(){
+  const u = session.user;
+  const month = document.getElementById("payroll-month").value;
+  const accountId = document.getElementById("payroll-account").value;
+  if(!month){ toast("Select a month."); return; }
+  const fundAccount = await db.get("fundAccounts", accountId);
+  if(!fundAccount){ toast("Select a fund account."); return; }
+  const salaries = (await db.getAll("staffSalaries")).filter(s=>s.active);
+  if(salaries.length===0){ toast("No active salary structures to run."); return; }
+
+  const alreadyRun = (await db.getAll("payrollRuns")).filter(r=>r.month===month);
+  if(alreadyRun.length>0 && !window.confirm(`Payroll for ${month} already has ${alreadyRun.length} record(s). Run again and add more?`)) return;
+
+  let totalPaid = 0, paidCount = 0, manualCount = 0;
+  for(const s of salaries){
+    const payoutResult = await attemptPayout(s.staffName, "", "", s.netSalary, "Salary — "+month);
+    const paid = payoutResult.ok;
+    await db.put("payrollRuns", {
+      id: uid("pyr"), month, staffId: s.staffId, staffName: s.staffName, grossSalary: s.grossSalary,
+      totalDeductions: s.totalDeductions, netSalary: s.netSalary, fundAccountId: accountId, fundAccountName: fundAccount.name,
+      payoutStatus: paid ? "Paid" : "Manual", paidDate: paid ? todayStr() : null, createdAt: nowISO(), createdBy: u.name
+    });
+    await db.put("journalEntries", {
+      id: uid("jnl"), type:"Expense", category:"Salaries", date: todayStr(), amount: s.netSalary,
+      description: `${s.staffName} — ${month}`, fundAccountId: accountId, fundAccountName: fundAccount.name,
+      createdAt: nowISO(), createdBy: u.name, proposedBy: u.name, proposedByRole: u.role, status:"Posted", approvedBy: u.name, approvedAt: nowISO()
+    });
+    fundAccount.balance -= s.netSalary;
+    totalPaid += s.netSalary;
+    if(paid) paidCount++; else manualCount++;
+  }
+  await db.put("fundAccounts", fundAccount);
+  await logAudit(u.name, u.role, "Payroll Run", `${month} — ${salaries.length} staff — ${fmtINR(totalPaid)} total — ${paidCount} auto-paid, ${manualCount} need manual transfer`);
+  toast(`Payroll run for ${month}: ${fmtINR(totalPaid)} across ${salaries.length} staff.${manualCount>0 ? ' '+manualCount+' need manual bank transfer (no payout provider configured).' : ''}`);
+  render();
+}
+
+/* ---------------------------------------------------------------------
+   DSA handlers
+   --------------------------------------------------------------------- */
+async function handleSaveDsaAgent(){
+  const u = session.user;
+  const name = document.getElementById("dsa-name").value.trim();
+  if(!name){ toast("DSA name is required."); return; }
+  await db.put("dsaAgents", {
+    id: uid("dsa"), name, mobile: document.getElementById("dsa-mobile").value.trim(),
+    email: document.getElementById("dsa-email").value.trim(), bankAccount: document.getElementById("dsa-account").value.trim(),
+    bankIfsc: document.getElementById("dsa-ifsc").value.trim().toUpperCase(), active:true,
+    createdAt: nowISO(), createdBy: u.name
+  });
+  await logAudit(u.name, u.role, "DSA Agent Added", name);
+  toast("DSA saved.");
+  session.showDsaForm = false;
+  render();
+}
+
+async function handlePayDsaCommissions(dsaId){
+  const u = session.user;
+  const dsa = await db.get("dsaAgents", dsaId);
+  if(!dsa) return;
+  const commissions = (await db.getAll("dsaCommissions")).filter(c=>c.dsaId===dsaId && c.status==="Accrued");
+  if(commissions.length===0) return;
+  const total = commissions.reduce((s,c)=>s+c.commissionAmount,0);
+  if(!window.confirm(`Pay ${fmtINR(total)} across ${commissions.length} accrued commission(s) to ${dsa.name}?`)) return;
+
+  const payoutResult = await attemptPayout(dsa.name, dsa.bankAccount, dsa.bankIfsc, total, "DSA commission payout");
+  const fundAccounts = await db.getAll("fundAccounts");
+  const fundAccount = fundAccounts[0] || null;
+
+  for(const c of commissions){
+    c.status = "Paid";
+    c.paidDate = todayStr();
+    await db.put("dsaCommissions", c);
+  }
+  if(fundAccount){
+    await db.put("journalEntries", {
+      id: uid("jnl"), type:"Expense", category:"DSA Commission", date: todayStr(), amount: total,
+      description: `${dsa.name} — ${commissions.length} commission(s)`, fundAccountId: fundAccount.id, fundAccountName: fundAccount.name,
+      createdAt: nowISO(), createdBy: u.name, proposedBy: u.name, proposedByRole: u.role, status:"Posted", approvedBy: u.name, approvedAt: nowISO()
+    });
+    fundAccount.balance -= total;
+    await db.put("fundAccounts", fundAccount);
+  }
+  await logAudit(u.name, u.role, "DSA Commissions Paid", `${dsa.name} — ${fmtINR(total)} — ${payoutResult.status}`);
+  toast(payoutResult.ok ? `Paid via bank transfer: ${fmtINR(total)}` : `Recorded as expense — ${payoutResult.status}. Complete the bank transfer manually.`);
   render();
 }
 
@@ -5385,11 +5690,12 @@ async function handleSaveNewLead(){
   const amountRequested = Number(document.getElementById("nl-amount").value);
   const purpose = document.getElementById("nl-purpose").value.trim();
   const source = document.getElementById("nl-source").value;
+  const dsaId = document.getElementById("nl-dsa").value || null;
   if(!name || !mobile){ toast("Name and mobile are required."); return; }
   const lead = {
     id: uid("led"), applicantName:name, mobile, aadhaar, pan, location, borrowerId:null,
     product, amountRequested: amountRequested||null, purpose, occupation, monthlyIncome: income||null,
-    existingLoan, source, status:"New", createdAt: nowISO(), customerId:null
+    existingLoan, source, status:"New", createdAt: nowISO(), customerId:null, dsaId, sanctionId:null
   };
   await db.put("leads", lead);
   await logAudit(session.user.name, session.user.role, "Lead Created", `${name} via ${source}`);
