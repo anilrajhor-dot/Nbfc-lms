@@ -622,6 +622,7 @@ const VERIFICATION_SERVICES = [
   {key:"aml",        label:"AML / Sanctions & PEP Screening", defaultEndpoint:"/api/v1/aml/screen"},
   {key:"whatsapp",   label:"WhatsApp Messaging",           defaultEndpoint:"/api/v1/whatsapp/send"},
   {key:"email",      label:"Email Messaging",              defaultEndpoint:"/api/v1/email/send"},
+  {key:"payout",     label:"Bank Payout / Disbursement (RazorpayX, Cashfree Payouts, Decentro, etc.)", defaultEndpoint:"/api/v1/payout/transfer"},
 ];
 
 const STAFF_HELP = [
@@ -708,6 +709,17 @@ async function sendMessage(channel, to, subject, message){
   return await callVerificationApi(channel, { to, subject, message });
 }
 
+/** Attempt a real bank payout via whatever provider is configured under
+ *  Integrations → "Bank Payout / Disbursement". Requires a licensed
+ *  Payment Aggregator / Banking-as-a-Service account (RazorpayX, Cashfree
+ *  Payouts, Decentro, or your bank's corporate API) — this NEVER
+ *  pretends money moved if nothing is configured; it returns
+ *  "Not Configured" and the caller must record the transaction as
+ *  manual/offline instead. */
+async function attemptPayout(accountHolderName, accountNumber, ifsc, amount, purpose){
+  return await callVerificationApi("payout", { beneficiary_name: accountHolderName, account_number: accountNumber, ifsc, amount, purpose });
+}
+
 /** Best-effort status extraction — every vendor's response shape differs.
  *  Update this once a vendor is chosen; until then it just surfaces
  *  whatever plausible status field it can find, or "Response Received —
@@ -779,6 +791,53 @@ const ROLES = [
 ];
 const DASHBOARD_ROLES = ["Super Admin","Managing Director","Credit Manager","Operations Manager","Branch Manager","Auditor","Viewer"];
 const LOAN_PRODUCTS = ["Business Loan","MSME Loan","SHG Loan","Joint Liability Group Loan","Gold Loan","Personal Loan","Consumer Loan","Emergency Loan"];
+
+/* ---------------------------------------------------------------------
+   Straight-Through Processing: per-product rule engine
+   ---------------------------------------------------------------------
+   Opt-in per product. If enabled and every rule passes for an approved
+   appraisal, the loan is auto-sanctioned and (if a payout provider is
+   configured) auto-disbursed — bypassing the human Maker-Checker step
+   your own Credit Policy otherwise requires for sanctions. This is a
+   deliberate, logged override — every auto-sanction is clearly tagged
+   in the Audit Trail as machine-decided, not a human approval.
+   --------------------------------------------------------------------- */
+const RULE_FIELDS = [
+  {key:"creditScore", label:"Credit Score", type:"number"},
+  {key:"monthlyIncome", label:"Monthly Income (₹)", type:"number"},
+  {key:"riskCategoryScore", label:"Risk Category (Low=1, Medium=2, High=3)", type:"number"},
+  {key:"amountRequested", label:"Amount Requested (₹)", type:"number"},
+  {key:"foirPct", label:"FOIR % (assessed EMI ÷ income)", type:"number"},
+];
+const RULE_OPERATORS = [">=","<=","==","!=",">","<"];
+
+function evaluateRule(actual, operator, target){
+  const a = Number(actual), t = Number(target);
+  if(isNaN(a) || isNaN(t)) return false;
+  switch(operator){
+    case ">=": return a >= t;
+    case "<=": return a <= t;
+    case "==": return a === t;
+    case "!=": return a !== t;
+    case ">": return a > t;
+    case "<": return a < t;
+    default: return false;
+  }
+}
+
+function evaluateProductRules(product, context){
+  const rules = product.rules || [];
+  if(rules.length===0) return { passed:false, results:[], reason:"No rules configured — auto-sanction requires at least one rule." };
+  const results = rules.map(r=>{
+    const actual = context[r.field];
+    const passed = actual!==undefined && actual!==null && evaluateRule(actual, r.operator, r.value);
+    return { field:r.field, operator:r.operator, value:r.value, actual, passed };
+  });
+  return { passed: results.every(r=>r.passed), results };
+}
+
+const RISK_CATEGORY_SCORE = {Low:1, Medium:2, High:3};
+
 const LEAD_STATUSES = ["New","Contacted","Documents Pending","KYC Pending","Under Verification","Eligible","Rejected","Converted into Loan Application"];
 const LEAD_SOURCES_STAFF = ["Walk-in","Referral","Business Correspondent","DSA","Bank Sakhi","Vitta Sakhi","Field Officer"];
 const ID_TYPES = ["CKYC","Voter ID","Passport","Driving Licence"];
@@ -839,17 +898,40 @@ function generateEmiSchedule(loanAccount){
   return { schedule, emiAmount: schedule.length ? schedule[0].emiAmount : 0, totalInstallments };
 }
 
+function estimateMonthlyEmi(principal, annualRatePct, tenureMonths){
+  const r = (annualRatePct/100)/12;
+  if(!tenureMonths) return 0;
+  if(r===0) return principal/tenureMonths;
+  return principal * r * Math.pow(1+r, tenureMonths) / (Math.pow(1+r, tenureMonths) - 1);
+}
+
+async function generateLoanAccountNumber(){
+  const existing = new Set((await db.getAll("loanAccounts")).map(a=>a.accountNumber).filter(Boolean));
+  let candidate;
+  do{
+    const digits = Math.floor(10000000 + Math.random()*89999999);
+    candidate = "LN"+new Date().getFullYear()+digits;
+  } while(existing.has(candidate));
+  return candidate;
+}
+
 async function backfillLoanSchedules(){
   const accounts = await db.getAll("loanAccounts");
   for(const acc of accounts){
+    let dirty = false;
     if(!acc.schedule){
       const gen = generateEmiSchedule(acc);
       acc.schedule = gen.schedule;
       acc.emiAmount = gen.emiAmount;
       acc.totalInstallments = gen.totalInstallments;
       acc.principalOutstanding = acc.principal;
-      await db.put("loanAccounts", acc);
+      dirty = true;
     }
+    if(!acc.accountNumber){
+      acc.accountNumber = await generateLoanAccountNumber();
+      dirty = true;
+    }
+    if(dirty) await db.put("loanAccounts", acc);
   }
 }
 
@@ -1654,8 +1736,18 @@ function renderProductsTab(products){
 }
 
 function renderProductForm(product){
-  const p = product || {name:"", interestRate:"", tenureMin:6, tenureMax:36, emiFrequency:"Monthly", processingFeePct:1, insurancePct:0.5, penaltyRatePct:2, gstPct:18, moratoriumMonths:0, securityRequired:"No", maxLoanAmount:200000, active:true};
+  const p = product || {name:"", interestRate:"", tenureMin:6, tenureMax:36, emiFrequency:"Monthly", processingFeePct:1, insurancePct:0.5, penaltyRatePct:2, gstPct:18, moratoriumMonths:0, securityRequired:"No", maxLoanAmount:200000, active:true, autoSanctionEnabled:false, rules:[]};
   const isSuperAdmin = session.user.role==="Super Admin";
+  const rules = p.rules || [];
+  const ruleRow = (i)=>{
+    const r = rules[i] || {};
+    return `
+      <div class="grid grid-3" style="margin-bottom:8px;">
+        <select class="rule-field" data-idx="${i}"><option value="">— Not used —</option>${RULE_FIELDS.map(f=>`<option value="${f.key}" ${r.field===f.key?'selected':''}>${f.label}</option>`).join("")}</select>
+        <select class="rule-operator" data-idx="${i}">${RULE_OPERATORS.map(o=>`<option ${r.operator===o?'selected':''}>${o}</option>`).join("")}</select>
+        <input class="rule-value" data-idx="${i}" type="number" step="0.1" value="${r.value!==undefined?r.value:''}" placeholder="Threshold value">
+      </div>`;
+  };
   return `
     <div class="card">
       <div class="flex-between">
@@ -1679,6 +1771,15 @@ function renderProductForm(product){
         <div class="field"><label>Status</label><select id="pf-active"><option value="true" ${p.active?'selected':''}>Active</option><option value="false" ${!p.active?'selected':''}>Draft (Inactive)</option></select></div>
         ` : `<div class="field"><label>Status</label><div class="small muted" style="padding-top:8px;">Only Super Admin can activate a product. This saves as Draft.</div></div>`}
       </div>
+
+      ${isSuperAdmin ? `
+      <h3 class="section-h">Straight-Through Processing (Rule Engine)</h3>
+      <div class="warn-banner" style="background:#FBE7E8;border-color:var(--danger);color:#7A1F27;">⚠ Enabling this bypasses the human Maker-Checker approval your Credit Policy otherwise requires for this product — every auto-sanction is logged distinctly as machine-decided. Only Super Admin can turn this on.</div>
+      <label style="display:flex; align-items:center; gap:8px; margin-bottom:12px;"><input type="checkbox" id="pf-auto-sanction" ${p.autoSanctionEnabled?'checked':''} style="width:auto;"> Enable auto-sanction for this product when every rule below passes</label>
+      <p class="small muted">Applies when an appraisal recommends "Approve" for this product. Leave a rule row's field as "— Not used —" to skip it. All configured rules must pass.</p>
+      ${[0,1,2,3,4].map(ruleRow).join("")}
+      ` : ""}
+
       <button class="btn btn-gold" id="btn-save-product" data-product="${product?product.id:''}">Save Product</button>
     </div>
   `;
@@ -2246,15 +2347,16 @@ function renderLoanAccountsList(loanAccounts, customers){
   return `
     <div class="card">
       <h2>Loan Accounts</h2>
-      <p class="sub">Principal outstanding, EMI schedule, repayment history, prepayment and foreclosure. One customer may hold multiple accounts.</p>
+      <p class="sub">Each account has a unique reference number for statements/receipts. Principal outstanding, EMI schedule, repayment history, prepayment and foreclosure. One customer may hold multiple accounts.</p>
       <table>
-        <thead><tr><th>Customer</th><th>Product</th><th>Principal</th><th>Outstanding</th><th>Next Due</th><th>Status</th><th></th></tr></thead>
+        <thead><tr><th>Account No.</th><th>Customer</th><th>Product</th><th>Principal</th><th>Outstanding</th><th>Next Due</th><th>Status</th><th></th></tr></thead>
         <tbody>
-        ${sorted.length===0 ? `<tr class="empty-row"><td colspan="7">No loan accounts yet — disburse a sanctioned loan to create one.</td></tr>` :
+        ${sorted.length===0 ? `<tr class="empty-row"><td colspan="8">No loan accounts yet — disburse a sanctioned loan to create one.</td></tr>` :
           sorted.map(a=>{
             const next = loanNextDue(a);
             const overdue = next && next.dueDate < today;
             return `<tr>
+              <td class="mono">${esc(a.accountNumber)||"—"}</td>
               <td>${esc(custName(a.customerId))}</td><td>${esc(a.product)}</td>
               <td>${fmtINR(a.principal)}</td><td>${fmtINR(a.principalOutstanding)}</td>
               <td>${next ? `${fmtINR(next.emiAmount)} on ${next.dueDate} ${overdue?'<span class="badge badge-rejected">Overdue</span>':''}` : "—"}</td>
@@ -2277,7 +2379,7 @@ async function renderLoanAccountDetail(acc, customers){
   return `
     <div class="card">
       <div class="flex-between">
-        <h2>Loan Account — ${esc(cust?cust.personal.name:'')}</h2>
+        <h2>Loan Account — ${esc(cust?cust.personal.name:'')} <span class="small mono muted">(${esc(acc.accountNumber)||acc.id})</span></h2>
         <button class="btn btn-outline btn-sm" id="btn-back-to-loans">← Back to list</button>
       </div>
       <div class="grid grid-4">
@@ -2300,7 +2402,7 @@ async function renderLoanAccountDetail(acc, customers){
         <tbody>
         ${acc.schedule.map(i=>{
           const overdue = i.status!=="Paid" && i.dueDate < today;
-          let badge = i.status==="Paid" ? `<span class="badge badge-approved">Paid</span>` : i.status==="Partial" ? `<span class="badge badge-progress">Partial</span>` : overdue ? `<span class="badge badge-rejected">Overdue</span>` : `<span class="badge badge-new">Pending</span>`;
+          let badge = i.status==="Paid" ? `<span class="badge badge-approved">Paid</span>` : i.status==="Foreclosed" ? `<span class="badge badge-approved">Foreclosed</span>` : i.status==="Partial" ? `<span class="badge badge-progress">Partial</span>` : overdue ? `<span class="badge badge-rejected">Overdue</span>` : `<span class="badge badge-new">Pending</span>`;
           return `<tr><td>${i.index}</td><td>${i.dueDate}</td><td>${fmtINR(i.emiAmount)}</td><td>${fmtINR(i.principalComponent)}</td><td>${fmtINR(i.interestComponent)}</td><td>${badge}</td></tr>`;
         }).join("")}
         </tbody>
@@ -2606,6 +2708,46 @@ async function renderRecoveryVisitForm(acc, customers){
 /* ---------------------------------------------------------------------
    Accounting (Phase 7)
    --------------------------------------------------------------------- */
+/* ---------------------------------------------------------------------
+   Month-End Interest Accrual (memo only — does NOT touch fund/cash
+   balances, since accrued interest isn't cash received. Interest
+   Income on the Income Statement above stays cash-basis, driven by
+   actual EMI collections. This is a separate accrual-basis memo view
+   for whoever wants to see interest earned by the book this month
+   regardless of what's actually been collected yet.)
+   --------------------------------------------------------------------- */
+async function computeMonthlyInterestAccrual(monthLabel){
+  const loanAccounts = await db.getAll("loanAccounts");
+  let accrued = 0, installmentCount = 0;
+  for(const acc of loanAccounts){
+    for(const inst of (acc.schedule||[])){
+      if(inst.dueDate && inst.dueDate.slice(0,7)===monthLabel){
+        accrued += inst.interestComponent;
+        installmentCount++;
+      }
+    }
+  }
+  return { accrued, installmentCount };
+}
+
+async function renderInterestAccrualCard(){
+  const monthLabel = session.accrualMonth || todayStr().slice(0,7);
+  const { accrued, installmentCount } = await computeMonthlyInterestAccrual(monthLabel);
+  const logs = (await db.getAll("auditLog")).filter(l=>l.action==="Month-End Interest Accrual Logged" && l.details.includes(monthLabel));
+  return `
+    <div class="card">
+      <h2 style="font-size:16px;">Month-End Interest Accrual</h2>
+      <p class="sub">Accrual-basis memo — interest earned by the book for the selected month across all installments due in it, regardless of whether they've actually been collected yet. This is separate from Interest Income above, which is cash-basis (only counts what's actually been collected) — this card doesn't move any fund balance. There's no server to run this automatically at midnight on the last day of the month; run it manually here whenever you like for any month.</p>
+      <div class="grid grid-3">
+        <div class="field"><label>Month</label><input id="accrual-month" type="month" value="${monthLabel}"></div>
+        <div class="kpi"><div class="lbl">Interest Accrued (${installmentCount} installment(s) due)</div><div class="val" style="font-size:18px;">${fmtINR(Math.round(accrued))}</div></div>
+        <div class="field" style="align-self:end;"><button class="btn btn-gold btn-block" id="btn-log-accrual">Log This Accrual</button></div>
+      </div>
+      ${logs.length>0 ? `<p class="small muted">Already logged for ${monthLabel}: ${logs.map(l=>fmtDate(l.ts)+" by "+l.actor).join(", ")}</p>` : ""}
+    </div>
+  `;
+}
+
 async function renderAccountingTab(){
   const acct = await computeAccountingSummary();
   const cashBank = [
@@ -2721,6 +2863,8 @@ async function renderAccountingTab(){
       </div>
       <p class="small muted" style="margin-top:10px;">Illustrative management view only — not a statutory Balance Sheet or Schedule III format.</p>
     </div>
+
+    ${await renderInterestAccrualCard()}
 
     <div class="card">
       <h2 style="font-size:16px;">Trial Balance</h2>
@@ -3729,6 +3873,10 @@ function bindEvents(){
   // Accounting
   const exportCashbookBtn = document.getElementById("btn-export-cashbook");
   if(exportCashbookBtn) exportCashbookBtn.onclick = handleExportCashbook;
+  const accrualMonthInput = document.getElementById("accrual-month");
+  if(accrualMonthInput) accrualMonthInput.onchange = ()=>{ session.accrualMonth = accrualMonthInput.value; render(); };
+  const logAccrualBtn = document.getElementById("btn-log-accrual");
+  if(logAccrualBtn) logAccrualBtn.onclick = handleLogInterestAccrual;
   const exportTallyBtn = document.getElementById("btn-export-tally");
   if(exportTallyBtn) exportTallyBtn.onclick = handleExportTally;
   const jfType = document.getElementById("jf-type");
@@ -3813,6 +3961,21 @@ async function handleSaveProduct(){
   const existingId = document.getElementById("btn-save-product").dataset.product;
   const isSuperAdmin = session.user.role==="Super Admin";
   const activeEl = document.getElementById("pf-active");
+  let rules = [];
+  let autoSanctionEnabled = false;
+  if(isSuperAdmin){
+    document.querySelectorAll(".rule-field").forEach(sel=>{
+      const idx = sel.dataset.idx;
+      const field = sel.value;
+      if(!field) return;
+      const operator = document.querySelector(`.rule-operator[data-idx="${idx}"]`).value;
+      const value = Number(document.querySelector(`.rule-value[data-idx="${idx}"]`).value);
+      if(isNaN(value)) return;
+      rules.push({field, operator, value});
+    });
+    const autoEl = document.getElementById("pf-auto-sanction");
+    autoSanctionEnabled = autoEl ? autoEl.checked : false;
+  }
   const rec = {
     id: existingId || uid("prd"),
     name: document.getElementById("pf-name").value.trim(),
@@ -3828,15 +3991,23 @@ async function handleSaveProduct(){
     gstPct: Number(document.getElementById("pf-gst").value)||0,
     securityRequired: document.getElementById("pf-security").value,
     active: isSuperAdmin && activeEl ? (activeEl.value === "true") : false,
+    rules: isSuperAdmin ? rules : (existingId ? undefined : []),
+    autoSanctionEnabled: isSuperAdmin ? autoSanctionEnabled : undefined,
     createdAt: nowISO()
   };
+  if(existingId && !isSuperAdmin){
+    // Non-Super-Admin editors shouldn't blank out an existing rule config they can't see.
+    const existing = await db.get("products", existingId);
+    if(existing){ rec.rules = existing.rules; rec.autoSanctionEnabled = existing.autoSanctionEnabled; }
+  }
   if(!rec.name){ toast("Product name is required."); return; }
   await db.put("products", rec);
-  await logAudit(session.user.name, session.user.role, existingId?"Product Updated":"Product Created", `${rec.name} — ${rec.interestRate}% p.a. — Max ${fmtINR(rec.maxLoanAmount)}${!isSuperAdmin ? ' — saved as Draft, awaiting Super Admin activation' : ''}`);
+  await logAudit(session.user.name, session.user.role, existingId?"Product Updated":"Product Created", `${rec.name} — ${rec.interestRate}% p.a. — Max ${fmtINR(rec.maxLoanAmount)}${!isSuperAdmin ? ' — saved as Draft, awaiting Super Admin activation' : ''}${rec.autoSanctionEnabled ? ' — Auto-sanction ENABLED' : ''}`);
   toast(isSuperAdmin ? "Product saved: "+rec.name : "Saved as Draft — a Super Admin needs to activate it.");
   session.productSubview = "list";
   render();
 }
+
 
 async function handleToggleProductActive(productId, makeActive){
   const u = session.user;
@@ -3959,6 +4130,7 @@ async function handleSaveAppraisal(){
   const cust = await db.get("customers", customerId);
   await logAudit(session.user.name, session.user.role, "Credit Appraisal Submitted", `${cust?cust.personal.name:customerId} — Risk: ${rec.riskRating}, Recommendation: ${rec.recommendation}`);
 
+  let autoSanctionResult = null;
   if(leadId){
     const lead = await db.get("leads", leadId);
     if(lead){
@@ -3967,12 +4139,111 @@ async function handleSaveAppraisal(){
       else lead.status="Under Verification";
       await db.put("leads", lead);
       await logAudit(session.user.name, session.user.role, "Lead Status Changed (via Appraisal)", `${lead.applicantName}: → ${lead.status}`);
+
+      if(rec.recommendation==="Approve" && cust && !lead.sanctionId){
+        autoSanctionResult = await attemptAutoSanction(lead, cust, rec);
+      }
     }
   }
 
-  toast("Appraisal submitted.");
+  toast(autoSanctionResult && autoSanctionResult.sanctioned ? "Appraisal submitted — rule engine auto-sanctioned this loan." : "Appraisal submitted.");
   session.appraisalSubview = "list";
   render();
+}
+
+/* ---------------------------------------------------------------------
+   Straight-Through Processing: auto-sanction (and auto-disburse if a
+   payout provider is configured) when a product's rules all pass.
+   --------------------------------------------------------------------- */
+async function attemptAutoSanction(lead, customer, appraisal){
+  const products = await db.getAll("products");
+  const product = products.find(p=>p.name===lead.product);
+  if(!product || !product.active || !product.autoSanctionEnabled) return { sanctioned:false };
+
+  const estEmi = estimateMonthlyEmi(lead.amountRequested, product.interestRate, product.tenureMax);
+  const context = {
+    creditScore: customer.creditScore,
+    monthlyIncome: customer.income.monthly,
+    riskCategoryScore: RISK_CATEGORY_SCORE[customer.riskCategory] || null,
+    amountRequested: lead.amountRequested,
+    foirPct: customer.income.monthly ? (estEmi/customer.income.monthly*100) : null,
+  };
+  const evalResult = evaluateProductRules(product, context);
+  if(!evalResult.passed){
+    await logAudit("System (Rule Engine)", "System", "Auto-Sanction Declined", `${customer.personal.name} — ${product.name} — one or more rules not met`);
+    return { sanctioned:false, evalResult };
+  }
+
+  const fundPos = await computeFundPosition();
+  if(lead.amountRequested > fundPos.available){
+    await logAudit("System (Rule Engine)", "System", "Auto-Sanction Blocked", `${customer.personal.name} — insufficient available funds (${fmtINR(fundPos.available)} available, ${fmtINR(lead.amountRequested)} requested)`);
+    return { sanctioned:false };
+  }
+  if(product.maxLoanAmount && lead.amountRequested > product.maxLoanAmount){
+    await logAudit("System (Rule Engine)", "System", "Auto-Sanction Blocked", `${customer.personal.name} — exceeds product max ${fmtINR(product.maxLoanAmount)}`);
+    return { sanctioned:false };
+  }
+  const policy = (await db.get("policyConfig","default")) || defaultPolicyConfig();
+  const borrowerExp = await computeBorrowerExposure(customer.id, null);
+  if(borrowerExp + lead.amountRequested > policy.exposure.maxBorrowerExposure){
+    await logAudit("System (Rule Engine)", "System", "Auto-Sanction Blocked", `${customer.personal.name} — exceeds borrower exposure cap`);
+    return { sanctioned:false };
+  }
+
+  const sanction = {
+    id: uid("snc"), leadId: lead.id, customerId: customer.id, product: product.name,
+    sanctionedAmount: lead.amountRequested, interestRate: product.interestRate, tenureMonths: product.tenureMax,
+    proposedBy: "System (Rule Engine)", proposedByRole: "System", createdAt: nowISO(),
+    status: "Approved", approvedBy: "System (Rule Engine)", approvedByRole: "System", approvedAt: nowISO(),
+    disbursementId:null, loanAccountId:null, overrideUsed:false, overrideReason:"",
+    autoSanctioned:true, ruleEvaluation: evalResult.results
+  };
+  await db.put("sanctions", sanction);
+  lead.sanctionId = sanction.id;
+  lead.status = "Converted into Loan Application";
+  await db.put("leads", lead);
+  await logAudit("System (Rule Engine)", "System", "Sanction Auto-Approved", `${customer.personal.name} — ${product.name} — ${fmtINR(lead.amountRequested)} — all configured rules passed (bypasses human Maker-Checker by product policy)`);
+
+  // Only actually create the loan account / mark disbursed if a real payout
+  // provider is configured AND the transfer succeeds. Otherwise the
+  // sanction sits Approved & undisbursed in the normal manual queue.
+  const fundAccounts = await db.getAll("fundAccounts");
+  const fundAccount = fundAccounts[0] || null;
+  let payoutResult = { ok:false, status:"Not Configured" };
+  if(fundAccount){
+    payoutResult = await attemptPayout(customer.personal.name, customer.bank.account, customer.bank.ifsc, sanction.sanctionedAmount, "Loan disbursement — auto-sanctioned");
+  }
+
+  if(payoutResult.ok){
+    const loanAccount = {
+      id: uid("loa"), sanctionId: sanction.id, customerId: customer.id, product: product.name,
+      principal: sanction.sanctionedAmount, interestRate: sanction.interestRate, tenureMonths: sanction.tenureMonths,
+      emiFrequency: product.emiFrequency, disbursedDate: todayStr(), status:"Active", createdAt: nowISO(), createdBy:"System (Rule Engine)",
+      accountNumber: await generateLoanAccountNumber()
+    };
+    const gen = generateEmiSchedule(loanAccount);
+    loanAccount.schedule = gen.schedule; loanAccount.emiAmount = gen.emiAmount; loanAccount.totalInstallments = gen.totalInstallments;
+    loanAccount.principalOutstanding = loanAccount.principal;
+    await db.put("loanAccounts", loanAccount);
+
+    const disbursement = {
+      id: uid("dsb"), sanctionId: sanction.id, customerId: customer.id, amount: sanction.sanctionedAmount,
+      mode:"Auto Bank Transfer", date: todayStr(), utr: (payoutResult.raw && payoutResult.raw.utr) || "AUTO"+Date.now(),
+      fundAccountId: fundAccount.id, fundAccountName: fundAccount.name,
+      createdAt: nowISO(), createdBy:"System (Rule Engine)"
+    };
+    await db.put("disbursements", disbursement);
+    fundAccount.balance -= sanction.sanctionedAmount;
+    await db.put("fundAccounts", fundAccount);
+    sanction.disbursementId = disbursement.id;
+    sanction.loanAccountId = loanAccount.id;
+    await db.put("sanctions", sanction);
+    await logAudit("System (Rule Engine)", "System", "Loan Auto-Disbursed", `${customer.personal.name} — ${fmtINR(sanction.sanctionedAmount)} to A/c ${loanAccount.accountNumber} — ${payoutResult.status}`);
+    return { sanctioned:true, disbursed:true, sanction, loanAccount };
+  } else {
+    await logAudit("System (Rule Engine)", "System", "Auto-Disbursement Pending", `${customer.personal.name} — ${fmtINR(sanction.sanctionedAmount)} sanctioned but not transferred — no payout provider configured under Integrations. Complete the transfer manually from Sanction & Disbursement.`);
+    return { sanctioned:true, disbursed:false, sanction };
+  }
 }
 
 /* ---------------------------------------------------------------------
@@ -4095,7 +4366,7 @@ async function handleConfirmDisbursement(sanctionId){
     id: uid("loa"), sanctionId, customerId: sanction.customerId, product: sanction.product,
     principal: amount, interestRate: sanction.interestRate, tenureMonths: sanction.tenureMonths,
     emiFrequency: prod ? prod.emiFrequency : "Monthly", disbursedDate: date, status: "Active",
-    createdAt: nowISO(), createdBy: u.name
+    createdAt: nowISO(), createdBy: u.name, accountNumber: await generateLoanAccountNumber()
   };
   const gen = generateEmiSchedule(loanAccount);
   loanAccount.schedule = gen.schedule;
@@ -4266,16 +4537,28 @@ async function handleForecloseLoan(loanId){
   const u = session.user;
   const acc = await db.get("loanAccounts", loanId);
   if(!acc) return;
-  const outstanding = acc.schedule.filter(i=>i.status!=="Paid").reduce((s,i)=>s+i.principalComponent+ (i.interestComponent||0) - (i.paidAmount||0),0);
-  const confirmMsg = `Foreclose this loan? Outstanding payoff amount is approximately ${fmtINR(outstanding)}. This marks all remaining installments as settled.`;
+  const principalOutstanding = acc.principalOutstanding;
+  const paidInstallments = acc.schedule.filter(i=>i.status==="Paid" && i.paidDate).sort((a,b)=> new Date(b.paidDate) - new Date(a.paidDate));
+  const lastPaidDate = paidInstallments.length ? paidInstallments[0].paidDate : acc.disbursedDate;
+  const today = todayStr();
+  const daysSince = Math.max(0, Math.round((new Date(today) - new Date(lastPaidDate)) / (1000*60*60*24)));
+  const accruedInterest = principalOutstanding * (acc.interestRate/100) * (daysSince/365);
+  const payoffAmount = principalOutstanding + accruedInterest;
+
+  const confirmMsg = `Foreclose this loan?\n\nPrincipal outstanding: ${fmtINR(principalOutstanding)}\nAccrued interest (${daysSince} days since ${lastPaidDate} @ ${acc.interestRate}% p.a.): ${fmtINR(Math.round(accruedInterest))}\nTotal payoff amount: ${fmtINR(Math.round(payoffAmount))}\n\nThis doesn't include any prepayment charges your product terms may carry — check manually if applicable. Continue?`;
   if(!window.confirm(confirmMsg)) return;
-  acc.schedule.forEach(i=>{ if(i.status!=="Paid"){ i.status="Paid"; i.paidDate = todayStr(); i.paidAmount = i.emiAmount; } });
+
+  acc.schedule.forEach(i=>{ if(i.status!=="Paid"){ i.status="Foreclosed"; i.paidDate=today; i.paidAmount=0; } });
   acc.principalOutstanding = 0;
   acc.status = "Closed (Foreclosed)";
+  acc.foreclosureAccruedInterest = Math.round(accruedInterest);
+  acc.foreclosurePayoffAmount = Math.round(payoffAmount);
+  acc.foreclosedAt = nowISO();
   await db.put("loanAccounts", acc);
+
   const cust = await db.get("customers", acc.customerId);
-  await logAudit(u.name, u.role, "Loan Foreclosed", `${cust?cust.personal.name:acc.customerId} — payoff ${fmtINR(outstanding)}`);
-  toast("Loan foreclosed and closed.");
+  await logAudit(u.name, u.role, "Loan Foreclosed", `${cust?cust.personal.name:acc.customerId} — Principal ${fmtINR(principalOutstanding)} + Accrued Interest ${fmtINR(Math.round(accruedInterest))} = Payoff ${fmtINR(Math.round(payoffAmount))}`);
+  toast(`Foreclosed. Payoff amount ${fmtINR(Math.round(payoffAmount))} — record it as a payment under Collect EMI (or a Journal entry) once received, this doesn't move funds by itself.`);
   render();
 }
 
@@ -4427,6 +4710,15 @@ async function handleExportCashbook(){
   const rows = cashBank.map(e=>{ running += (e.credit - e.debit); return [e.date, e.particulars, e.ref, e.debit||"", e.credit||"", running]; });
   downloadCSV("cash-bank-book.csv", ["Date","Particulars","Reference","Debit","Credit","Running Balance"], rows);
   await logAudit(session.user.name, session.user.role, "Report Exported", "Cash & Bank Book (CSV)");
+}
+
+async function handleLogInterestAccrual(){
+  const u = session.user;
+  const monthLabel = session.accrualMonth || todayStr().slice(0,7);
+  const { accrued, installmentCount } = await computeMonthlyInterestAccrual(monthLabel);
+  await logAudit(u.name, u.role, "Month-End Interest Accrual Logged", `${monthLabel} — ${fmtINR(Math.round(accrued))} across ${installmentCount} installment(s) — memo only, no fund balance affected`);
+  toast(`Logged: ${fmtINR(Math.round(accrued))} accrued interest for ${monthLabel}.`);
+  render();
 }
 
 async function handleExportTally(){
