@@ -902,6 +902,7 @@ const DEFAULT_MICRO_ENTERPRISE_TEMPLATES = [
 const LEAD_STATUSES = ["New","Contacted","Documents Pending","KYC Pending","Under Verification","Eligible","Rejected","Converted into Loan Application"];
 const LEAD_SOURCES_STAFF = ["Walk-in","Referral","Business Correspondent","DSA","Bank Sakhi","Vitta Sakhi","Field Officer"];
 const ID_TYPES = ["CKYC","Voter ID","Passport","Driving Licence"];
+const RELATIONSHIP_OPTIONS = ["Spouse","Son","Daughter","Father","Mother","Brother","Sister","Other"];
 const RISK_CATEGORIES = ["Low","Medium","High"];
 const GENDERS = ["Male","Female","Other"];
 const MARITAL = ["Single","Married","Widowed","Divorced"];
@@ -1719,7 +1720,8 @@ function renderCustomerForm(){
         <div class="field"><label>Business type / occupation</label><input id="c-biz-type" value="${esc(p(prefill.occupation))}"></div>
         <div class="field"><label>Years in operation</label><input id="c-biz-years" type="number"></div>
         <div class="field"><label>Monthly income (₹)</label><input id="c-income-monthly" type="number" value="${esc(p(prefill.monthlyIncome))}"></div>
-        <div class="field"><label>Annual income (₹)</label><input id="c-income-annual" type="number"></div>
+        <div class="field"><label>Annual income (₹)</label><input id="c-income-annual" type="number" placeholder="Auto-calculated as monthly × 12"></div>
+        <div class="field"><label>Monthly expenses (₹)</label><input id="c-expenses-monthly" type="number"></div>
         <div class="field"><label>Income source</label><input id="c-income-source"></div>
       </div>
 
@@ -1729,7 +1731,7 @@ function renderCustomerForm(){
         <div class="field"><label>Account number</label><input id="c-bank-account"></div>
         <div class="field"><label>IFSC</label><input id="c-bank-ifsc" style="text-transform:uppercase;"></div>
         <div class="field"><label>Nominee name</label><input id="c-nom-name"></div>
-        <div class="field"><label>Relationship</label><input id="c-nom-relation"></div>
+        <div class="field"><label>Relationship</label><select id="c-nom-relation">${RELATIONSHIP_OPTIONS.map(r=>`<option>${r}</option>`).join("")}</select></div>
         <div class="field"><label>Nominee mobile</label><input id="c-nom-mobile" maxlength="10"></div>
       </div>
 
@@ -1812,6 +1814,8 @@ async function renderCustomerDetail(c){
         <div><div class="field"><label>Risk Category</label><div>${c.riskCategory?`<span class="badge badge-risk-${c.riskCategory}">${c.riskCategory}</span>`:"—"}</div></div></div>
         <div><div class="field"><label>Credit Score</label><div>${c.creditScore||"—"}</div></div></div>
         <div><div class="field"><label>Monthly Income</label><div>${fmtINR(c.income.monthly)}</div></div></div>
+        <div><div class="field"><label>Monthly Expenses</label><div>${fmtINR(c.income.monthlyExpenses)}</div></div></div>
+        <div><div class="field"><label>Annual Income</label><div>${fmtINR(c.income.annual)}</div></div></div>
       </div>
       <h3 class="section-h">Business</h3>
       <p>${esc(c.business.name)||"—"} · ${esc(c.business.type)||"—"} · ${c.business.years||"—"} yrs</p>
@@ -4286,6 +4290,16 @@ function bindEvents(){
   });
   const saveCustomerBtn = document.getElementById("btn-save-customer");
   if(saveCustomerBtn) saveCustomerBtn.onclick = handleSaveCustomer;
+  const monthlyIncomeInput = document.getElementById("c-income-monthly");
+  const annualIncomeInput = document.getElementById("c-income-annual");
+  if(monthlyIncomeInput && annualIncomeInput){
+    const recalcAnnual = ()=>{
+      const monthly = Number(monthlyIncomeInput.value);
+      if(monthly>0) annualIncomeInput.value = monthly*12;
+    };
+    monthlyIncomeInput.oninput = recalcAnnual;
+    if(monthlyIncomeInput.value) recalcAnnual();
+  }
 
   // KYC widgets
   document.querySelectorAll(".kyc-file-input").forEach(inp=>{
@@ -6367,7 +6381,7 @@ async function handleSaveCustomer(){
     family: { name: val("c-family-name"), dependents: val("c-dependents") },
     address: { current: val("c-addr-current"), permanent: val("c-addr-permanent") },
     business: { name: val("c-biz-name"), type: val("c-biz-type"), years: val("c-biz-years") },
-    income: { monthly: Number(val("c-income-monthly"))||null, annual: Number(val("c-income-annual"))||null, source: val("c-income-source") },
+    income: { monthly: Number(val("c-income-monthly"))||null, annual: Number(val("c-income-annual"))||null, monthlyExpenses: Number(val("c-expenses-monthly"))||null, source: val("c-income-source") },
     bank: { name: val("c-bank-name"), account: val("c-bank-account"), ifsc: val("c-bank-ifsc").toUpperCase() },
     nominee: { name: val("c-nom-name"), relationship: val("c-nom-relation"), mobile: val("c-nom-mobile") },
     references: [ val("c-ref1"), val("c-ref2") ],
