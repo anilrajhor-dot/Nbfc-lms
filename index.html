@@ -520,7 +520,7 @@ function downloadJSON(filename, obj){
 const ALL_COLLECTIONS = [
   "staff","borrowers","leads","customers","products","appraisals","policyConfig",
   "fundAccounts","sanctions","disbursements","loanAccounts","payments","reminders",
-  "recoveryVisits","apiConfig","journalEntries","complianceItems","rbiReturnFilings",
+  "recoveryVisits","apiConfig","nbfcProfile","journalEntries","complianceItems","rbiReturnFilings",
   "staffSalaries","payrollRuns","dsaAgents","dsaCommissions",
   "shgGroups","shgMembers","shgSavings","shgInternalLoans","microEnterpriseTemplates",
   "auditLog","meta"
@@ -703,6 +703,18 @@ function defaultApiConfig(){
 
 async function getApiConfig(){
   return (await db.get("apiConfig","default")) || defaultApiConfig();
+}
+
+function defaultNbfcProfile(){
+  return {
+    id:"default", name:"", address:"", registrationNumber:"", cin:"",
+    gstNumber:"", panNumber:"", tanNumber:"", contactEmail:"", contactPhone:"", website:"",
+    updatedAt:null, updatedBy:null
+  };
+}
+
+async function getNbfcProfile(){
+  return (await db.get("nbfcProfile","default")) || defaultNbfcProfile();
 }
 
 /**
@@ -1428,6 +1440,8 @@ async function renderStaffShell(){
     tabContent = await renderAiInsightsTab(customers, appraisals, loanAccounts, products, payments);
   } else if(tab === "apiconfig" && u.role==="Super Admin"){
     tabContent = await renderApiConfigTab();
+  } else if(tab === "nbfcprofile" && u.role==="Super Admin"){
+    tabContent = await renderNbfcProfileTab();
   } else if(tab === "datamgmt" && u.role==="Super Admin"){
     tabContent = await renderDataManagementTab();
   } else if(tab === "help"){
@@ -1494,6 +1508,7 @@ async function renderStaffShell(){
         ${canSeeReports ? `<button class="tab ${tab==='reports'?'active':''}" data-tab="reports">Reports &amp; MIS</button>`:""}
         <button class="tab ${tab==='ai'?'active':''}" data-tab="ai">AI Insights</button>
         ${u.role==="Super Admin" ? `<button class="tab ${tab==='apiconfig'?'active':''}" data-tab="apiconfig">Integrations</button>`:""}
+        ${u.role==="Super Admin" ? `<button class="tab ${tab==='nbfcprofile'?'active':''}" data-tab="nbfcprofile">NBFC Profile</button>`:""}
         ${u.role==="Super Admin" ? `<button class="tab ${tab==='datamgmt'?'active':''}" data-tab="datamgmt">Data Management</button>`:""}
         <button class="tab ${tab==='help'?'active':''}" data-tab="help">Help</button>
         ${canManagePolicy ? `<button class="tab ${tab==='products'?'active':''}" data-tab="products">Loan Products</button>`:""}
@@ -1503,7 +1518,7 @@ async function renderStaffShell(){
       </div>
       ${tabContent}
     </main>
-    <div class="footer-note">NBFC LMS — Phase 8 · All 8 planned phases complete · AI Insights are rule-based and explainable; the AI Assistant and Auto-read ID call Claude directly and only work inside Claude.ai</div>
+    <div class="footer-note">NBFC LMS · Developed by Anil Sharma, Former General Manager, Central Bank of India · AI Insights are rule-based and explainable; the AI Assistant and Auto-read ID call Claude directly and only work inside Claude.ai</div>
   </div>`;
 }
 
@@ -2410,6 +2425,7 @@ async function renderSanctionLetter(sanction, customers, products){
   const cust = customers.find(c=>c.id===sanction.customerId);
   const prod = products.find(p=>p.name===sanction.product);
   const sigStatus = sanction.signatureStatus || "Not Sent";
+  const nbfc = await getNbfcProfile();
   return `
     <div class="card no-print" style="margin-bottom:0;">
       <div class="flex-between"><h2>Sanction Letter</h2>
@@ -2433,9 +2449,15 @@ async function renderSanctionLetter(sanction, customers, products){
       ${sanction.signedDocumentBase64 ? `<div class="kyc-upload-box" style="margin-top:10px;"><div class="small">Signed Document</div>${sanction.signedDocumentBase64.startsWith('data:application/pdf') ? `<a href="${sanction.signedDocumentBase64}" download="signed-sanction-${sanction.id}.pdf" class="btn btn-outline btn-sm" style="margin-top:8px;">Download PDF</a>` : `<img src="${sanction.signedDocumentBase64}" style="display:block; margin-top:8px;">`}</div>` : ""}
     </div>
     <div class="card" id="printable-letter" style="border-top:4px solid var(--gold);">
+      ${nbfc.name ? `
+      <div style="text-align:center; margin-bottom:14px; padding-bottom:14px; border-bottom:1px solid var(--line);">
+        <h2 style="font-size:20px;">${esc(nbfc.name)}</h2>
+        <p class="small muted" style="margin:2px 0;">${esc(nbfc.address)}</p>
+        <p class="small muted" style="margin:2px 0;">${nbfc.registrationNumber?`RBI Reg. No: ${esc(nbfc.registrationNumber)}`:""}${nbfc.gstNumber?` · GSTIN: ${esc(nbfc.gstNumber)}`:""}${nbfc.panNumber?` · PAN: ${esc(nbfc.panNumber)}`:""}</p>
+      </div>` : ""}
       <div class="flex-between" style="align-items:flex-start;">
         <div>
-          <h2 style="font-size:20px;">NBFC LMS — Loan Sanction Letter</h2>
+          <h2 style="font-size:20px;">Loan Sanction Letter</h2>
           <p class="small muted">Reference: ${esc(sanction.id)} · Date: ${fmtDate(sanction.approvedAt||sanction.createdAt)}</p>
         </div>
         <div style="text-align:right;" class="small muted">Prototype document — not a legally issued sanction letter</div>
@@ -4002,6 +4024,33 @@ async function renderDsaSection(){
   `;
 }
 
+/* ---------------------------------------------------------------------
+   NBFC Company Profile
+   --------------------------------------------------------------------- */
+async function renderNbfcProfileTab(){
+  const p = await getNbfcProfile();
+  return `
+    <div class="card">
+      <h2>NBFC Profile</h2>
+      <p class="sub">Your company's registration details — used on the Sanction Letter letterhead and available for reports. Super Admin only.</p>
+      <div class="grid grid-2">
+        <div class="field"><label>NBFC Name</label><input id="np-name" value="${esc(p.name)}"></div>
+        <div class="field"><label>Registered Address</label><input id="np-address" value="${esc(p.address)}"></div>
+        <div class="field"><label>RBI Registration Number (CoR)</label><input id="np-registration" value="${esc(p.registrationNumber)}"></div>
+        <div class="field"><label>CIN (Corporate Identity Number)</label><input id="np-cin" value="${esc(p.cin)}"></div>
+        <div class="field"><label>GST Number</label><input id="np-gst" value="${esc(p.gstNumber)}"></div>
+        <div class="field"><label>PAN</label><input id="np-pan" value="${esc(p.panNumber)}" style="text-transform:uppercase;"></div>
+        <div class="field"><label>TAN</label><input id="np-tan" value="${esc(p.tanNumber)}" style="text-transform:uppercase;"></div>
+        <div class="field"><label>Contact Email</label><input id="np-email" type="email" value="${esc(p.contactEmail)}"></div>
+        <div class="field"><label>Contact Phone</label><input id="np-phone" value="${esc(p.contactPhone)}"></div>
+        <div class="field"><label>Website</label><input id="np-website" value="${esc(p.website)}"></div>
+      </div>
+      <button class="btn btn-gold" id="btn-save-nbfc-profile">Save Profile</button>
+      <span class="small muted" style="margin-left:10px;">${p.updatedAt ? "Last updated "+fmtDate(p.updatedAt)+" by "+esc(p.updatedBy) : "Not yet configured"}</span>
+    </div>
+  `;
+}
+
 async function renderDataManagementTab(){
   const counts = {};
   for(const c of ALL_COLLECTIONS){
@@ -4069,6 +4118,12 @@ async function renderUserManagement(){
         <button class="btn btn-outline btn-sm" id="btn-load-demo-data">Load Demo Data</button>
       </div>
     </div>
+    <div class="card">
+      <div class="flex-between">
+        <div><h2>50-Applicant Test Batch</h2><p class="sub" style="margin-bottom:0;">A larger, more realistic batch for accuracy-checking every menu: 50 applicants — 45 taken through appraisal → sanction → disbursement → EMI collection (with a spread of current, mildly overdue, and seriously overdue accounts so Overdue/NPA/PAR/AI Insights all have real data), and 5 rejected at appraisal. Also books a few journal expense entries. Takes a minute — don't close the tab while it runs. Running it again adds another 50.</p></div>
+        <button class="btn btn-outline btn-sm" id="btn-load-bulk-demo-data">Load 50 Applicants</button>
+      </div>
+    </div>
   `;
 }
 
@@ -4117,7 +4172,7 @@ async function renderBorrowerShell(){
       </div>
       ${tab==='apply' ? renderApplyForm(products) : tab==='status' ? renderMyApplications(myLeads) : tab==='advisor' ? renderBorrowerAdvisor() : renderBorrowerHelp()}
     </main>
-    <div class="footer-note">NBFC LMS — Borrower Portal</div>
+    <div class="footer-note">NBFC LMS — Borrower Portal · Developed by Anil Sharma, Former General Manager, Central Bank of India</div>
   </div>`;
 }
 
@@ -4258,6 +4313,8 @@ function bindEvents(){
   if(addStaffBtn) addStaffBtn.onclick = handleAddStaff;
   const loadDemoBtn = document.getElementById("btn-load-demo-data");
   if(loadDemoBtn) loadDemoBtn.onclick = handleLoadDemoData;
+  const loadBulkDemoBtn = document.getElementById("btn-load-bulk-demo-data");
+  if(loadBulkDemoBtn) loadBulkDemoBtn.onclick = handleLoadBulkDemoData;
 
   const submitAppBtn = document.getElementById("btn-submit-application");
   if(submitAppBtn) submitAppBtn.onclick = handleSubmitApplication;
@@ -4579,6 +4636,8 @@ function bindEvents(){
   }
   const runRestoreBtn = document.getElementById("btn-run-restore");
   if(runRestoreBtn) runRestoreBtn.onclick = handleRestoreBackup;
+  const saveNbfcProfileBtn = document.getElementById("btn-save-nbfc-profile");
+  if(saveNbfcProfileBtn) saveNbfcProfileBtn.onclick = handleSaveNbfcProfile;
   document.querySelectorAll(".clear-collection-btn").forEach(btn=>{
     btn.onclick = ()=> handleClearCollection(btn.dataset.collection);
   });
@@ -5911,6 +5970,27 @@ async function handleOcrDocument(){
 /* ---------------------------------------------------------------------
    Verification API handlers
    --------------------------------------------------------------------- */
+async function handleSaveNbfcProfile(){
+  const u = session.user;
+  const p = await getNbfcProfile();
+  p.name = document.getElementById("np-name").value.trim();
+  p.address = document.getElementById("np-address").value.trim();
+  p.registrationNumber = document.getElementById("np-registration").value.trim();
+  p.cin = document.getElementById("np-cin").value.trim();
+  p.gstNumber = document.getElementById("np-gst").value.trim();
+  p.panNumber = document.getElementById("np-pan").value.trim().toUpperCase();
+  p.tanNumber = document.getElementById("np-tan").value.trim().toUpperCase();
+  p.contactEmail = document.getElementById("np-email").value.trim();
+  p.contactPhone = document.getElementById("np-phone").value.trim();
+  p.website = document.getElementById("np-website").value.trim();
+  p.updatedAt = nowISO();
+  p.updatedBy = u.name;
+  await db.put("nbfcProfile", p);
+  await logAudit(u.name, u.role, "NBFC Profile Updated", p.name || "(unnamed)");
+  toast("NBFC profile saved.");
+  render();
+}
+
 async function handleSaveApiConfig(){
   const u = session.user;
   const cfg = await getApiConfig();
@@ -6283,6 +6363,178 @@ async function handleLoadDemoData(){
   }
 }
 
+/* ---------------------------------------------------------------------
+   50-Applicant Test Batch — larger, more realistic accuracy-check dataset.
+   45 go through the full lifecycle with a spread of repayment scenarios
+   (current / mildly overdue / seriously overdue) so Overdue, NPA, PAR,
+   and AI Insights all have real data to show. 5 are rejected at appraisal.
+   --------------------------------------------------------------------- */
+async function handleLoadBulkDemoData(){
+  const u = session.user;
+  toast("Loading 50 applicants — this takes a minute, please wait…");
+  try{
+    const MALE_NAMES = ["Ramesh","Suresh","Ganesh","Prakash","Vijay","Anil","Sunil","Rajesh","Mahesh","Dinesh","Ashok","Vinod","Sanjay","Manoj","Deepak","Ravi","Santosh","Balaji","Gopal","Ramdas","Yogesh","Nitin","Pravin","Rahul","Amit"];
+    const FEMALE_NAMES = ["Sunita","Meena","Kavita","Anita","Rekha","Pooja","Neha","Priya","Geeta","Radha","Savita","Lata","Usha","Shanti","Kiran","Vandana","Manisha","Sarika","Archana","Snehal","Jyoti","Nirmala","Sushila","Kalpana","Asha"];
+    const LAST_NAMES = ["Patil","Sharma","Deshmukh","Kulkarni","Joshi","Pawar","Rao","Kumar","Singh","Yadav","Gupta","Mishra","Verma","Chauhan","Naik","Jadhav","More","Kale","Shinde","Bhosale"];
+    const LOCATIONS = ["Wardha, Maharashtra","Nagpur, Maharashtra","Pune, Maharashtra","Nashik, Maharashtra","Aurangabad, Maharashtra","Amravati, Maharashtra","Akola, Maharashtra","Solapur, Maharashtra"];
+    const OCCUPATIONS = ["Kirana store owner","Tailoring unit","Vegetable vendor","Dairy farmer","Poultry farmer","Beauty parlour owner","General trading","Food processing unit","Small manufacturing unit","Service provider"];
+    const pick = (arr)=>arr[Math.floor(Math.random()*arr.length)];
+    const rand = (min,max)=>Math.floor(min+Math.random()*(max-min));
+
+    const products = (await db.getAll("products")).filter(p=>p.active);
+    if(products.length===0){ toast("No active products found — activate at least one product first."); return; }
+    const fundAccounts = await db.getAll("fundAccounts");
+    const fundAccount = fundAccounts[0] || null;
+    if(!fundAccount){ toast("No fund account found — add one under Fund Management first."); return; }
+
+    let sanctionedCount = 0, rejectedCount = 0;
+    const usedMobiles = new Set();
+    const genMobile = ()=>{ let m; do{ m = "9"+String(rand(100000000,999999999)); } while(usedMobiles.has(m)); usedMobiles.add(m); return m; };
+
+    for(let i=0; i<50; i++){
+      const isFemale = Math.random()<0.5;
+      const name = `${pick(isFemale?FEMALE_NAMES:MALE_NAMES)} ${pick(LAST_NAMES)}`;
+      const mobile = genMobile();
+      const aadhaar = String(rand(100000000000,999999999999));
+      const pan = String.fromCharCode(65+rand(0,26))+String.fromCharCode(65+rand(0,26))+String.fromCharCode(65+rand(0,26))+String.fromCharCode(65+rand(0,26))+String.fromCharCode(65+rand(0,26))+rand(1000,9999)+String.fromCharCode(65+rand(0,26));
+      const location = pick(LOCATIONS);
+      const occupation = pick(OCCUPATIONS);
+      const monthlyIncome = rand(15000,42000);
+      const creditScore = rand(600,800);
+      const riskCategory = creditScore>=750 ? "Low" : creditScore>=680 ? "Medium" : "High";
+      const product = pick(products);
+      const amountRequested = Math.min(product.maxLoanAmount||150000, rand(40000,150000));
+      const rejectThis = i>=45; // last 5 are rejected
+
+      const lead = {
+        id: uid("led"), applicantName:name, mobile, aadhaar, pan, location, borrowerId:null,
+        product: product.name, amountRequested, purpose:"Working capital / business expansion",
+        occupation, monthlyIncome, existingLoan: Math.random()<0.2?"Yes":"No",
+        source: pick(["Walk-in","Referral","Field Officer","Business Correspondent"]),
+        status: rejectThis ? "Rejected" : "New", createdAt: nowISO(), customerId:null, sanctionId:null
+      };
+
+      if(rejectThis){
+        await db.put("leads", lead);
+        rejectedCount++;
+        continue;
+      }
+
+      const customer = {
+        id: uid("cus"), personal:{name, dob:"", gender:isFemale?"Female":"Male", maritalStatus:"Married", mobile, email:""},
+        family:{name:"", dependents:String(rand(0,4))},
+        address:{current:location, permanent:location},
+        business:{name:name.split(" ")[0]+"'s "+occupation, type:occupation, years:String(rand(1,12))},
+        income:{monthly:monthlyIncome, annual:monthlyIncome*12, monthlyExpenses: Math.round(monthlyIncome*0.4), source:occupation},
+        bank:{name:"Local Bank", account:String(rand(1000000000,9999999999)), ifsc:"BANK000"+rand(1000,9999)},
+        nominee:{name:"", relationship: isFemale?"Spouse":"Spouse", mobile:""},
+        references:[`Reference for ${name}, ${genMobile()}, Neighbour`, `Reference 2, ${genMobile()}, Relative`],
+        existingLoans:"", previousLoans:"", creditScore, riskCategory,
+        kyc:{aadhaar, pan, otherIdType:"", otherIdNumber:"", photoBase64:null, docImageBase64:null, signatureBase64:null, gpsLat:null, gpsLng:null},
+        duplicateFlag:false, duplicateReason:"", leadId:lead.id, createdAt: nowISO(), createdBy: u.name
+      };
+      await db.put("customers", customer);
+      lead.customerId = customer.id;
+      lead.status = "Converted into Loan Application";
+      await db.put("leads", lead);
+
+      await db.put("appraisals", {
+        id: uid("apr"), customerId:customer.id, leadId:lead.id, collateralValue:null,
+        businessVerification:"Field visit conducted — operation active and consistent with declared business.",
+        residenceVerification:"Residence verified, stable.", neighbourVerification:"No adverse remarks.",
+        creditBureauReport:`Bureau score ${creditScore}.`,
+        incomeAssessment:"Income supported by observed business activity.", cashFlowAssessment:"Adequate for proposed EMI.",
+        householdExpenses: Math.round(monthlyIncome*0.4), repaymentCapacity: Math.round(monthlyIncome*0.3),
+        riskRating: riskCategory, recommendation:"Approve", photoBase64:null, gpsLat:null, gpsLng:null,
+        officerName:u.name, appraisalDate: todayStr(), status:"Submitted", createdAt: nowISO(), createdBy: u.name
+      });
+
+      const sanction = {
+        id: uid("snc"), leadId:lead.id, customerId:customer.id, product: product.name,
+        sanctionedAmount: amountRequested, interestRate: product.interestRate, tenureMonths: product.tenureMax,
+        proposedBy: u.name, proposedByRole: u.role, createdAt: nowISO(),
+        status:"Approved", approvedBy: u.name, approvedByRole: u.role, approvedAt: nowISO(),
+        disbursementId:null, loanAccountId:null, overrideUsed:false, overrideReason:""
+      };
+      await db.put("sanctions", sanction);
+
+      // Spread disbursement dates so the schedule naturally produces a mix
+      // of current / mildly overdue / seriously overdue accounts.
+      const bucket = sanctionedCount<28 ? "current" : sanctionedCount<40 ? "mild" : "severe";
+      const monthsAgo = bucket==="current" ? rand(1,2) : bucket==="mild" ? rand(4,5) : rand(8,11);
+      const disbursedDate = new Date();
+      disbursedDate.setMonth(disbursedDate.getMonth()-monthsAgo);
+      const disbursedDateStr = disbursedDate.toISOString().slice(0,10);
+
+      const loanAccount = {
+        id: uid("loa"), sanctionId:sanction.id, customerId:customer.id, product: product.name,
+        principal: amountRequested, interestRate: sanction.interestRate, tenureMonths: sanction.tenureMonths,
+        emiFrequency: product.emiFrequency, disbursedDate: disbursedDateStr, status:"Active",
+        createdAt: nowISO(), createdBy: u.name, accountNumber: await generateLoanAccountNumber()
+      };
+      const gen = generateEmiSchedule(loanAccount);
+      loanAccount.schedule = gen.schedule; loanAccount.emiAmount = gen.emiAmount; loanAccount.totalInstallments = gen.totalInstallments;
+      loanAccount.principalOutstanding = loanAccount.principal;
+
+      const disbursement = {
+        id: uid("dsb"), sanctionId:sanction.id, customerId:customer.id, amount:amountRequested,
+        mode:"Bank Transfer", date: disbursedDateStr, utr:"BULK"+Date.now()+i,
+        fundAccountId: fundAccount.id, fundAccountName: fundAccount.name, createdAt: nowISO(), createdBy: u.name
+      };
+      await db.put("disbursements", disbursement);
+      sanction.disbursementId = disbursement.id;
+      sanction.loanAccountId = loanAccount.id;
+      await db.put("sanctions", sanction);
+
+      // Simulate repayment history per bucket: current pays everything due
+      // on time; mild leaves the latest 1-2 unpaid; severe leaves most unpaid.
+      const today = todayStr();
+      const dueSoFar = loanAccount.schedule.filter(inst=>inst.dueDate<=today);
+      let payThrough;
+      if(bucket==="current") payThrough = dueSoFar.length;
+      else if(bucket==="mild") payThrough = Math.max(0, dueSoFar.length-rand(1,2));
+      else payThrough = Math.max(0, Math.min(dueSoFar.length, rand(1,3)));
+
+      for(let k=0; k<payThrough; k++){
+        const inst = loanAccount.schedule[k];
+        await db.put("payments", {
+          id: uid("pay"), loanAccountId:loanAccount.id, customerId:customer.id, installmentIndex:inst.index,
+          amount: inst.emiAmount, mode: pick(["Cash","UPI","Bank Transfer"]), date: inst.dueDate,
+          referenceNumber:"BULKPAY"+i+"-"+k, collectedBy:u.name, createdAt: nowISO(),
+          fundAccountId: fundAccount.id, fundAccountName: fundAccount.name
+        });
+        inst.status = "Paid"; inst.paidAmount = inst.emiAmount; inst.paidDate = inst.dueDate;
+      }
+      loanAccount.principalOutstanding = loanAccount.schedule.filter(i2=>i2.status!=="Paid").reduce((s,i2)=>s+i2.principalComponent,0);
+      await db.put("loanAccounts", loanAccount);
+
+      sanctionedCount++;
+    }
+
+    // A handful of journal expense entries for Accounting accuracy-checking.
+    const expenseCategories = [["Rent",15000],["Electricity",4000],["Office Supplies",2500],["Salaries",60000],["Travel",3000]];
+    for(const [category, amount] of expenseCategories){
+      await db.put("journalEntries", {
+        id: uid("jnl"), type:"Expense", category, date: todayStr(), amount,
+        description:"Bulk test batch entry", fundAccountId: fundAccount.id, fundAccountName: fundAccount.name,
+        createdAt: nowISO(), createdBy: u.name, proposedBy: u.name, proposedByRole: u.role,
+        status:"Posted", approvedBy: u.name, approvedAt: nowISO()
+      });
+    }
+    const totalExpense = expenseCategories.reduce((s,[,a])=>s+a,0);
+    const freshFund = await db.get("fundAccounts", fundAccount.id);
+    freshFund.balance -= totalExpense;
+    await db.put("fundAccounts", freshFund);
+
+    await logAudit(u.name, u.role, "50-Applicant Test Batch Loaded", `${sanctionedCount} sanctioned/disbursed with spread repayment history, ${rejectedCount} rejected, ${expenseCategories.length} journal entries`);
+    toast(`Done — ${sanctionedCount} sanctioned (with a mix of current/overdue accounts), ${rejectedCount} rejected.`);
+    render();
+  } catch(err){
+    console.error(err);
+    toast("Bulk load failed: "+(err.message||err));
+  }
+}
+
 async function handleSubmitApplication(){
   const u = session.user;
   const product = document.getElementById("ap-product").value;
@@ -6430,6 +6682,93 @@ async function handleSaveCustomer(){
 /* =========================================================================
    BOOT
    ========================================================================= */
+/* =========================================================================
+   Floating Help Widget — persistent across every screen (staff + borrower),
+   separate from the Help tab and AI Assistant/Advisor tabs. Same
+   Claude-via-artifact caveat: only sends while running inside Claude.ai.
+   ========================================================================= */
+function initFloatingHelp(){
+  if(document.getElementById("floating-help-btn")) return;
+  const btn = document.createElement("button");
+  btn.id = "floating-help-btn";
+  btn.innerHTML = "💬";
+  btn.title = "Quick Help";
+  btn.style.cssText = "position:fixed; bottom:20px; right:20px; width:56px; height:56px; border-radius:50%; background:#C6992F; color:#0E1A30; border:none; font-size:24px; box-shadow:0 4px 14px rgba(0,0,0,.28); z-index:998; cursor:pointer;";
+  btn.onclick = toggleFloatingHelp;
+  document.body.appendChild(btn);
+
+  const panel = document.createElement("div");
+  panel.id = "floating-help-panel";
+  panel.style.cssText = "position:fixed; bottom:86px; right:20px; width:320px; max-width:90vw; max-height:60vh; background:#fff; border-radius:12px; box-shadow:0 8px 30px rgba(0,0,0,.3); z-index:999; display:none; flex-direction:column; overflow:hidden; border:1px solid #DCD7CA; font-family:'Inter',system-ui,sans-serif;";
+  document.body.appendChild(panel);
+}
+
+function toggleFloatingHelp(){
+  const panel = document.getElementById("floating-help-panel");
+  if(!panel) return;
+  const isHidden = panel.style.display==="none" || !panel.style.display;
+  panel.style.display = isHidden ? "flex" : "none";
+  if(isHidden) renderFloatingHelpPanel();
+}
+
+function renderFloatingHelpPanel(){
+  const panel = document.getElementById("floating-help-panel");
+  if(!panel) return;
+  const messages = session.floatingHelpMessages || (session.floatingHelpMessages = []);
+  panel.innerHTML = `
+    <div style="background:#0E1A30; color:#fff; padding:12px 14px; display:flex; justify-content:space-between; align-items:center; border-bottom:3px solid #C6992F;">
+      <b style="font-family:'Fraunces',serif; font-size:15px;">Quick Help</b>
+      <button id="btn-close-floating-help" style="background:none; border:none; color:#fff; font-size:20px; cursor:pointer; line-height:1;">×</button>
+    </div>
+    <div id="floating-chat-messages" style="flex:1; overflow-y:auto; padding:12px; font-size:13px; background:#F6F4EF; min-height:120px;">
+      ${messages.length===0 ? `<p style="color:#5C6579; font-size:12.5px; font-style:italic;">Ask about any screen, a term you don't recognize, or how to do something — from anywhere in the app.</p>` :
+        messages.map(m=>`<div style="margin-bottom:10px;"><b>${m.role==='user'?'You':'Help'}:</b> ${esc(m.content)}</div>`).join("")}
+    </div>
+    <div style="background:#FBF1DC; color:#5C4200; font-size:11px; padding:6px 12px;">Works while this runs inside Claude.ai — needs your own key once hosted standalone.</div>
+    <div style="display:flex; gap:6px; padding:10px; border-top:1px solid #DCD7CA;">
+      <input id="floating-chat-input" placeholder="Ask a question…" style="flex:1; padding:8px 10px; border:1px solid #DCD7CA; border-radius:6px; font-size:13px;">
+      <button id="btn-floating-send" style="background:#C6992F; color:#0E1A30; border:none; border-radius:7px; padding:8px 14px; font-weight:600; font-size:13px; cursor:pointer;">Send</button>
+    </div>
+  `;
+  const closeBtn = document.getElementById("btn-close-floating-help");
+  if(closeBtn) closeBtn.onclick = toggleFloatingHelp;
+  const sendBtn = document.getElementById("btn-floating-send");
+  if(sendBtn) sendBtn.onclick = handleSendFloatingHelp;
+  const input = document.getElementById("floating-chat-input");
+  if(input) input.onkeydown = (e)=>{ if(e.key==="Enter") handleSendFloatingHelp(); };
+  const msgBox = document.getElementById("floating-chat-messages");
+  if(msgBox) msgBox.scrollTop = msgBox.scrollHeight;
+}
+
+async function handleSendFloatingHelp(){
+  const input = document.getElementById("floating-chat-input");
+  const text = input.value.trim();
+  if(!text) return;
+  const messages = session.floatingHelpMessages || (session.floatingHelpMessages = []);
+  messages.push({role:"user", content:text});
+  input.value = "";
+  renderFloatingHelpPanel();
+  try{
+    const isBorrower = session.type==="borrower";
+    const systemContext = isBorrower
+      ? "You are a friendly loan advisor for NBFC LMS, a borrower-facing loan application portal. Explain loan products, documents needed, and the application process in plain language. Never invent specific approval decisions, interest rates, or amounts — direct the person to their branch for anything specific to their own application."
+      : "You are a helpful assistant embedded in NBFC LMS, an NBFC Loan Management System, answering a staff member's quick question from wherever they are in the app. Be concise and practical for a banking/NBFC operations audience.";
+    const apiMessages = messages.map(m=>({role:m.role, content:m.content}));
+    apiMessages.unshift({role:"user", content: systemContext});
+    apiMessages.splice(1,0,{role:"assistant", content:"Understood."});
+    const response = await fetch("https://api.anthropic.com/v1/messages", {
+      method:"POST", headers:{ "Content-Type":"application/json" },
+      body: JSON.stringify({ model:"claude-sonnet-4-6", max_tokens:800, messages: apiMessages })
+    });
+    const data = await response.json();
+    const textResponses = (data.content||[]).filter(b=>b.type==="text").map(b=>b.text).join("\n");
+    messages.push({role:"assistant", content: textResponses || "(No response — this only works inside Claude.ai's artifact runtime.)"});
+  } catch(err){
+    messages.push({role:"assistant", content:"Couldn't reach the AI service — this only works while running inside Claude.ai."});
+  }
+  renderFloatingHelpPanel();
+}
+
 (async function boot(){
   try{
     await initFirebase();
@@ -6444,6 +6783,7 @@ async function handleSaveCustomer(){
       navigator.serviceWorker.register("sw.js").catch(()=>{ /* fine if unavailable, e.g. opened via file:// */ });
     }
     render();
+    initFloatingHelp();
   } catch(err){
     console.error("NBFC LMS failed to start:", err);
     // initFirebase() already rendered a setup message if config is missing.
