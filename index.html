@@ -492,7 +492,9 @@ const ALL_COLLECTIONS = [
   "staff","borrowers","leads","customers","products","appraisals","policyConfig",
   "fundAccounts","sanctions","disbursements","loanAccounts","payments","reminders",
   "recoveryVisits","apiConfig","journalEntries","complianceItems","rbiReturnFilings",
-  "staffSalaries","payrollRuns","dsaAgents","dsaCommissions","auditLog","meta"
+  "staffSalaries","payrollRuns","dsaAgents","dsaCommissions",
+  "shgGroups","shgMembers","shgSavings","shgInternalLoans","microEnterpriseTemplates",
+  "auditLog","meta"
 ];
 
 /* ---------------------------------------------------------------------
@@ -841,6 +843,33 @@ const RISK_CATEGORY_SCORE = {Low:1, Medium:2, High:3};
 
 const PAYROLL_DEDUCTION_LABELS = ["Provident Fund (PF)","Professional Tax","TDS","ESI","Other Deduction"];
 
+/* ---------------------------------------------------------------------
+   SHG / Rural Finance (DAY-NRLM terminology)
+   --------------------------------------------------------------------- */
+const SHG_GRADINGS = ["Not Graded","Grade I","Grade II"];
+const SHG_MEMBER_ROLES = ["President","Secretary","Treasurer","Member"];
+const SHG_STATUSES = ["Active","Dormant","Defunct"];
+
+/* ---------------------------------------------------------------------
+   Micro Enterprise reference templates — illustrative starting
+   assumptions to speed up income assessment during appraisal, NOT
+   authoritative figures. Actual revenue/expenses vary hugely by
+   location, scale, and season — always verify against the applicant's
+   own books, bank statements, or field visit findings.
+   --------------------------------------------------------------------- */
+const DEFAULT_MICRO_ENTERPRISE_TEMPLATES = [
+  {businessType:"Trading (General)", monthlyRevenue:60000, monthlyExpenses:48000, workingCapitalCycleDays:30, notes:"Kirana/general trading — margins typically 8-15%"},
+  {businessType:"Manufacturing (Small Unit)", monthlyRevenue:100000, monthlyExpenses:78000, workingCapitalCycleDays:45, notes:"Raw material + labour cycle usually longer than trading"},
+  {businessType:"Service (General)", monthlyRevenue:40000, monthlyExpenses:26000, workingCapitalCycleDays:15, notes:"Lower capital intensity, faster cash cycle"},
+  {businessType:"Dairy", monthlyRevenue:35000, monthlyExpenses:24000, workingCapitalCycleDays:7, notes:"Daily cash sales, feed cost is the main recurring expense"},
+  {businessType:"Poultry", monthlyRevenue:50000, monthlyExpenses:38000, workingCapitalCycleDays:60, notes:"Cycle length depends on broiler vs layer operation"},
+  {businessType:"Tailoring", monthlyRevenue:20000, monthlyExpenses:8000, workingCapitalCycleDays:15, notes:"Low fixed cost, seasonal demand (festivals)"},
+  {businessType:"Grocery", monthlyRevenue:70000, monthlyExpenses:58000, workingCapitalCycleDays:20, notes:"Thin margins, high volume"},
+  {businessType:"Vegetable Vendor", monthlyRevenue:25000, monthlyExpenses:19000, workingCapitalCycleDays:2, notes:"Very fast cash cycle, perishable stock risk"},
+  {businessType:"Beauty Parlour", monthlyRevenue:30000, monthlyExpenses:14000, workingCapitalCycleDays:10, notes:"Service-based, low inventory"},
+  {businessType:"Food Processing", monthlyRevenue:55000, monthlyExpenses:42000, workingCapitalCycleDays:20, notes:"Raw material perishability affects cycle length"},
+];
+
 const LEAD_STATUSES = ["New","Contacted","Documents Pending","KYC Pending","Under Verification","Eligible","Rejected","Converted into Loan Application"];
 const LEAD_SOURCES_STAFF = ["Walk-in","Referral","Business Correspondent","DSA","Bank Sakhi","Vitta Sakhi","Field Officer"];
 const ID_TYPES = ["CKYC","Voter ID","Passport","Driving Licence"];
@@ -1161,6 +1190,19 @@ async function ensureSeedYearEndClosing(){
   await logAudit("System", "System", "Year-End Closing Checklist Seeded", `${YEAR_END_CLOSING_ITEMS.length} post-audit closing items added`);
 }
 
+async function ensureSeedMicroEnterpriseTemplates(){
+  const flag = await db.get("meta","seededMicroEnterprise");
+  if(flag) return;
+  for(const t of DEFAULT_MICRO_ENTERPRISE_TEMPLATES){
+    const monthlyProfit = t.monthlyRevenue - t.monthlyExpenses;
+    await db.put("microEnterpriseTemplates", {
+      id: uid("met"), ...t, monthlyProfit, createdAt: nowISO(), createdBy:"system"
+    });
+  }
+  await db.put("meta", {key:"seededMicroEnterprise", value:true});
+  await logAudit("System", "System", "Micro Enterprise Templates Seeded", `${DEFAULT_MICRO_ENTERPRISE_TEMPLATES.length} illustrative business-type reference templates added`);
+}
+
 /* =========================================================================
    RENDER
    ========================================================================= */
@@ -1340,6 +1382,8 @@ async function renderStaffShell(){
     tabContent = await renderAccountingTab();
   } else if(tab === "payrolldsa" && canManageFunds){
     tabContent = await renderPayrollDsaTab();
+  } else if(tab === "shgrural"){
+    tabContent = await renderShgRuralTab();
   } else if(tab === "ratios" && canSeeReports){
     tabContent = await renderRatiosComplianceTab();
   } else if(tab === "reports" && canSeeReports){
@@ -1409,6 +1453,7 @@ async function renderStaffShell(){
         ${canManageFunds ? `<button class="tab ${tab==='funds'?'active':''}" data-tab="funds">Fund Management</button>`:""}
         ${canManageFunds ? `<button class="tab ${tab==='accounting'?'active':''}" data-tab="accounting">Accounting</button>`:""}
         ${canManageFunds ? `<button class="tab ${tab==='payrolldsa'?'active':''}" data-tab="payrolldsa">Payroll &amp; DSA</button>`:""}
+        <button class="tab ${tab==='shgrural'?'active':''}" data-tab="shgrural">SHG / Rural Finance</button>
         ${canSeeReports ? `<button class="tab ${tab==='ratios'?'active':''}" data-tab="ratios">Ratios &amp; Compliance</button>`:""}
         ${canSeeReports ? `<button class="tab ${tab==='reports'?'active':''}" data-tab="reports">Reports &amp; MIS</button>`:""}
         <button class="tab ${tab==='ai'?'active':''}" data-tab="ai">AI Insights</button>
@@ -3547,6 +3592,195 @@ function renderStaffHelpTab(){
 /* ---------------------------------------------------------------------
    Payroll & DSA
    --------------------------------------------------------------------- */
+/* ---------------------------------------------------------------------
+   SHG / Rural Finance + Micro Enterprise
+   --------------------------------------------------------------------- */
+async function renderShgRuralTab(){
+  const sub = session.shgSubTab || "groups";
+  const tabs = [
+    {id:"groups", label:"SHG Groups"}, {id:"members", label:"Members"},
+    {id:"savings", label:"Savings"}, {id:"loans", label:"Internal Loans"},
+    {id:"microenterprise", label:"Micro Enterprise"},
+  ];
+  let body = "";
+  if(sub==="groups") body = await renderShgGroups();
+  else if(sub==="members") body = await renderShgMembers();
+  else if(sub==="savings") body = await renderShgSavings();
+  else if(sub==="loans") body = await renderShgInternalLoans();
+  else if(sub==="microenterprise") body = await renderMicroEnterpriseTemplatesTab();
+  return `
+    <div class="card">
+      <h2>SHG / Rural Finance</h2>
+      <p class="sub">Self-Help Group profiles, member savings, and internal lending — DAY-NRLM terminology (RF: Revolving Fund, CIF: Community Investment Fund).</p>
+      <div class="tabs" style="margin-bottom:0; border-bottom:none;">
+        ${tabs.map(t=>`<button class="tab ${sub===t.id?'active':''}" data-shgtab="${t.id}">${t.label}</button>`).join("")}
+      </div>
+    </div>
+    ${body}
+  `;
+}
+
+async function renderShgGroups(){
+  const groups = await db.getAll("shgGroups");
+  const showForm = session.showShgGroupForm;
+  return `
+    <div class="card">
+      <div class="flex-between">
+        <h2 style="font-size:16px;">SHG Groups</h2>
+        <button class="btn btn-gold btn-sm" id="btn-open-new-shg">+ New SHG</button>
+      </div>
+      ${showForm ? `
+      <div class="divider"></div>
+      <div class="grid grid-3">
+        <div class="field"><label>SHG name</label><input id="shg-name"></div>
+        <div class="field"><label>SHG code (if any)</label><input id="shg-code"></div>
+        <div class="field"><label>Village</label><input id="shg-village"></div>
+        <div class="field"><label>Block</label><input id="shg-block"></div>
+        <div class="field"><label>District</label><input id="shg-district"></div>
+        <div class="field"><label>State</label><input id="shg-state"></div>
+        <div class="field"><label>Formation date</label><input id="shg-formed" type="date"></div>
+        <div class="field"><label>Grading</label><select id="shg-grading">${SHG_GRADINGS.map(g=>`<option>${g}</option>`).join("")}</select></div>
+        <div class="field"><label>Status</label><select id="shg-status">${SHG_STATUSES.map(s=>`<option>${s}</option>`).join("")}</select></div>
+        <div class="field"><label>Bank linked?</label><select id="shg-bank-linked"><option value="No">No</option><option value="Yes">Yes</option></select></div>
+        <div class="field"><label>Bank name</label><input id="shg-bank-name"></div>
+        <div class="field"><label>Bank account number</label><input id="shg-bank-account"></div>
+        <div class="field"><label>Revolving Fund (RF) received (₹)</label><input id="shg-rf" type="number"></div>
+        <div class="field"><label>Community Investment Fund (CIF) received (₹)</label><input id="shg-cif" type="number"></div>
+      </div>
+      <button class="btn btn-gold btn-sm" id="btn-save-shg">Save SHG</button>
+      ` : ""}
+      <table>
+        <thead><tr><th>Name</th><th>Village</th><th>Members</th><th>Grading</th><th>RF</th><th>CIF</th><th>Status</th></tr></thead>
+        <tbody>
+        ${groups.length===0 ? `<tr class="empty-row"><td colspan="7">No SHGs added yet.</td></tr>` :
+          groups.map(g=>`<tr><td>${esc(g.name)}</td><td>${esc(g.village)}</td><td>${g.memberCount||0}</td><td>${esc(g.grading)}</td><td>${fmtINR(g.revolvingFund)}</td><td>${fmtINR(g.cif)}</td><td>${g.status==='Active'?`<span class="badge badge-approved">Active</span>`:`<span class="badge badge-new">${esc(g.status)}</span>`}</td></tr>`).join("")}
+        </tbody>
+      </table>
+    </div>
+  `;
+}
+
+async function renderShgMembers(){
+  const groups = await db.getAll("shgGroups");
+  const members = await db.getAll("shgMembers");
+  const showForm = session.showShgMemberForm;
+  const groupName = (id)=>{ const g=groups.find(g=>g.id===id); return g?g.name:"—"; };
+  return `
+    <div class="card">
+      <div class="flex-between">
+        <h2 style="font-size:16px;">SHG Members</h2>
+        <button class="btn btn-gold btn-sm" id="btn-open-new-shg-member" ${groups.length===0?'disabled':''}>+ New Member</button>
+      </div>
+      ${groups.length===0 ? `<p class="small muted">Add an SHG group first.</p>` : ""}
+      ${showForm ? `
+      <div class="divider"></div>
+      <div class="grid grid-3">
+        <div class="field"><label>SHG</label><select id="mem-shg">${groups.map(g=>`<option value="${g.id}">${esc(g.name)}</option>`).join("")}</select></div>
+        <div class="field"><label>Name</label><input id="mem-name"></div>
+        <div class="field"><label>Husband's/Father's name</label><input id="mem-relation"></div>
+        <div class="field"><label>Age</label><input id="mem-age" type="number"></div>
+        <div class="field"><label>Mobile</label><input id="mem-mobile" maxlength="10"></div>
+        <div class="field"><label>Aadhaar</label><input id="mem-aadhaar" maxlength="12"></div>
+        <div class="field"><label>Role in SHG</label><select id="mem-role">${SHG_MEMBER_ROLES.map(r=>`<option>${r}</option>`).join("")}</select></div>
+        <div class="field"><label>Joining date</label><input id="mem-joined" type="date"></div>
+      </div>
+      <button class="btn btn-gold btn-sm" id="btn-save-shg-member">Save Member</button>
+      ` : ""}
+      <table>
+        <thead><tr><th>Name</th><th>SHG</th><th>Role</th><th>Mobile</th><th>Savings Balance</th></tr></thead>
+        <tbody>
+        ${members.length===0 ? `<tr class="empty-row"><td colspan="5">No members added yet.</td></tr>` :
+          members.map(m=>`<tr><td>${esc(m.name)}</td><td>${esc(groupName(m.shgId))}</td><td>${esc(m.role)}</td><td class="mono">${esc(m.mobile)||"—"}</td><td>${fmtINR(m.savingsBalance||0)}</td></tr>`).join("")}
+        </tbody>
+      </table>
+    </div>
+  `;
+}
+
+async function renderShgSavings(){
+  const groups = await db.getAll("shgGroups");
+  const members = await db.getAll("shgMembers");
+  const transactions = (await db.getAll("shgSavings")).sort((a,b)=>new Date(b.date)-new Date(a.date));
+  const memberName = (id)=>{ const m=members.find(m=>m.id===id); return m?m.name:"—"; };
+  return `
+    <div class="card">
+      <h2 style="font-size:16px;">Record Savings Transaction</h2>
+      ${members.length===0 ? `<p class="small muted">Add SHG members first.</p>` : `
+      <div class="grid grid-4">
+        <div class="field"><label>Member</label><select id="sav-member">${members.map(m=>`<option value="${m.id}">${esc(m.name)}</option>`).join("")}</select></div>
+        <div class="field"><label>Type</label><select id="sav-type"><option>Deposit</option><option>Withdrawal</option></select></div>
+        <div class="field"><label>Amount (₹)</label><input id="sav-amount" type="number"></div>
+        <div class="field"><label>Date</label><input id="sav-date" type="date" value="${todayStr()}"></div>
+      </div>
+      <button class="btn btn-gold btn-sm" id="btn-save-shg-savings">Record</button>
+      `}
+    </div>
+    <div class="card">
+      <h2 style="font-size:16px;">Savings Ledger</h2>
+      <table>
+        <thead><tr><th>Date</th><th>Member</th><th>Type</th><th>Amount</th><th>Balance After</th></tr></thead>
+        <tbody>
+        ${transactions.length===0 ? `<tr class="empty-row"><td colspan="5">No transactions yet.</td></tr>` :
+          transactions.map(t=>`<tr><td>${esc(t.date)}</td><td>${esc(memberName(t.memberId))}</td><td>${t.type==='Deposit'?`<span class="badge badge-approved">Deposit</span>`:`<span class="badge badge-rejected">Withdrawal</span>`}</td><td>${fmtINR(t.amount)}</td><td>${fmtINR(t.balanceAfter)}</td></tr>`).join("")}
+        </tbody>
+      </table>
+    </div>
+  `;
+}
+
+async function renderShgInternalLoans(){
+  const members = await db.getAll("shgMembers");
+  const loans = (await db.getAll("shgInternalLoans")).sort((a,b)=>new Date(b.createdAt)-new Date(a.createdAt));
+  const memberName = (id)=>{ const m=members.find(m=>m.id===id); return m?m.name:"—"; };
+  return `
+    <div class="card">
+      <h2 style="font-size:16px;">New Internal Loan</h2>
+      <p class="sub">Informal lending from the SHG's own corpus/savings to a member — separate from bank loans in the main Loan Accounts module.</p>
+      ${members.length===0 ? `<p class="small muted">Add SHG members first.</p>` : `
+      <div class="grid grid-3">
+        <div class="field"><label>Member</label><select id="sil-member">${members.map(m=>`<option value="${m.id}">${esc(m.name)}</option>`).join("")}</select></div>
+        <div class="field"><label>Amount (₹)</label><input id="sil-amount" type="number"></div>
+        <div class="field"><label>Purpose</label><input id="sil-purpose"></div>
+        <div class="field"><label>Disbursed date</label><input id="sil-date" type="date" value="${todayStr()}"></div>
+        <div class="field"><label>Interest rate (% p.a., if any)</label><input id="sil-rate" type="number" step="0.1"></div>
+        <div class="field"><label>Tenure (months)</label><input id="sil-tenure" type="number"></div>
+      </div>
+      <button class="btn btn-gold btn-sm" id="btn-save-shg-loan">Save Internal Loan</button>
+      `}
+    </div>
+    <div class="card">
+      <h2 style="font-size:16px;">Internal Loans</h2>
+      <table>
+        <thead><tr><th>Member</th><th>Amount</th><th>Purpose</th><th>Disbursed</th><th>Status</th><th></th></tr></thead>
+        <tbody>
+        ${loans.length===0 ? `<tr class="empty-row"><td colspan="6">No internal loans yet.</td></tr>` :
+          loans.map(l=>`<tr><td>${esc(memberName(l.memberId))}</td><td>${fmtINR(l.amount)}</td><td>${esc(l.purpose)||"—"}</td><td>${esc(l.disbursedDate)}</td>
+          <td>${l.status==='Active'?`<span class="badge badge-progress">Active</span>`:`<span class="badge badge-approved">Closed</span>`}</td>
+          <td>${l.status==='Active'?`<button class="btn btn-outline btn-sm mark-shg-loan-repaid-btn" data-loan="${l.id}">Mark Repaid</button>`:""}</td></tr>`).join("")}
+        </tbody>
+      </table>
+    </div>
+  `;
+}
+
+async function renderMicroEnterpriseTemplatesTab(){
+  const templates = await db.getAll("microEnterpriseTemplates");
+  const isSuperAdmin = session.user.role==="Super Admin";
+  return `
+    <div class="card">
+      <h2 style="font-size:16px;">Micro Enterprise Reference Templates</h2>
+      <div class="warn-banner" style="background:#FBF1DC;border-color:var(--gold);color:#5C4200;">⚠ Illustrative starting assumptions to speed up income assessment during appraisal — not authoritative figures. Actual revenue/expenses vary hugely by location, scale, and season; always verify against the applicant's own books, bank statements, or field visit.</div>
+      <table>
+        <thead><tr><th>Business Type</th><th>Monthly Revenue</th><th>Monthly Expenses</th><th>Monthly Profit</th><th>Working Capital Cycle</th><th>Notes</th></tr></thead>
+        <tbody>
+        ${templates.map(t=>`<tr><td>${esc(t.businessType)}</td><td>${fmtINR(t.monthlyRevenue)}</td><td>${fmtINR(t.monthlyExpenses)}</td><td>${fmtINR(t.monthlyProfit)}</td><td>${t.workingCapitalCycleDays} days</td><td class="small muted">${esc(t.notes)}</td></tr>`).join("")}
+        </tbody>
+      </table>
+      ${isSuperAdmin ? `<p class="small muted" style="margin-top:10px;">Editing these templates isn't wired up yet — ask if you'd like that added; for now this is a reference table your credit officers can consult manually.</p>` : ""}
+    </div>
+  `;
+}
+
 async function renderPayrollDsaTab(){
   const sub = session.payrollSubTab || "payroll";
   return `
@@ -3912,6 +4146,7 @@ function bindEvents(){
       session.productSubview="list"; session.appraisalSubview="list"; session.sanctionSubview="list";
       session.loanSubview="list"; session.showCustomReminderForm=false; session.recoverySubview="list";
       session.showSalaryForm=false; session.showDsaForm=false;
+      session.showShgGroupForm=false; session.showShgMemberForm=false;
       render();
     };
   });
@@ -4134,6 +4369,25 @@ function bindEvents(){
   const saveDsaBtn = document.getElementById("btn-save-dsa");
   if(saveDsaBtn) saveDsaBtn.onclick = handleSaveDsaAgent;
   document.querySelectorAll(".pay-dsa-btn").forEach(btn=> btn.onclick = ()=> handlePayDsaCommissions(btn.dataset.dsa));
+
+  // SHG / Rural Finance
+  document.querySelectorAll(".tab[data-shgtab]").forEach(el=>{
+    el.onclick = ()=>{ session.shgSubTab = el.getAttribute("data-shgtab"); session.showShgGroupForm=false; session.showShgMemberForm=false; render(); };
+  });
+  const openNewShg = document.getElementById("btn-open-new-shg");
+  if(openNewShg) openNewShg.onclick = ()=>{ session.showShgGroupForm=true; render(); };
+  const saveShgBtn = document.getElementById("btn-save-shg");
+  if(saveShgBtn) saveShgBtn.onclick = handleSaveShgGroup;
+  const openNewShgMember = document.getElementById("btn-open-new-shg-member");
+  if(openNewShgMember) openNewShgMember.onclick = ()=>{ session.showShgMemberForm=true; render(); };
+  const saveShgMemberBtn = document.getElementById("btn-save-shg-member");
+  if(saveShgMemberBtn) saveShgMemberBtn.onclick = handleSaveShgMember;
+  const saveShgSavingsBtn = document.getElementById("btn-save-shg-savings");
+  if(saveShgSavingsBtn) saveShgSavingsBtn.onclick = handleSaveShgSavings;
+  const saveShgLoanBtn = document.getElementById("btn-save-shg-loan");
+  if(saveShgLoanBtn) saveShgLoanBtn.onclick = handleSaveShgInternalLoan;
+  document.querySelectorAll(".mark-shg-loan-repaid-btn").forEach(btn=> btn.onclick = ()=> handleMarkShgLoanRepaid(btn.dataset.loan));
+
   const exportTallyBtn = document.getElementById("btn-export-tally");
   if(exportTallyBtn) exportTallyBtn.onclick = handleExportTally;
   const jfType = document.getElementById("jf-type");
@@ -5125,6 +5379,102 @@ async function handlePayDsaCommissions(dsaId){
   render();
 }
 
+/* ---------------------------------------------------------------------
+   SHG / Rural Finance handlers
+   --------------------------------------------------------------------- */
+async function handleSaveShgGroup(){
+  const u = session.user;
+  const name = document.getElementById("shg-name").value.trim();
+  if(!name){ toast("SHG name is required."); return; }
+  await db.put("shgGroups", {
+    id: uid("shg"), name, code: document.getElementById("shg-code").value.trim(),
+    village: document.getElementById("shg-village").value.trim(), block: document.getElementById("shg-block").value.trim(),
+    district: document.getElementById("shg-district").value.trim(), state: document.getElementById("shg-state").value.trim(),
+    formationDate: document.getElementById("shg-formed").value, grading: document.getElementById("shg-grading").value,
+    status: document.getElementById("shg-status").value, bankLinked: document.getElementById("shg-bank-linked").value,
+    bankName: document.getElementById("shg-bank-name").value.trim(), bankAccount: document.getElementById("shg-bank-account").value.trim(),
+    revolvingFund: Number(document.getElementById("shg-rf").value)||0, cif: Number(document.getElementById("shg-cif").value)||0,
+    memberCount:0, createdAt: nowISO(), createdBy: u.name
+  });
+  await logAudit(u.name, u.role, "SHG Group Added", name);
+  toast("SHG saved.");
+  session.showShgGroupForm = false;
+  render();
+}
+
+async function handleSaveShgMember(){
+  const u = session.user;
+  const shgId = document.getElementById("mem-shg").value;
+  const name = document.getElementById("mem-name").value.trim();
+  if(!shgId || !name){ toast("SHG and member name are required."); return; }
+  await db.put("shgMembers", {
+    id: uid("mbr"), shgId, name, relationName: document.getElementById("mem-relation").value.trim(),
+    age: Number(document.getElementById("mem-age").value)||null, mobile: document.getElementById("mem-mobile").value.trim(),
+    aadhaar: document.getElementById("mem-aadhaar").value.trim(), role: document.getElementById("mem-role").value,
+    joiningDate: document.getElementById("mem-joined").value, status:"Active", savingsBalance:0,
+    createdAt: nowISO(), createdBy: u.name
+  });
+  const shg = await db.get("shgGroups", shgId);
+  if(shg){ shg.memberCount = (shg.memberCount||0)+1; await db.put("shgGroups", shg); }
+  await logAudit(u.name, u.role, "SHG Member Added", `${name} — ${shg?shg.name:shgId}`);
+  toast("Member saved.");
+  session.showShgMemberForm = false;
+  render();
+}
+
+async function handleSaveShgSavings(){
+  const u = session.user;
+  const memberId = document.getElementById("sav-member").value;
+  const type = document.getElementById("sav-type").value;
+  const amount = Number(document.getElementById("sav-amount").value);
+  const date = document.getElementById("sav-date").value;
+  if(!amount || amount<=0){ toast("Enter a valid amount."); return; }
+  const member = await db.get("shgMembers", memberId);
+  if(!member) return;
+  if(type==="Withdrawal" && amount > (member.savingsBalance||0)){ toast("Withdrawal exceeds member's savings balance."); return; }
+  const balanceAfter = (member.savingsBalance||0) + (type==="Deposit" ? amount : -amount);
+  await db.put("shgSavings", {
+    id: uid("sav"), shgId: member.shgId, memberId, type, amount, date, balanceAfter,
+    createdAt: nowISO(), createdBy: u.name
+  });
+  member.savingsBalance = balanceAfter;
+  await db.put("shgMembers", member);
+  await logAudit(u.name, u.role, "SHG Savings Recorded", `${member.name} — ${type} ${fmtINR(amount)} — balance ${fmtINR(balanceAfter)}`);
+  toast("Recorded.");
+  render();
+}
+
+async function handleSaveShgInternalLoan(){
+  const u = session.user;
+  const memberId = document.getElementById("sil-member").value;
+  const amount = Number(document.getElementById("sil-amount").value);
+  if(!amount || amount<=0){ toast("Enter a valid amount."); return; }
+  const member = await db.get("shgMembers", memberId);
+  if(!member) return;
+  await db.put("shgInternalLoans", {
+    id: uid("sil"), shgId: member.shgId, memberId, amount, purpose: document.getElementById("sil-purpose").value.trim(),
+    disbursedDate: document.getElementById("sil-date").value, interestRate: Number(document.getElementById("sil-rate").value)||0,
+    tenureMonths: Number(document.getElementById("sil-tenure").value)||0, status:"Active",
+    createdAt: nowISO(), createdBy: u.name
+  });
+  await logAudit(u.name, u.role, "SHG Internal Loan Recorded", `${member.name} — ${fmtINR(amount)}`);
+  toast("Internal loan saved.");
+  render();
+}
+
+async function handleMarkShgLoanRepaid(loanId){
+  const u = session.user;
+  const loan = await db.get("shgInternalLoans", loanId);
+  if(!loan) return;
+  loan.status = "Closed";
+  loan.repaidDate = todayStr();
+  await db.put("shgInternalLoans", loan);
+  const member = await db.get("shgMembers", loan.memberId);
+  await logAudit(u.name, u.role, "SHG Internal Loan Repaid", `${member?member.name:loan.memberId} — ${fmtINR(loan.amount)}`);
+  toast("Marked repaid.");
+  render();
+}
+
 async function handleExportTally(){
   const acct = await computeAccountingSummary();
   const rows = [
@@ -5899,6 +6249,7 @@ async function handleSaveCustomer(){
     await ensureSeedPhase4();
     await ensureSeedCompliance();
     await ensureSeedYearEndClosing();
+    await ensureSeedMicroEnterpriseTemplates();
     await backfillLoanSchedules();
     if("serviceWorker" in navigator){
       navigator.serviceWorker.register("sw.js").catch(()=>{ /* fine if unavailable, e.g. opened via file:// */ });
