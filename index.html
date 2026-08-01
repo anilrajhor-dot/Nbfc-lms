@@ -907,12 +907,16 @@ function defaultNbfcProfile(){
   return {
     id:"default", name:"", address:"", registrationNumber:"", cin:"",
     gstNumber:"", panNumber:"", tanNumber:"", contactEmail:"", contactPhone:"", website:"",
+    bankAccounts:[], upiIds:[],
     updatedAt:null, updatedBy:null
   };
 }
 
 async function getNbfcProfile(){
-  return (await db.get("nbfcProfile","default")) || defaultNbfcProfile();
+  const p = (await db.get("nbfcProfile","default")) || defaultNbfcProfile();
+  if(!p.bankAccounts) p.bankAccounts = [];
+  if(!p.upiIds) p.upiIds = [];
+  return p;
 }
 
 /**
@@ -1121,9 +1125,9 @@ const RECOMMENDATIONS = ["Approve","Refer for Review","Reject"];
 const DELEGATION_ROLES = ["Credit Officer","Branch Manager","Credit Manager","Operations Manager","Managing Director"];
 const PROVISION_CLASSES = ["Standard Assets","SMA-0 (0–30 DPD)","SMA-1 (31–60 DPD)","SMA-2 (61–90 DPD)","Sub-standard NPA","Doubtful NPA","Loss Assets"];
 const LTV_PRODUCTS = ["Gold Loan","Business Loan","MSME Loan"];
-const DISBURSEMENT_MODES = ["NEFT","RTGS","IMPS","UPI","Bank Transfer"];
-const FUND_ACCOUNT_TYPES = ["Capital","Bank Account","Borrowing","Investment"];
-const COLLECTION_MODES = ["Cash","Cheque","UPI","Auto Debit","NACH","Bank Transfer","QR Code","POS Machine"];
+const DISBURSEMENT_MODES = ["Cash","Bank","UPI"];
+const FUND_ACCOUNT_TYPES = ["Capital","Cash","Bank Account","UPI","Borrowing","Investment"];
+const COLLECTION_MODES = ["Cash","Bank","UPI"];
 const REMINDER_RULES = [
   {offset:-7, label:"7 days before EMI", channels:["SMS","WhatsApp"]},
   {offset:-3, label:"3 days before EMI", channels:["SMS","WhatsApp"]},
@@ -2836,6 +2840,17 @@ async function renderFundsTab(){
     </div>
 
     <div class="card">
+      <h2 style="font-size:16px;">Add Capital — Cash / Bank / UPI</h2>
+      <p class="sub">Add initial capital split across your three collection points in one step, or top up any of them later by running this again — amounts add to the existing balance rather than replacing it. Creates a "Capital — Cash"/"Capital — Bank"/"Capital — UPI" fund source the first time; tops the same one up on repeat use.</p>
+      <div class="grid grid-3">
+        <div class="field"><label>Cash (₹)</label><input id="ic-cash" type="number" placeholder="0"></div>
+        <div class="field"><label>Bank (₹)</label><input id="ic-bank" type="number" placeholder="0"></div>
+        <div class="field"><label>UPI (₹)</label><input id="ic-upi" type="number" placeholder="0"></div>
+      </div>
+      <button class="btn btn-gold btn-sm" id="btn-add-initial-capital">Add Capital</button>
+    </div>
+
+    <div class="card">
       <h2 style="font-size:16px;">Projected Available Funds — Next 15 Days</h2>
       <p class="sub">Starts from today's Available Funds and adds each day's scheduled EMI collections, assuming on-time payment — this is a projection, not a guarantee; actual collections will run behind it if some installments come in late or are missed. It doesn't assume any future disbursements or expenses, since those aren't scheduled in advance in this app.</p>
       <table>
@@ -4522,6 +4537,42 @@ async function renderNbfcProfileTab(){
       <button class="btn btn-gold" id="btn-save-nbfc-profile">Save Profile</button>
       <span class="small muted" style="margin-left:10px;">${p.updatedAt ? "Last updated "+fmtDate(p.updatedAt)+" by "+esc(p.updatedBy) : "Not yet configured"}</span>
     </div>
+
+    <div class="card">
+      <h2 style="font-size:16px;">Bank Accounts</h2>
+      <p class="sub">The NBFC's own bank accounts — separate from Fund Management, this is your registration/reference record of where accounts are held.</p>
+      <table>
+        <thead><tr><th>Bank</th><th>Account Number</th><th>IFSC</th><th>Type</th><th></th></tr></thead>
+        <tbody>
+        ${p.bankAccounts.length===0 ? `<tr class="empty-row"><td colspan="5">No bank accounts added yet.</td></tr>` :
+          p.bankAccounts.map(b=>`<tr><td>${esc(b.bankName)}</td><td class="mono">${esc(b.accountNumber)}</td><td class="mono">${esc(b.ifsc)}</td><td>${esc(b.accountType)}${b.isPrimary?' <span class="badge badge-approved">Primary</span>':''}</td><td><button class="btn btn-danger btn-sm delete-bank-account-btn" data-id="${b.id}">Delete</button></td></tr>`).join("")}
+        </tbody>
+      </table>
+      <div class="grid grid-4" style="margin-top:10px;">
+        <div class="field"><label>Bank name</label><input id="nba-bank"></div>
+        <div class="field"><label>Account number</label><input id="nba-account"></div>
+        <div class="field"><label>IFSC</label><input id="nba-ifsc" style="text-transform:uppercase;"></div>
+        <div class="field"><label>Type</label><select id="nba-type"><option>Current</option><option>Savings</option><option>CC</option><option>OD</option></select></div>
+      </div>
+      <label style="display:flex; align-items:center; gap:6px; margin:8px 0;"><input type="checkbox" id="nba-primary" style="width:auto;"> Set as primary account</label>
+      <button class="btn btn-outline btn-sm" id="btn-add-bank-account">+ Add Bank Account</button>
+    </div>
+
+    <div class="card">
+      <h2 style="font-size:16px;">UPI IDs</h2>
+      <table>
+        <thead><tr><th>UPI ID</th><th>Label</th><th></th></tr></thead>
+        <tbody>
+        ${p.upiIds.length===0 ? `<tr class="empty-row"><td colspan="3">No UPI IDs added yet.</td></tr>` :
+          p.upiIds.map(u=>`<tr><td class="mono">${esc(u.upiId)}</td><td>${esc(u.label)}</td><td><button class="btn btn-danger btn-sm delete-upi-btn" data-id="${u.id}">Delete</button></td></tr>`).join("")}
+        </tbody>
+      </table>
+      <div class="grid grid-2" style="margin-top:10px;">
+        <div class="field"><label>UPI ID</label><input id="nu-upi" placeholder="yourname@bank"></div>
+        <div class="field"><label>Label</label><input id="nu-label" placeholder="e.g. Collections QR"></div>
+      </div>
+      <button class="btn btn-outline btn-sm" id="btn-add-upi">+ Add UPI ID</button>
+    </div>
   `;
 }
 
@@ -5056,6 +5107,8 @@ function bindEvents(){
   const openNewFund = document.getElementById("btn-open-new-fund");
   if(openNewFund) openNewFund.onclick = ()=>{ document.getElementById("new-fund-form-box").innerHTML = renderNewFundForm(); document.getElementById("btn-save-fund").onclick = handleSaveFund; };
   document.querySelectorAll(".adjust-fund-btn").forEach(btn=> btn.onclick = ()=> handleAdjustFund(btn.dataset.fund));
+  const addInitialCapitalBtn = document.getElementById("btn-add-initial-capital");
+  if(addInitialCapitalBtn) addInitialCapitalBtn.onclick = handleAddInitialCapital;
 
   // Loan Accounts
   document.querySelectorAll(".view-loan-btn").forEach(btn=> btn.onclick = ()=>{ session.loanSubview="view"; session.viewingLoanId=btn.dataset.loan; render(); });
@@ -5278,6 +5331,12 @@ function bindEvents(){
   if(runRestoreBtn) runRestoreBtn.onclick = handleRestoreBackup;
   const saveNbfcProfileBtn = document.getElementById("btn-save-nbfc-profile");
   if(saveNbfcProfileBtn) saveNbfcProfileBtn.onclick = handleSaveNbfcProfile;
+  const addBankAccountBtn = document.getElementById("btn-add-bank-account");
+  if(addBankAccountBtn) addBankAccountBtn.onclick = handleAddBankAccount;
+  document.querySelectorAll(".delete-bank-account-btn").forEach(btn=> btn.onclick = ()=> handleDeleteBankAccount(btn.dataset.id));
+  const addUpiBtn = document.getElementById("btn-add-upi");
+  if(addUpiBtn) addUpiBtn.onclick = handleAddUpi;
+  document.querySelectorAll(".delete-upi-btn").forEach(btn=> btn.onclick = ()=> handleDeleteUpi(btn.dataset.id));
   const saveOnboardingProfileBtn = document.getElementById("btn-save-onboarding-profile");
   if(saveOnboardingProfileBtn) saveOnboardingProfileBtn.onclick = handleSaveOnboardingProfile;
   const saveOnboardingFundBtn = document.getElementById("btn-save-onboarding-fund");
@@ -5861,6 +5920,35 @@ async function handleAdjustFund(fundId){
   await db.put("fundAccounts", account);
   await logAudit(session.user.name, session.user.role, "Fund Balance Adjusted", `${account.name}: ${fmtINR(old)} → ${fmtINR(newBalance)}`);
   toast("Balance updated.");
+  render();
+}
+
+async function handleAddInitialCapital(){
+  const u = session.user;
+  const cashAmt = Number(document.getElementById("ic-cash").value)||0;
+  const bankAmt = Number(document.getElementById("ic-bank").value)||0;
+  const upiAmt = Number(document.getElementById("ic-upi").value)||0;
+  if(cashAmt<=0 && bankAmt<=0 && upiAmt<=0){ toast("Enter at least one amount."); return; }
+  const entries = [
+    {amt:cashAmt, name:"Capital — Cash", type:"Cash"},
+    {amt:bankAmt, name:"Capital — Bank", type:"Bank Account"},
+    {amt:upiAmt, name:"Capital — UPI", type:"UPI"},
+  ];
+  const accounts = await db.getAll("fundAccounts");
+  const summary = [];
+  for(const e of entries){
+    if(e.amt<=0) continue;
+    let acc = accounts.find(a=>a.name===e.name && a.type===e.type);
+    if(acc){
+      acc.balance += e.amt;
+      await db.put("fundAccounts", acc);
+    } else {
+      await db.put("fundAccounts", { id: uid("fnd"), name:e.name, type:e.type, balance:e.amt, createdAt: nowISO(), createdBy: u.name });
+    }
+    summary.push(`${e.name}: +${fmtINR(e.amt)}`);
+  }
+  await logAudit(u.name, u.role, "Capital Added (Cash/Bank/UPI)", summary.join(", "));
+  toast("Capital added — "+summary.join(", "));
   render();
 }
 
@@ -6743,6 +6831,60 @@ async function handleSaveNbfcProfile(){
   render();
 }
 
+async function handleAddBankAccount(){
+  const u = session.user;
+  const bankName = document.getElementById("nba-bank").value.trim();
+  const accountNumber = document.getElementById("nba-account").value.trim();
+  if(!bankName || !accountNumber){ toast("Bank name and account number are required."); return; }
+  const p = await getNbfcProfile();
+  const isPrimary = document.getElementById("nba-primary").checked;
+  if(isPrimary) p.bankAccounts.forEach(b=>b.isPrimary=false);
+  p.bankAccounts.push({
+    id: uid("nba"), bankName, accountNumber, ifsc: document.getElementById("nba-ifsc").value.trim().toUpperCase(),
+    accountType: document.getElementById("nba-type").value, isPrimary
+  });
+  p.updatedAt = nowISO(); p.updatedBy = u.name;
+  await db.put("nbfcProfile", p);
+  await logAudit(u.name, u.role, "NBFC Bank Account Added", `${bankName} — ${accountNumber}`);
+  toast("Bank account added.");
+  render();
+}
+
+async function handleDeleteBankAccount(id){
+  const u = session.user;
+  const p = await getNbfcProfile();
+  p.bankAccounts = p.bankAccounts.filter(b=>b.id!==id);
+  p.updatedAt = nowISO(); p.updatedBy = u.name;
+  await db.put("nbfcProfile", p);
+  await logAudit(u.name, u.role, "NBFC Bank Account Removed", id);
+  toast("Bank account removed.");
+  render();
+}
+
+async function handleAddUpi(){
+  const u = session.user;
+  const upiId = document.getElementById("nu-upi").value.trim();
+  if(!upiId){ toast("Enter a UPI ID."); return; }
+  const p = await getNbfcProfile();
+  p.upiIds.push({ id: uid("upi"), upiId, label: document.getElementById("nu-label").value.trim() });
+  p.updatedAt = nowISO(); p.updatedBy = u.name;
+  await db.put("nbfcProfile", p);
+  await logAudit(u.name, u.role, "NBFC UPI ID Added", upiId);
+  toast("UPI ID added.");
+  render();
+}
+
+async function handleDeleteUpi(id){
+  const u = session.user;
+  const p = await getNbfcProfile();
+  p.upiIds = p.upiIds.filter(x=>x.id!==id);
+  p.updatedAt = nowISO(); p.updatedBy = u.name;
+  await db.put("nbfcProfile", p);
+  await logAudit(u.name, u.role, "NBFC UPI ID Removed", id);
+  toast("UPI ID removed.");
+  render();
+}
+
 async function handleSaveOnboardingProfile(){
   const u = session.user;
   const p = await getNbfcProfile();
@@ -7218,7 +7360,7 @@ async function handleLoadDemoData(){
 
     const disbursement3 = {
       id: uid("dsb"), sanctionId: sanction3.id, customerId: cust3.id, amount: sanction3.sanctionedAmount,
-      mode:"Bank Transfer", date: todayStr(), utr:"DEMO"+Date.now(),
+      mode:"Bank", date: todayStr(), utr:"DEMO"+Date.now(),
       fundAccountId: fundAccount?fundAccount.id:null, fundAccountName: fundAccount?fundAccount.name:"—",
       createdAt: nowISO(), createdBy: u.name
     };
@@ -7420,7 +7562,7 @@ async function handleLoadBulkDemoData(){
 
       const disbursement = {
         id: uid("dsb"), sanctionId:sanction.id, customerId:customer.id, amount:amountRequested,
-        mode:"Bank Transfer", date: disbursedDateStr, utr:"BULK"+Date.now()+i,
+        mode:"Bank", date: disbursedDateStr, utr:"BULK"+Date.now()+i,
         fundAccountId: fundAccount.id, fundAccountName: fundAccount.name, createdAt: dateToIso(disbursedDateStr), createdBy: u.name
       };
       await db.put("disbursements", disbursement);
@@ -7441,7 +7583,7 @@ async function handleLoadBulkDemoData(){
         const inst = loanAccount.schedule[k];
         await db.put("payments", {
           id: uid("pay"), loanAccountId:loanAccount.id, customerId:customer.id, installmentIndex:inst.index,
-          amount: inst.emiAmount, mode: pick(["Cash","UPI","Bank Transfer"]), date: inst.dueDate,
+          amount: inst.emiAmount, mode: pick(["Cash","UPI","Bank"]), date: inst.dueDate,
           referenceNumber:"BULKPAY"+i+"-"+k, collectedBy:u.name, createdAt: dateToIso(inst.dueDate),
           fundAccountId: fundAccount.id, fundAccountName: fundAccount.name
         });
