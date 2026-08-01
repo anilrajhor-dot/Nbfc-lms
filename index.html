@@ -272,11 +272,23 @@ async function initFirebase(){
   firebaseReady = true;
 }
 
+/** Cleared at the start of every render() pass, and whenever a write
+ *  happens. Within one screen load, many different parts (dashboard,
+ *  notifications, fund position, portfolio risk, etc.) independently
+ *  ask for the same collections — this avoids re-fetching them from
+ *  Firestore over and over for a single page load, which was the main
+ *  cause of slow loading as the app grew. */
+let renderCache = {};
+function clearRenderCache(){ renderCache = {}; }
+
 const db = {
   async getAll(collectionName){
     await initFirebase();
+    if(renderCache[collectionName]) return renderCache[collectionName];
     const snap = await firestoreDb.collection(collectionName).get();
-    return snap.docs.map(d => ({ ...d.data(), id: d.id }));
+    const result = snap.docs.map(d => ({ ...d.data(), id: d.id }));
+    renderCache[collectionName] = result;
+    return result;
   },
   async get(collectionName, id){
     await initFirebase();
@@ -286,7 +298,13 @@ const db = {
   async put(collectionName, obj){
     await initFirebase();
     await firestoreDb.collection(collectionName).doc(obj.id).set(obj);
+    delete renderCache[collectionName]; // this collection just changed — don't serve a stale list
     return obj;
+  },
+  async delete(collectionName, id){
+    await initFirebase();
+    await firestoreDb.collection(collectionName).doc(id).delete();
+    delete renderCache[collectionName];
   },
 };
 
@@ -1439,6 +1457,7 @@ async function ensureSeedMicroEnterpriseTemplates(){
    RENDER
    ========================================================================= */
 async function render(){
+  clearRenderCache();
   const app = document.getElementById("app");
   app.innerHTML = `<div style="padding:60px;text-align:center;color:#5C6579;">Loading…</div>`;
 
@@ -4087,7 +4106,7 @@ async function renderShgMembers(){
 async function renderShgSavings(){
   const groups = await db.getAll("shgGroups");
   const members = await db.getAll("shgMembers");
-  const transactions = (await db.getAll("shgSavings")).sort((a,b)=>new Date(b.date)-new Date(a.date));
+  const transactions = (await db.getAll("shgSavings")).slice().sort((a,b)=>new Date(b.date)-new Date(a.date));
   const memberName = (id)=>{ const m=members.find(m=>m.id===id); return m?m.name:"—"; };
   return `
     <div class="card">
@@ -4117,7 +4136,7 @@ async function renderShgSavings(){
 
 async function renderShgInternalLoans(){
   const members = await db.getAll("shgMembers");
-  const loans = (await db.getAll("shgInternalLoans")).sort((a,b)=>new Date(b.createdAt)-new Date(a.createdAt));
+  const loans = (await db.getAll("shgInternalLoans")).slice().sort((a,b)=>new Date(b.createdAt)-new Date(a.createdAt));
   const memberName = (id)=>{ const m=members.find(m=>m.id===id); return m?m.name:"—"; };
   return `
     <div class="card">
@@ -4265,7 +4284,7 @@ async function renderPayrollDsaTab(){
 async function renderPayrollSection(){
   const staffList = await db.getAll("staff");
   const salaries = await db.getAll("staffSalaries");
-  const runs = (await db.getAll("payrollRuns")).sort((a,b)=> b.month.localeCompare(a.month) || new Date(b.createdAt)-new Date(a.createdAt));
+  const runs = (await db.getAll("payrollRuns")).slice().sort((a,b)=> b.month.localeCompare(a.month) || new Date(b.createdAt)-new Date(a.createdAt));
   const fundAccounts = await db.getAll("fundAccounts");
   const showForm = session.showSalaryForm;
   const deductionRow = (i)=>`
@@ -4527,7 +4546,7 @@ async function renderUserManagement(){
 }
 
 async function renderAuditTrail(){
-  const logs = (await db.getAll("auditLog")).sort((a,b)=>new Date(b.ts)-new Date(a.ts));
+  const logs = (await db.getAll("auditLog")).slice().sort((a,b)=>new Date(b.ts)-new Date(a.ts));
   return `
     <div class="card">
       <h2>Audit Trail</h2>
@@ -6291,7 +6310,7 @@ async function handleDeleteMicroTemplate(templateId){
   const template = await db.get("microEnterpriseTemplates", templateId);
   if(!template) return;
   if(!window.confirm(`Delete the "${template.businessType}" template? This can't be undone.`)) return;
-  await firestoreDb.collection("microEnterpriseTemplates").doc(templateId).delete();
+  await db.delete("microEnterpriseTemplates", templateId);
   await logAudit(u.name, u.role, "Micro Enterprise Template Deleted", template.businessType);
   toast("Template deleted.");
   render();
@@ -6429,7 +6448,7 @@ async function handleDedupeCompliance(){
     const keep = group[0];
     const toRemove = group.slice(1);
     for(const dupe of toRemove){
-      await firestoreDb.collection("complianceItems").doc(dupe.id).delete();
+      await db.delete("complianceItems", dupe.id);
       removed++;
     }
   }
@@ -6701,7 +6720,7 @@ async function handleClearCollection(collectionName){
   const typed = window.prompt(`Type DELETE to permanently clear all ${records.length} record(s) in "${collectionName}". This cannot be undone — download a backup first if you haven't.`, "");
   if(typed !== "DELETE"){ toast("Cancelled — nothing was deleted."); return; }
   for(const rec of records){
-    await firestoreDb.collection(collectionName).doc(rec.id).delete();
+    await db.delete(collectionName, rec.id);
   }
   await logAudit(u.name, u.role, "Collection Cleared", `${collectionName} — ${records.length} record(s) deleted`);
   toast(`Cleared ${records.length} record(s) from ${collectionName}.`);
