@@ -2117,18 +2117,25 @@ function renderProductsTab(products){
   if(subview === "form") return renderProductForm(session.editingProduct);
   const sorted = products.slice().sort((a,b)=>a.name.localeCompare(b.name));
   const isSuperAdmin = session.user.role==="Super Admin";
+  const nameCounts = {};
+  products.forEach(p=>{ nameCounts[p.name] = (nameCounts[p.name]||0)+1; });
+  const hasDuplicates = Object.values(nameCounts).some(c=>c>1);
   return `
     <div class="card">
       <div class="flex-between">
         <div><h2>Loan Products</h2><p class="sub">Every product's rate, tenure, fees, security requirement, and lending limit — configurable, not hard-coded. ${isSuperAdmin?'':'Only Super Admin can activate a product or change its limit into effect — your changes save as Draft until activated.'}</p></div>
-        <button class="btn btn-gold btn-sm" id="btn-open-new-product">+ New Product</button>
+        <div class="action-row">
+          ${isSuperAdmin ? `<button class="btn btn-outline btn-sm" id="btn-activate-all-products">Activate All</button>` : ""}
+          ${isSuperAdmin && hasDuplicates ? `<button class="btn btn-danger btn-sm" id="btn-dedupe-products">Remove Duplicates</button>` : ""}
+          <button class="btn btn-gold btn-sm" id="btn-open-new-product">+ New Product</button>
+        </div>
       </div>
       <table>
         <thead><tr><th>Product</th><th>Rate</th><th>Tenure</th><th>Max Loan Amount</th><th>Security</th><th>Status</th><th></th></tr></thead>
         <tbody>
         ${sorted.map(p=>`
           <tr>
-            <td>${esc(p.name)}</td><td>${p.interestRate}% p.a.</td><td>${p.tenureMin}–${p.tenureMax} mo</td>
+            <td>${esc(p.name)}${nameCounts[p.name]>1?` <span class="badge badge-rejected">Duplicate</span>`:''}</td><td>${p.interestRate}% p.a.</td><td>${p.tenureMin}–${p.tenureMax} mo</td>
             <td>${fmtINR(p.maxLoanAmount)}</td><td>${esc(p.securityRequired)}</td>
             <td>${p.active ? `<span class="badge badge-approved">Active</span>` : `<span class="badge badge-new">Draft</span>`}</td>
             <td>
@@ -4538,8 +4545,8 @@ async function renderUserManagement(){
     </div>
     <div class="card">
       <div class="flex-between">
-        <div><h2>50-Applicant Test Batch</h2><p class="sub" style="margin-bottom:0;">A larger, more realistic batch for accuracy-checking every menu: 50 applicants — 45 taken through appraisal → sanction → disbursement → EMI collection (with a spread of current, mildly overdue, and seriously overdue accounts so Overdue/NPA/PAR/AI Insights all have real data), and 5 rejected at appraisal. Also books a few journal expense entries. Takes a minute — don't close the tab while it runs. Running it again adds another 50.</p></div>
-        <button class="btn btn-outline btn-sm" id="btn-load-bulk-demo-data">Load 50 Applicants</button>
+        <div><h2>Full-Journey Test Batch</h2><p class="sub" style="margin-bottom:0;">At least 50 applicants — guaranteed at least one per active product/scheme, split between direct and DSA-sourced leads — taken through appraisal → sanction → disbursement → EMI collection, backdated from 01/04/2025 so there's a real spread across every DPD/NPA band by today, including recovery officer assignment and a logged visit for the most overdue accounts. 5 more are rejected at appraisal. Also books a few journal expense entries. Activate every product first (Loan Products → "Activate All") so nothing gets skipped. Takes a minute or two — don't close the tab while it runs. Running it again adds another batch.</p></div>
+        <button class="btn btn-outline btn-sm" id="btn-load-bulk-demo-data">Load Full-Journey Batch</button>
       </div>
     </div>
   `;
@@ -4922,6 +4929,10 @@ function bindEvents(){
   document.querySelectorAll(".activate-product-btn").forEach(btn=>{
     btn.onclick = ()=> handleToggleProductActive(btn.dataset.product, btn.dataset.activate==="1");
   });
+  const activateAllBtn = document.getElementById("btn-activate-all-products");
+  if(activateAllBtn) activateAllBtn.onclick = handleActivateAllProducts;
+  const dedupeProductsBtn = document.getElementById("btn-dedupe-products");
+  if(dedupeProductsBtn) dedupeProductsBtn.onclick = handleDedupeProducts;
 
   // Credit Policy
   const savePolicyBtn = document.getElementById("btn-save-policy");
@@ -5281,6 +5292,40 @@ async function handleToggleProductActive(productId, makeActive){
   await db.put("products", product);
   await logAudit(u.name, u.role, makeActive ? "Product Activated" : "Product Deactivated", `${product.name} — Max ${fmtINR(product.maxLoanAmount)}`);
   toast(product.name+(makeActive?" activated.":" deactivated."));
+  render();
+}
+
+async function handleActivateAllProducts(){
+  const u = session.user;
+  const products = await db.getAll("products");
+  const inactive = products.filter(p=>!p.active);
+  if(inactive.length===0){ toast("All products are already active."); return; }
+  for(const p of inactive){ p.active = true; await db.put("products", p); }
+  await logAudit(u.name, u.role, "All Products Activated", `${inactive.length} product(s): ${inactive.map(p=>p.name).join(", ")}`);
+  toast(`Activated ${inactive.length} product(s).`);
+  render();
+}
+
+async function handleDedupeProducts(){
+  const u = session.user;
+  const products = await db.getAll("products");
+  const groups = {};
+  products.forEach(p=>{ groups[p.name] = groups[p.name]||[]; groups[p.name].push(p); });
+  let removed = 0;
+  for(const name in groups){
+    const group = groups[name];
+    if(group.length<=1) continue;
+    // Keep whichever copy is Active; among those (or if none active), keep the earliest created.
+    group.sort((a,b)=>{
+      const activeDiff = (b.active?1:0) - (a.active?1:0);
+      if(activeDiff!==0) return activeDiff;
+      return new Date(a.createdAt) - new Date(b.createdAt);
+    });
+    const toRemove = group.slice(1);
+    for(const dupe of toRemove){ await db.delete("products", dupe.id); removed++; }
+  }
+  await logAudit(u.name, u.role, "Duplicate Products Removed", `${removed} duplicate product(s) removed, keeping the active (or earliest) copy of each name`);
+  toast(removed>0 ? `Removed ${removed} duplicate product(s).` : "No duplicates found.");
   render();
 }
 
@@ -7085,14 +7130,19 @@ async function handleLoadDemoData(){
 }
 
 /* ---------------------------------------------------------------------
-   50-Applicant Test Batch — larger, more realistic accuracy-check dataset.
-   45 go through the full lifecycle with a spread of repayment scenarios
-   (current / mildly overdue / seriously overdue) so Overdue, NPA, PAR,
-   and AI Insights all have real data to show. 5 are rejected at appraisal.
+   Full-Journey Test Batch — covers every active product/scheme with at
+   least one application, split between direct and DSA-sourced leads,
+   the whole journey (lead → appraisal → sanction → disbursement → EMI
+   collection → recovery for overdue ones) backdated from 01/04/2025 so
+   there's a realistic spread of DPD across every NPA band by "today".
    --------------------------------------------------------------------- */
+function dateToIso(dateStr){ return new Date(dateStr+"T10:00:00").toISOString(); }
+function addDays(dateStr, days){ const d = new Date(dateStr); d.setDate(d.getDate()+days); return d.toISOString().slice(0,10); }
+function shuffleArray(arr){ const a=arr.slice(); for(let i=a.length-1;i>0;i--){ const j=Math.floor(Math.random()*(i+1)); [a[i],a[j]]=[a[j],a[i]]; } return a; }
+
 async function handleLoadBulkDemoData(){
   const u = session.user;
-  toast("Loading 50 applicants — this takes a minute, please wait…");
+  toast("Loading full-journey test batch — this takes a minute or two, please wait…");
   try{
     const MALE_NAMES = ["Ramesh","Suresh","Ganesh","Prakash","Vijay","Anil","Sunil","Rajesh","Mahesh","Dinesh","Ashok","Vinod","Sanjay","Manoj","Deepak","Ravi","Santosh","Balaji","Gopal","Ramdas","Yogesh","Nitin","Pravin","Rahul","Amit"];
     const FEMALE_NAMES = ["Sunita","Meena","Kavita","Anita","Rekha","Pooja","Neha","Priya","Geeta","Radha","Savita","Lata","Usha","Shanti","Kiran","Vandana","Manisha","Sarika","Archana","Snehal","Jyoti","Nirmala","Sushila","Kalpana","Asha"];
@@ -7101,18 +7151,53 @@ async function handleLoadBulkDemoData(){
     const OCCUPATIONS = ["Kirana store owner","Tailoring unit","Vegetable vendor","Dairy farmer","Poultry farmer","Beauty parlour owner","General trading","Food processing unit","Small manufacturing unit","Service provider"];
     const pick = (arr)=>arr[Math.floor(Math.random()*arr.length)];
     const rand = (min,max)=>Math.floor(min+Math.random()*(max-min));
+    const START = "2025-04-01";
+    const TODAY = todayStr();
+    const clamp = (dateStr)=> dateStr<START ? START : (dateStr>TODAY ? TODAY : dateStr);
 
     const products = (await db.getAll("products")).filter(p=>p.active);
-    if(products.length===0){ toast("No active products found — activate at least one product first."); return; }
+    if(products.length===0){ toast("No active products found — use \"Activate All\" on Loan Products first."); return; }
     const fundAccounts = await db.getAll("fundAccounts");
     const fundAccount = fundAccounts[0] || null;
     if(!fundAccount){ toast("No fund account found — add one under Fund Management first."); return; }
+    const staffList = await db.getAll("staff");
+    const recoveryOfficers = staffList.filter(s=>s.role==="Recovery Officer");
+    const officerPool = recoveryOfficers.length>0 ? recoveryOfficers : staffList;
 
-    let sanctionedCount = 0, rejectedCount = 0;
+    // Ensure at least a few DSA agents exist so DSA-sourced leads have someone to attribute to.
+    let dsaAgents = await db.getAll("dsaAgents");
+    if(dsaAgents.length===0){
+      const seedDsas = [
+        {name:"Vikram Associates", mobile:"9822011223"}, {name:"Priya Financial Services", mobile:"9822033445"}, {name:"Suresh DSA Network", mobile:"9822055667"}
+      ];
+      for(const d of seedDsas){
+        await db.put("dsaAgents", { id: uid("dsa"), name:d.name, mobile:d.mobile, email:"", bankAccount:String(rand(1000000000,9999999999)), bankIfsc:"BANK0009999", active:true, createdAt: nowISO(), createdBy:"System (Test Batch)" });
+      }
+      dsaAgents = await db.getAll("dsaAgents");
+    }
+    // Products need a commission % for DSA accrual to actually happen — default any unset ones.
+    for(const p of products){
+      if(p.dsaCommissionPct===undefined || p.dsaCommissionPct===null){
+        p.dsaCommissionPct = 1.5;
+        await db.put("products", p);
+      }
+    }
+
+    const totalCount = Math.max(50, products.length + 10);
+    const rejectedCount = 5;
+    const sanctionedTarget = totalCount - rejectedCount;
+
+    // Guarantee at least one application per product, then fill the rest randomly.
+    let productAssignments = products.map(p=>p);
+    while(productAssignments.length < sanctionedTarget) productAssignments.push(pick(products));
+    productAssignments = shuffleArray(productAssignments).slice(0, sanctionedTarget);
+
+    let sanctionedCount = 0, rejectedDone = 0;
     const usedMobiles = new Set();
     const genMobile = ()=>{ let m; do{ m = "9"+String(rand(100000000,999999999)); } while(usedMobiles.has(m)); usedMobiles.add(m); return m; };
+    const productsCovered = new Set();
 
-    for(let i=0; i<50; i++){
+    for(let i=0; i<totalCount; i++){
       const isFemale = Math.random()<0.5;
       const name = `${pick(isFemale?FEMALE_NAMES:MALE_NAMES)} ${pick(LAST_NAMES)}`;
       const mobile = genMobile();
@@ -7123,23 +7208,30 @@ async function handleLoadBulkDemoData(){
       const monthlyIncome = rand(15000,42000);
       const creditScore = rand(600,800);
       const riskCategory = creditScore>=750 ? "Low" : creditScore>=680 ? "Medium" : "High";
-      const product = pick(products);
-      const amountRequested = Math.min(product.maxLoanAmount||150000, rand(40000,150000));
-      const rejectThis = i>=45; // last 5 are rejected
+      const rejectThis = i>=sanctionedTarget;
+      const product = rejectThis ? pick(products) : productAssignments[i];
+
+      const isDsaSourced = Math.random()<0.3;
+      const dsa = isDsaSourced ? pick(dsaAgents) : null;
+      const leadDate = clamp(addDays(TODAY, -rand(1, 480)));
 
       const lead = {
         id: uid("led"), applicantName:name, mobile, aadhaar, pan, location, borrowerId:null,
-        product: product.name, amountRequested, purpose:"Working capital / business expansion",
-        occupation, monthlyIncome, existingLoan: Math.random()<0.2?"Yes":"No",
-        source: pick(["Walk-in","Referral","Field Officer","Business Correspondent"]),
-        status: rejectThis ? "Rejected" : "New", createdAt: nowISO(), customerId:null, sanctionId:null
+        product: product.name, amountRequested: Math.min(product.maxLoanAmount||150000, rand(40000,150000)),
+        purpose:"Working capital / business expansion", occupation, monthlyIncome,
+        existingLoan: Math.random()<0.2?"Yes":"No",
+        source: isDsaSourced ? "DSA" : pick(["Walk-in","Referral","Field Officer"]),
+        dsaId: dsa ? dsa.id : null,
+        status: rejectThis ? "Rejected" : "New", createdAt: dateToIso(leadDate), customerId:null, sanctionId:null
       };
+      const amountRequested = lead.amountRequested;
 
       if(rejectThis){
         await db.put("leads", lead);
-        rejectedCount++;
+        rejectedDone++;
         continue;
       }
+      productsCovered.add(product.id);
 
       const customer = {
         id: uid("cus"), personal:{name, dob:"", gender:isFemale?"Female":"Male", maritalStatus:"Married", mobile, email:""},
@@ -7148,16 +7240,28 @@ async function handleLoadBulkDemoData(){
         business:{name:name.split(" ")[0]+"'s "+occupation, type:occupation, years:String(rand(1,12))},
         income:{monthly:monthlyIncome, annual:monthlyIncome*12, monthlyExpenses: Math.round(monthlyIncome*0.4), source:occupation},
         bank:{name:"Local Bank", account:String(rand(1000000000,9999999999)), ifsc:"BANK000"+rand(1000,9999)},
-        nominee:{name:"", relationship: isFemale?"Spouse":"Spouse", mobile:""},
+        nominee:{name:"", relationship:"Spouse", mobile:""},
         references:[`Reference for ${name}, ${genMobile()}, Neighbour`, `Reference 2, ${genMobile()}, Relative`],
         existingLoans:"", previousLoans:"", creditScore, riskCategory,
         kyc:{aadhaar, pan, otherIdType:"", otherIdNumber:"", photoBase64:null, docImageBase64:null, signatureBase64:null, gpsLat:null, gpsLng:null},
-        duplicateFlag:false, duplicateReason:"", leadId:lead.id, createdAt: nowISO(), createdBy: u.name
+        duplicateFlag:false, duplicateReason:"", leadId:lead.id, createdAt: dateToIso(leadDate), createdBy: u.name
       };
       await db.put("customers", customer);
       lead.customerId = customer.id;
       lead.status = "Converted into Loan Application";
       await db.put("leads", lead);
+
+      // Spread disbursement dates within the 01/04/2025 → today window so
+      // the schedule naturally produces every DPD band by "today".
+      const bucket = sanctionedCount<sanctionedTarget*0.5 ? "current" : sanctionedCount<sanctionedTarget*0.75 ? "mild" : sanctionedCount<sanctionedTarget*0.9 ? "severe" : "loss";
+      let disbursedDateStr;
+      if(bucket==="current") disbursedDateStr = clamp(addDays(TODAY, -rand(30,90)));
+      else if(bucket==="mild") disbursedDateStr = clamp(addDays(TODAY, -rand(120,180)));
+      else if(bucket==="severe") disbursedDateStr = clamp(addDays(TODAY, -rand(240,365)));
+      else disbursedDateStr = clamp(addDays(START, rand(0,60))); // deepest overdue, anchored near 01/04/2025
+
+      const appraisalDate = clamp(addDays(disbursedDateStr, -rand(5,10)));
+      const sanctionDate = clamp(addDays(disbursedDateStr, -rand(1,4)));
 
       await db.put("appraisals", {
         id: uid("apr"), customerId:customer.id, leadId:lead.id, collateralValue:null,
@@ -7167,31 +7271,24 @@ async function handleLoadBulkDemoData(){
         incomeAssessment:"Income supported by observed business activity.", cashFlowAssessment:"Adequate for proposed EMI.",
         householdExpenses: Math.round(monthlyIncome*0.4), repaymentCapacity: Math.round(monthlyIncome*0.3),
         riskRating: riskCategory, recommendation:"Approve", photoBase64:null, gpsLat:null, gpsLng:null,
-        officerName:u.name, appraisalDate: todayStr(), status:"Submitted", createdAt: nowISO(), createdBy: u.name
+        officerName:u.name, appraisalDate, status:"Submitted", createdAt: dateToIso(appraisalDate), createdBy: u.name
       });
 
       const sanction = {
         id: uid("snc"), leadId:lead.id, customerId:customer.id, product: product.name,
         sanctionedAmount: amountRequested, interestRate: product.interestRate, tenureMonths: product.tenureMax,
-        proposedBy: u.name, proposedByRole: u.role, createdAt: nowISO(),
-        status:"Approved", approvedBy: u.name, approvedByRole: u.role, approvedAt: nowISO(),
+        proposedBy: u.name, proposedByRole: u.role, createdAt: dateToIso(sanctionDate),
+        status:"Approved", approvedBy: u.name, approvedByRole: u.role, approvedAt: dateToIso(sanctionDate),
         disbursementId:null, loanAccountId:null, overrideUsed:false, overrideReason:""
       };
       await db.put("sanctions", sanction);
-
-      // Spread disbursement dates so the schedule naturally produces a mix
-      // of current / mildly overdue / seriously overdue accounts.
-      const bucket = sanctionedCount<28 ? "current" : sanctionedCount<40 ? "mild" : "severe";
-      const monthsAgo = bucket==="current" ? rand(1,2) : bucket==="mild" ? rand(4,5) : rand(8,11);
-      const disbursedDate = new Date();
-      disbursedDate.setMonth(disbursedDate.getMonth()-monthsAgo);
-      const disbursedDateStr = disbursedDate.toISOString().slice(0,10);
 
       const loanAccount = {
         id: uid("loa"), sanctionId:sanction.id, customerId:customer.id, product: product.name,
         principal: amountRequested, interestRate: sanction.interestRate, tenureMonths: sanction.tenureMonths,
         emiFrequency: product.emiFrequency, disbursedDate: disbursedDateStr, status:"Active",
-        createdAt: nowISO(), createdBy: u.name, accountNumber: await generateLoanAccountNumber()
+        createdAt: dateToIso(disbursedDateStr), createdBy: u.name, accountNumber: await generateLoanAccountNumber(),
+        recoveryOfficer:null, recoveryStatus:null
       };
       const gen = generateEmiSchedule(loanAccount);
       loanAccount.schedule = gen.schedule; loanAccount.emiAmount = gen.emiAmount; loanAccount.totalInstallments = gen.totalInstallments;
@@ -7200,34 +7297,55 @@ async function handleLoadBulkDemoData(){
       const disbursement = {
         id: uid("dsb"), sanctionId:sanction.id, customerId:customer.id, amount:amountRequested,
         mode:"Bank Transfer", date: disbursedDateStr, utr:"BULK"+Date.now()+i,
-        fundAccountId: fundAccount.id, fundAccountName: fundAccount.name, createdAt: nowISO(), createdBy: u.name
+        fundAccountId: fundAccount.id, fundAccountName: fundAccount.name, createdAt: dateToIso(disbursedDateStr), createdBy: u.name
       };
       await db.put("disbursements", disbursement);
       sanction.disbursementId = disbursement.id;
       sanction.loanAccountId = loanAccount.id;
       await db.put("sanctions", sanction);
+      await accrueDsaCommission(lead.id, sanction, amountRequested, u.name);
 
-      // Simulate repayment history per bucket: current pays everything due
-      // on time; mild leaves the latest 1-2 unpaid; severe leaves most unpaid.
-      const today = todayStr();
-      const dueSoFar = loanAccount.schedule.filter(inst=>inst.dueDate<=today);
+      // Simulate repayment history per bucket.
+      const dueSoFar = loanAccount.schedule.filter(inst=>inst.dueDate<=TODAY);
       let payThrough;
       if(bucket==="current") payThrough = dueSoFar.length;
       else if(bucket==="mild") payThrough = Math.max(0, dueSoFar.length-rand(1,2));
-      else payThrough = Math.max(0, Math.min(dueSoFar.length, rand(1,3)));
+      else if(bucket==="severe") payThrough = Math.max(0, Math.min(dueSoFar.length, rand(1,3)));
+      else payThrough = Math.max(0, Math.min(dueSoFar.length, rand(0,2))); // "loss" bucket — barely any payments
 
       for(let k=0; k<payThrough; k++){
         const inst = loanAccount.schedule[k];
         await db.put("payments", {
           id: uid("pay"), loanAccountId:loanAccount.id, customerId:customer.id, installmentIndex:inst.index,
           amount: inst.emiAmount, mode: pick(["Cash","UPI","Bank Transfer"]), date: inst.dueDate,
-          referenceNumber:"BULKPAY"+i+"-"+k, collectedBy:u.name, createdAt: nowISO(),
+          referenceNumber:"BULKPAY"+i+"-"+k, collectedBy:u.name, createdAt: dateToIso(inst.dueDate),
           fundAccountId: fundAccount.id, fundAccountName: fundAccount.name
         });
         inst.status = "Paid"; inst.paidAmount = inst.emiAmount; inst.paidDate = inst.dueDate;
       }
       loanAccount.principalOutstanding = loanAccount.schedule.filter(i2=>i2.status!=="Paid").reduce((s,i2)=>s+i2.principalComponent,0);
+
+      // Exercise the Recovery module for the two most-overdue buckets.
+      if((bucket==="severe" || bucket==="loss") && officerPool.length>0){
+        const officer = pick(officerPool);
+        loanAccount.recoveryOfficer = officer.name;
+        loanAccount.recoveryStatus = "In Progress";
+      }
       await db.put("loanAccounts", loanAccount);
+
+      if((bucket==="severe" || bucket==="loss") && officerPool.length>0){
+        const visitDate = clamp(addDays(TODAY, -rand(3,25)));
+        await db.put("recoveryVisits", {
+          id: uid("rvi"), loanAccountId: loanAccount.id, customerId: customer.id,
+          visitDate, officer: loanAccount.recoveryOfficer,
+          nextVisitDate: addDays(TODAY, rand(3,14)),
+          borrowerRemarks: pick(["Assured payment after harvest/festival season.","Requested part-payment plan.","Business slow this quarter, asked for more time.","Agreed to pay next week."]),
+          promiseToPayAmount: Math.round(loanAccount.emiAmount * rand(1,3)),
+          promiseToPayDate: addDays(TODAY, rand(5,20)),
+          settlementProposal:"", progressNotes:"Field visit conducted as part of full-journey test batch.",
+          photoBase64:null, gpsLat:null, gpsLng:null, createdAt: dateToIso(visitDate), createdBy: u.name
+        });
+      }
 
       sanctionedCount++;
     }
@@ -7237,7 +7355,7 @@ async function handleLoadBulkDemoData(){
     for(const [category, amount] of expenseCategories){
       await db.put("journalEntries", {
         id: uid("jnl"), type:"Expense", category, date: todayStr(), amount,
-        description:"Bulk test batch entry", fundAccountId: fundAccount.id, fundAccountName: fundAccount.name,
+        description:"Full-journey test batch entry", fundAccountId: fundAccount.id, fundAccountName: fundAccount.name,
         createdAt: nowISO(), createdBy: u.name, proposedBy: u.name, proposedByRole: u.role,
         status:"Posted", approvedBy: u.name, approvedAt: nowISO()
       });
@@ -7247,8 +7365,9 @@ async function handleLoadBulkDemoData(){
     freshFund.balance -= totalExpense;
     await db.put("fundAccounts", freshFund);
 
-    await logAudit(u.name, u.role, "50-Applicant Test Batch Loaded", `${sanctionedCount} sanctioned/disbursed with spread repayment history, ${rejectedCount} rejected, ${expenseCategories.length} journal entries`);
-    toast(`Done — ${sanctionedCount} sanctioned (with a mix of current/overdue accounts), ${rejectedCount} rejected.`);
+    const uncovered = products.filter(p=>!productsCovered.has(p.id));
+    await logAudit(u.name, u.role, "Full-Journey Test Batch Loaded", `${sanctionedCount} sanctioned/disbursed (backdated from ${START}) across ${productsCovered.size}/${products.length} products, ${rejectedDone} rejected, DSA-sourced and direct leads, recovery visits logged for overdue accounts`);
+    toast(`Done — ${sanctionedCount} sanctioned across ${productsCovered.size}/${products.length} products, ${rejectedDone} rejected.${uncovered.length>0?' Not covered: '+uncovered.map(p=>p.name).join(', '):''}`);
     render();
   } catch(err){
     console.error(err);
