@@ -790,6 +790,7 @@ const VERIFICATION_SERVICES = [
 const STAFF_HELP = [
   {section:"Getting Started", items:[
     {q:"How do I log in the first time?", a:"On first run, the Staff Login screen asks you to create the Super Admin account instead of logging in. After that, use the username/password you set. Only Super Admin can create further staff logins, under User Management."},
+    {q:"Can I remove a staff account, or hand off Super Admin to someone else?", a:"Yes — User Management → Staff Directory → Remove, Super Admin only. The app won't let you remove the last remaining Super Admin, since that would permanently lock everyone out. To hand off: create the new Super Admin first, confirm they can log in, then remove the old account."},
     {q:"What do the different roles see?", a:"Every staff role can see Leads, Customers, Credit Appraisal, Sanction & Disbursement, Loan Accounts, Overdue & NPA/Recovery, Reminders, SHG/Rural Finance, and AI Insights. Fund Management, Accounting, Payroll & DSA, Loan Products, and Credit Policy are limited to Super Admin/Accounts/Operations Manager/Credit Manager. Only Super Admin sees User Management, Integrations, NBFC Profile, and Data Management."},
     {q:"Is there help anywhere other than this tab?", a:"Yes — a 💬 button sits fixed in the corner of every screen (staff and borrower) for a quick question without navigating here. Same AI, works only inside Claude.ai until you connect your own key."},
   ]},
@@ -4791,6 +4792,8 @@ async function renderDataManagementTab(){
 
 async function renderUserManagement(){
   const staff = await db.getAll("staff");
+  const isSuperAdmin = session.user.role==="Super Admin";
+  const superAdminCount = staff.filter(s=>s.role==="Super Admin").length;
   return `
     <div class="card">
       <h2>Add Staff User</h2>
@@ -4808,10 +4811,15 @@ async function renderUserManagement(){
     </div>
     <div class="card">
       <h2>Staff Directory</h2>
+      <p class="sub">${isSuperAdmin ? 'Removing a staff member deletes their access immediately (their login itself is unaffected — see Security Migration notes). To hand off to a new Super Admin: create their account first, confirm they can log in, then remove the old one.' : ''}</p>
       <table>
-        <thead><tr><th>Name</th><th>Username</th><th>Role</th><th>Branch</th><th>Created</th></tr></thead>
+        <thead><tr><th>Name</th><th>Username</th><th>Role</th><th>Branch</th><th>Created</th>${isSuperAdmin?'<th></th>':''}</tr></thead>
         <tbody>
-        ${staff.map(s=>`<tr><td>${esc(s.name)}</td><td class="mono">${esc(s.username)}</td><td><span class="badge badge-role">${esc(s.role)}</span></td><td>${esc(s.branch)||"—"}</td><td>${fmtDate(s.createdAt)}</td></tr>`).join("")}
+        ${staff.map(s=>{
+          const isLastSuperAdmin = s.role==="Super Admin" && superAdminCount<=1;
+          return `<tr><td>${esc(s.name)}${s.id===session.user.id?' <span class="badge badge-new">You</span>':''}</td><td class="mono">${esc(s.username)}</td><td><span class="badge badge-role">${esc(s.role)}</span></td><td>${esc(s.branch)||"—"}</td><td>${fmtDate(s.createdAt)}</td>
+          ${isSuperAdmin ? `<td>${isLastSuperAdmin ? `<span class="small muted">Only Super Admin — can't remove</span>` : `<button class="btn btn-danger btn-sm remove-staff-btn" data-staff="${s.id}">Remove</button>`}</td>` : ''}</tr>`;
+        }).join("")}
         </tbody>
       </table>
     </div>
@@ -5143,6 +5151,7 @@ function bindEvents(){
 
   const addStaffBtn = document.getElementById("btn-add-staff");
   if(addStaffBtn) addStaffBtn.onclick = handleAddStaff;
+  document.querySelectorAll(".remove-staff-btn").forEach(btn=> btn.onclick = ()=> handleRemoveStaff(btn.dataset.staff));
   const loadDemoBtn = document.getElementById("btn-load-demo-data");
   if(loadDemoBtn) loadDemoBtn.onclick = handleLoadDemoData;
   const loadBulkDemoBtn = document.getElementById("btn-load-bulk-demo-data");
@@ -7630,6 +7639,47 @@ async function handleAddStaff(){
     await secondaryApp.delete();
   }
 }
+
+async function handleRemoveStaff(staffId){
+  const u = session.user;
+  if(u.role!=="Super Admin"){ toast("Only Super Admin can remove staff."); return; }
+  const target = await db.get("staff", staffId);
+  if(!target) return;
+
+  // Hard safeguard: never allow the last remaining Super Admin to be
+  // removed through the app — that would permanently lock everyone out,
+  // since the one-time bootstrap window for creating a fresh Super Admin
+  // closes forever after the first one and does not reopen.
+  if(target.role==="Super Admin"){
+    const allStaff = await db.getAll("staff");
+    const superAdminCount = allStaff.filter(s=>s.role==="Super Admin").length;
+    if(superAdminCount<=1){
+      toast("Can't remove the only Super Admin — create another Super Admin account first, confirm they can log in, then remove this one.");
+      return;
+    }
+  }
+
+  const removingSelf = staffId === u.id;
+  const confirmMsg = removingSelf
+    ? `This removes YOUR OWN staff access and signs you out immediately. Are you sure?`
+    : `Remove ${target.name} (${target.role})? This deletes their access immediately. Their Firebase Auth login itself isn't deleted (see Security Migration notes) — they'll simply have zero access if they try to sign in again.`;
+  if(!window.confirm(confirmMsg)) return;
+
+  await logAudit(u.name, u.role, "Staff User Removed", `${target.name} (${target.role}) — removed by ${u.name}`);
+  await db.delete("staff", staffId);
+
+  if(removingSelf){
+    toast("Your access has been removed. Signing you out.");
+    session = {type:null, user:null};
+    await firebase.auth().signOut();
+    await firebase.auth().signInAnonymously();
+    setRoute("landing");
+  } else {
+    toast(`${target.name} removed.`);
+    render();
+  }
+}
+
 
 async function handleLoadDemoData(){
   const u = session.user;
