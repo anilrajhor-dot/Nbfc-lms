@@ -287,7 +287,7 @@ async function initFirebase(){
  *     you just don't pay a fresh round-trip for rapid clicking around. */
 let renderCache = {};
 let staleCache = {};
-const STALE_CACHE_MS = 15000;
+const STALE_CACHE_MS = 45000;
 function clearRenderCache(){ renderCache = {}; }
 
 const db = {
@@ -340,8 +340,7 @@ async function logAudit(actor, actorRole, action, details){
 }
 
 async function computeFundPosition(){
-  const accounts = await db.getAll("fundAccounts");
-  const sanctions = await db.getAll("sanctions");
+  const [accounts, sanctions] = await Promise.all([db.getAll("fundAccounts"), db.getAll("sanctions")]);
   const totalFunds = accounts.reduce((s,a)=>s+a.balance,0);
   const undisbursed = sanctions.filter(s=>s.status==="Approved" && !s.disbursementId);
   const committed = undisbursed.reduce((s,x)=>s+x.sanctionedAmount,0);
@@ -626,7 +625,7 @@ const ALL_COLLECTIONS = [
   "recoveryVisits","apiConfig","aiConfig","nbfcProfile","categoryConfig","journalEntries","complianceItems","rbiReturnFilings",
   "staffSalaries","payrollRuns","dsaAgents","dsaCommissions",
   "shgGroups","shgMembers","shgSavings","shgInternalLoans","microEnterpriseTemplates",
-  "bankStatementLines",
+  "bankStatementLines","bankBorrowings","fixedAssets",
   "auditLog","meta"
 ];
 
@@ -984,13 +983,13 @@ function parseVerifyResponse(raw){
    Phase 8: Notifications Center — aggregated operational alerts
    --------------------------------------------------------------------- */
 async function computeNotifications(){
-  const leads = await db.getAll("leads");
-  const sanctions = await db.getAll("sanctions");
-  const loanAccounts = await db.getAll("loanAccounts");
-  const payments = await db.getAll("payments");
-  const fundPos = await computeFundPosition();
-  const riskPos = await computePortfolioRisk(loanAccounts, payments);
-  const emiPos = await computeEmiPosition(loanAccounts, payments);
+  const [leads, sanctions, loanAccounts, payments] = await Promise.all([
+    db.getAll("leads"), db.getAll("sanctions"), db.getAll("loanAccounts"), db.getAll("payments")
+  ]);
+  const [fundPos, riskPos, emiPos, overdueReturns, journalEntries] = await Promise.all([
+    computeFundPosition(), computePortfolioRisk(loanAccounts, payments), computeEmiPosition(loanAccounts, payments),
+    computeOverdueRbiReturns(), db.getAll("journalEntries")
+  ]);
 
   const items = [];
   const kycPending = leads.filter(l=>l.status==="KYC Pending").length;
@@ -1006,9 +1005,8 @@ async function computeNotifications(){
   const npaCount = riskPos.analyzed.filter(a=>NPA_CLASSES.includes(a.classification)).length;
   if(npaCount>0) items.push({label:`${npaCount} account(s) classified NPA`, tab:"overdue"});
   if(emiPos.emiDueTodayCount>0) items.push({label:`${emiPos.emiDueTodayCount} EMI(s) due today (${fmtINR(emiPos.emiDueTodayAmount)})`, tab:"loanaccounts"});
-  const overdueReturns = await computeOverdueRbiReturns();
   if(overdueReturns.length>0) items.push({label:`${overdueReturns.length} RBI return(s) overdue: ${overdueReturns.map(f=>f.code).join(", ")}`, tab:"ratios"});
-  const journalPending = (await db.getAll("journalEntries")).filter(j=>j.status==="Pending Approval").length;
+  const journalPending = journalEntries.filter(j=>j.status==="Pending Approval").length;
   if(journalPending>0) items.push({label:`${journalPending} journal/expense entr${journalPending===1?'y':'ies'} awaiting approval`, tab:"accounting"});
 
   return items;
@@ -1050,10 +1048,15 @@ const LOAN_PRODUCTS = ["Business Loan","MSME Loan","SHG Loan","Joint Liability G
    --------------------------------------------------------------------- */
 const RULE_FIELDS = [
   {key:"creditScore", label:"Credit Score", type:"number"},
-  {key:"monthlyIncome", label:"Monthly Income (₹)", type:"number"},
+  {key:"monthlyIncome", label:"Monthly Income — Gross (₹)", type:"number"},
+  {key:"takeHomePay", label:"Take-Home Pay — Net Salary (₹/month)", type:"number"},
   {key:"riskCategoryScore", label:"Risk Category (Low=1, Medium=2, High=3)", type:"number"},
   {key:"amountRequested", label:"Amount Requested (₹)", type:"number"},
   {key:"foirPct", label:"FOIR % (assessed EMI ÷ income)", type:"number"},
+  {key:"currentRatio", label:"Current Ratio (business loans)", type:"number"},
+  {key:"debtEquityRatio", label:"Debt-Equity Ratio (business loans)", type:"number"},
+  {key:"dscr", label:"DSCR (business loans)", type:"number"},
+  {key:"netWorth", label:"Net Worth (₹, business loans)", type:"number"},
 ];
 const RULE_OPERATORS = [">=","<=","==","!=",">","<"];
 
@@ -1202,6 +1205,29 @@ function calculateEmiWithMoratorium(principal, annualRatePct, tenureMonths, mora
   return { principal, effectivePrincipal, capitalizedInterest, moratoriumMonths, repaymentMonths, emi, totalPayment, totalInterest };
 }
 
+const DEPRECIATION_METHODS = ["WDV (Written Down Value)","SLM (Straight Line)"];
+
+/** Book value as of today, given purchase cost/date and an annual rate.
+ *  WDV: value shrinks by rate% of the REMAINING balance each year (never
+ *  quite hits zero). SLM: a flat rate% of original cost each year (can
+ *  hit zero once fully depreciated). Both are illustrative — actual
+ *  depreciation schedules should follow Schedule II of the Companies Act
+ *  or your auditor's policy, not a simple annualized approximation. */
+function computeAssetBookValue(asset){
+  const purchaseDate = new Date(asset.purchaseDate);
+  const today = new Date(todayStr());
+  const elapsedYears = Math.max(0, (today - purchaseDate) / (1000*60*60*24*365.25));
+  const rate = (asset.depreciationRatePct||0)/100;
+  let bookValue;
+  if(asset.depreciationMethod && asset.depreciationMethod.startsWith("SLM")){
+    const annualDep = asset.cost * rate;
+    bookValue = Math.max(0, asset.cost - annualDep*elapsedYears);
+  } else {
+    bookValue = asset.cost * Math.pow(1-rate, elapsedYears);
+  }
+  return { elapsedYears, bookValue, accumulatedDepreciation: asset.cost - bookValue };
+}
+
 /* ---------------------------------------------------------------------
    Applicant-level CMA calculator (FOIR / DSCR / Debt-Equity / Current
    Ratio / Net Worth) — standard banking ratios computed from figures
@@ -1216,7 +1242,10 @@ function computeCmaRatios(cma, monthlyIncome, proposedEmi){
   const currentRatio = cma.currentLiabilities>0 ? cma.currentAssets/cma.currentLiabilities : null;
   const debtEquityRatio = netWorth>0 ? (cma.totalLiabilities||0)/netWorth : null;
   const totalMonthlyObligation = (cma.existingEmi||0) + (proposedEmi||0);
-  const foirPct = monthlyIncome>0 ? (totalMonthlyObligation/monthlyIncome*100) : null;
+  // FOIR against take-home pay is more accurate for salaried applicants
+  // than against gross income — use it when provided.
+  const foirBase = (cma.takeHomePay && cma.takeHomePay>0) ? cma.takeHomePay : monthlyIncome;
+  const foirPct = foirBase>0 ? (totalMonthlyObligation/foirBase*100) : null;
   const annualDebtService = totalMonthlyObligation*12;
   const dscr = annualDebtService>0 ? ((cma.netOperatingIncome||0)/annualDebtService) : null;
 
@@ -1227,6 +1256,7 @@ function computeCmaRatios(cma, monthlyIncome, proposedEmi){
   };
   return {
     netWorth, currentRatio, debtEquityRatio, foirPct, dscr, proposedEmi, totalMonthlyObligation,
+    takeHomePay: cma.takeHomePay || null,
     flags: {
       currentRatio: flag(currentRatio, 1.33, 1.0, true),
       debtEquityRatio: flag(debtEquityRatio, 2, 4, false),
@@ -1350,6 +1380,7 @@ function defaultProducts(){
 function defaultPolicyConfig(){
   return {
     id: "default",
+    minCibilScore: 650,
     delegation: DELEGATION_ROLES.map((role,i)=>({role, maxAmount:[200000,1000000,2500000,5000000,10000000][i]})),
     journalLimits: DELEGATION_ROLES.map((role,i)=>({role, maxAmount:[5000,25000,50000,100000,500000][i]})),
     exposure: { maxBorrowerExposure: 2500000, maxSectorExposurePct: 25, maxBranchExposurePct: 15 },
@@ -1615,15 +1646,12 @@ function borrowerRegisterPanel(){
    --------------------------------------------------------------------- */
 async function renderStaffShell(){
   const u = session.user;
-  const leads = await db.getAll("leads");
-  const borrowers = await db.getAll("borrowers");
-  const customers = await db.getAll("customers");
-  const products = await db.getAll("products");
-  const appraisals = await db.getAll("appraisals");
-  const sanctions = await db.getAll("sanctions");
-  const loanAccounts = await db.getAll("loanAccounts");
-  const payments = await db.getAll("payments");
-  const staffCount = (await db.getAll("staff")).length;
+  const [leads, borrowers, customers, products, appraisals, sanctions, loanAccounts, payments, staffList] = await Promise.all([
+    db.getAll("leads"), db.getAll("borrowers"), db.getAll("customers"), db.getAll("products"),
+    db.getAll("appraisals"), db.getAll("sanctions"), db.getAll("loanAccounts"), db.getAll("payments"),
+    db.getAll("staff")
+  ]);
+  const staffCount = staffList.length;
   const newLeads = leads.filter(l=>l.status==="New").length;
   const canManagePolicy = u.role==="Super Admin" || u.role==="Credit Manager";
   const canManageFunds = ["Super Admin","Accounts","Operations Manager","Credit Manager"].includes(u.role);
@@ -2214,7 +2242,7 @@ function renderProductForm(product){
       <div class="warn-banner" style="background:#FBE7E8;border-color:var(--danger);color:#7A1F27;">⚠ Enabling this bypasses the human Maker-Checker approval your Credit Policy otherwise requires for this product — every auto-sanction is logged distinctly as machine-decided. Only Super Admin can turn this on.</div>
       <label style="display:flex; align-items:center; gap:8px; margin-bottom:12px;"><input type="checkbox" id="pf-auto-sanction" ${p.autoSanctionEnabled?'checked':''} style="width:auto;"> Enable auto-sanction for this product when every rule below passes</label>
       <p class="small muted">Applies when an appraisal recommends "Approve" for this product. Leave a rule row's field as "— Not used —" to skip it. All configured rules must pass.</p>
-      ${[0,1,2,3,4].map(ruleRow).join("")}
+      ${[0,1,2,3,4,5,6,7].map(ruleRow).join("")}
 
       <h3 class="section-h">DSA Commission</h3>
       <div class="field" style="max-width:260px;"><label>Commission (% of disbursed amount)</label><input id="pf-dsa-commission" type="number" step="0.1" value="${p.dsaCommissionPct||0}"></div>
@@ -2232,11 +2260,18 @@ async function renderPolicyTab(){
   let policy = await db.get("policyConfig","default");
   if(!policy) policy = defaultPolicyConfig();
   if(!policy.journalLimits) policy.journalLimits = defaultPolicyConfig().journalLimits;
+  if(policy.minCibilScore===undefined || policy.minCibilScore===null) policy.minCibilScore = defaultPolicyConfig().minCibilScore;
   return `
     <div class="card">
       <h2>Credit Policy Engine</h2>
       <p class="sub">Delegation of powers, exposure norms, LTV limits, pricing matrix, provisioning rules and early-warning signals — every sanction and disbursement will check against these from Phase 4 onward.</p>
       <div class="warn-banner" style="background:#FBF1DC;border-color:var(--gold);color:#5C4200;">⚠ Defaults shown are illustrative starting points, not RBI/NBFC compliance advice. Confirm every figure against current RBI Scale Based Regulation and your Board-approved credit policy before go-live.</div>
+
+      <h3 class="section-h">Minimum Eligibility</h3>
+      <div class="grid grid-3">
+        <div class="field"><label>Minimum CIBIL / bureau score</label><input id="pol-min-cibil" type="number" value="${policy.minCibilScore}"></div>
+      </div>
+      <p class="sub" style="margin-top:-6px;">Shown as a reference check on Credit Appraisal — the officer sees whether the applicant's declared bureau score clears this bar, but appraisal and sanction still require a human decision. If auto-sanction is enabled for a product (Loan Products tab), add a matching Credit Score rule there for it to actually gate approval automatically.</p>
 
       <h3 class="section-h">Delegation of Powers — Maximum Sanction Amount by Role</h3>
       <table>
@@ -2382,6 +2417,7 @@ async function renderAppraisalForm(customers, leads){
         <div class="field"><label>Current Liabilities (₹)</label><input id="af-cma-cur-liabilities" type="number"></div>
         <div class="field"><label>Net Operating Income (₹/year)</label><input id="af-cma-noi" type="number" placeholder="Profit before interest, annual"></div>
         <div class="field"><label>Existing EMI Obligations (₹/month)</label><input id="af-cma-existing-emi" type="number" placeholder="Other loans, if any"></div>
+        <div class="field"><label>Take-Home Pay (₹/month, salaried applicants)</label><input id="af-cma-take-home" type="number" placeholder="Net salary after deductions"></div>
       </div>
 
       <h3 class="section-h">Risk Rating &amp; Recommendation</h3>
@@ -2438,10 +2474,11 @@ function renderCmaRatiosBlock(r){
       ${row("DSCR", r.dscr===null?"—":r.dscr.toFixed(2), r.flags.dscr, "Comfortable ≥1.5")}
     </div>
     <div class="grid grid-3" style="margin-top:12px;">
-      ${row("FOIR", r.foirPct===null?"—":r.foirPct.toFixed(1)+"%", r.flags.foirPct, "Existing + proposed EMI ÷ income")}
+      ${row("FOIR", r.foirPct===null?"—":r.foirPct.toFixed(1)+"%", r.flags.foirPct, r.takeHomePay ? "vs. take-home pay (more accurate for salaried)" : "vs. gross income")}
       <div class="kpi"><div class="lbl">Proposed EMI (estimated)</div><div class="val" style="font-size:18px;">${fmtINR(Math.round(r.proposedEmi||0))}</div></div>
       <div class="kpi"><div class="lbl">Total Monthly Obligation</div><div class="val" style="font-size:18px;">${fmtINR(Math.round(r.totalMonthlyObligation||0))}</div></div>
     </div>
+    ${r.takeHomePay ? `<p class="small muted" style="margin-top:8px;">Take-Home Pay entered: <b>${fmtINR(r.takeHomePay)}</b>/month</p>` : ""}
   `;
 }
 
@@ -2449,6 +2486,9 @@ async function renderAppraisalDetail(a, customers){
   if(!a) return `<div class="card">Appraisal not found.</div>`;
   const cust = customers.find(c=>c.id===a.customerId);
   const cfg = await getApiConfig();
+  const policy = (await db.get("policyConfig","default")) || defaultPolicyConfig();
+  const minCibil = policy.minCibilScore || 0;
+  const custScore = cust ? cust.creditScore : null;
   const verifyRow = (key, label, resultField)=>{
     const result = a[resultField];
     const enabled = cfg[key+"Enabled"];
@@ -2470,6 +2510,10 @@ async function renderAppraisalDetail(a, customers){
         <div><div class="field"><label>Date</label><div>${esc(a.appraisalDate)}</div></div></div>
         <div><div class="field"><label>Risk Rating</label><div>${a.riskRating?`<span class="badge badge-risk-${a.riskRating}">${a.riskRating}</span>`:"—"}</div></div></div>
       </div>
+      ${custScore!==null ? `
+      <div class="warn-banner" style="background:${custScore>=minCibil?'#E4F3E8':'#FBE7E8'};border-color:${custScore>=minCibil?'var(--ok)':'var(--danger)'};color:${custScore>=minCibil?'#1D4E33':'#7A1F27'};">
+        ${custScore>=minCibil?'✓':'⚠'} Credit score ${custScore} — Credit Policy minimum is ${minCibil}. ${custScore>=minCibil?'Meets the minimum.':'Below the policy minimum — a deviation, if approved, should be explicitly noted.'}
+      </div>` : ""}
       <h3 class="section-h">Field Verification</h3>
       <p><b>Business:</b> ${esc(a.businessVerification)||"—"}</p>
       <p><b>Residence:</b> ${esc(a.residenceVerification)||"—"}</p>
@@ -2817,6 +2861,9 @@ async function renderFundsTab(){
   const disbursements = await db.getAll("disbursements");
   const projection = await computeFundsProjection(15);
   const maxProjected = Math.max(...projection.map(p=>Math.abs(p.projectedBalance)), 1);
+  const borrowings = await db.getAll("bankBorrowings");
+  const categoryConfig = await getCategoryConfig();
+  session.categoryConfigCache = categoryConfig;
   return `
     <div class="card">
       <h2>Fund Position</h2>
@@ -2884,6 +2931,33 @@ async function renderFundsTab(){
         </tbody>
       </table>
     </div>
+
+    <div class="card">
+      <div class="flex-between">
+        <div><h2>Bank Loans / Borrowings</h2><p class="sub">Facilities availed FROM banks by the NBFC itself — separate from Fund Sources above. A Term Loan credits an actual fund account (real cash received). A Cash Credit/Overdraft facility is a revolving limit, not cash in hand — drawing on it is tracked here as "Utilized" only, and deliberately does NOT touch your Cash or Bank fund balances, since the money isn't sitting in your account the way a term loan disbursement is.</p></div>
+        <button class="btn btn-gold btn-sm" id="btn-open-new-borrowing">+ Add Facility</button>
+      </div>
+      <div id="new-borrowing-form-box"></div>
+      <table>
+        <thead><tr><th>Bank</th><th>Facility Type</th><th>Sanctioned/Limit</th><th>Rate</th><th>Tenure</th><th>Utilized</th><th>Status</th><th></th></tr></thead>
+        <tbody>
+        ${borrowings.length===0 ? `<tr class="empty-row"><td colspan="8">No bank facilities added yet.</td></tr>` :
+          borrowings.map(b=>`<tr><td>${esc(b.bankName)}</td><td>${esc(b.facilityType)}</td><td>${fmtINR(b.sanctionedAmount)}</td><td>${b.interestRate}% p.a.</td><td>${b.tenureMonths?b.tenureMonths+' mo':'—'}</td>
+          <td>${b.affectsFundBalance ? '<span class="small muted">n/a — full amount is fund balance</span>' : `${fmtINR(b.utilizedAmount||0)} <button class="btn btn-outline btn-sm update-utilization-btn" data-borrowing="${b.id}" style="margin-left:6px;">Update</button>`}</td>
+          <td>${b.status==='Active'?`<span class="badge badge-approved">Active</span>`:`<span class="badge badge-new">Closed</span>`}</td>
+          <td><button class="btn btn-danger btn-sm close-borrowing-btn" data-borrowing="${b.id}" ${b.status!=='Active'?'disabled':''}>Close</button></td></tr>`).join("")}
+        </tbody>
+      </table>
+      <h3 class="section-h">Manage Facility Types</h3>
+      <div class="action-row" style="flex-wrap:wrap;">
+        ${categoryConfig.facilityTypes.map(t=>`<span class="badge badge-new" style="margin-right:4px;">${esc(t)} <button class="delete-facility-type-btn" data-type="${esc(t)}" style="border:none; background:none; color:var(--danger); cursor:pointer; font-weight:700; margin-left:4px;">×</button></span>`).join("")}
+      </div>
+      <div class="action-row" style="margin-top:8px;">
+        <input id="new-facility-type" placeholder="New facility type" style="max-width:240px;">
+        <button class="btn btn-outline btn-sm" id="btn-add-facility-type">+ Add Type</button>
+      </div>
+    </div>
+
     <div class="card">
       <h2>Disbursement Register</h2>
       <table>
@@ -2907,6 +2981,28 @@ function renderNewFundForm(){
         <div class="field"><label>Opening balance (₹)</label><input id="ff-balance" type="number"></div>
       </div>
       <button class="btn btn-gold btn-sm" id="btn-save-fund">Save Fund Source</button>
+    </div>
+  `;
+}
+
+function renderNewBorrowingForm(){
+  const facilityTypes = (session.categoryConfigCache || defaultCategoryConfig()).facilityTypes;
+  return `
+    <div class="card" style="background:var(--paper); border-style:dashed;">
+      <div class="grid grid-3">
+        <div class="field"><label>Bank name</label><input id="bb-bank" placeholder="e.g. State Bank of India"></div>
+        <div class="field"><label>Facility type</label><select id="bb-type">${facilityTypes.map(t=>`<option>${t}</option>`).join("")}</select></div>
+        <div class="field"><label>Sanctioned amount / limit (₹)</label><input id="bb-amount" type="number"></div>
+        <div class="field"><label>Interest rate (% p.a.)</label><input id="bb-rate" type="number" step="0.1"></div>
+        <div class="field"><label>Tenure (months, if a term loan)</label><input id="bb-tenure" type="number"></div>
+        <div class="field"><label>Sanction date</label><input id="bb-date" type="date" value="${todayStr()}"></div>
+      </div>
+      <label style="display:flex; align-items:center; gap:6px; margin:8px 0;">
+        <input type="checkbox" id="bb-affects-balance" style="width:auto;" checked>
+        This facility credits real cash to a fund account (term loans) — leave unchecked for CC/OD, which is a revolving limit, not cash received
+      </label>
+      <div class="field"><label>Notes</label><input id="bb-notes" placeholder="Optional"></div>
+      <button class="btn btn-gold btn-sm" id="btn-save-borrowing">Save Facility</button>
     </div>
   `;
 }
@@ -3335,6 +3431,49 @@ async function renderInterestAccrualCard(){
   `;
 }
 
+/* ---------------------------------------------------------------------
+   Fixed Assets Register — cost, method, rate, live-computed book value.
+   Illustrative approximation, not a Schedule II compliant schedule.
+   --------------------------------------------------------------------- */
+async function renderFixedAssetsCard(){
+  const assets = await db.getAll("fixedAssets");
+  const totalCost = assets.reduce((s,a)=>s+a.cost,0);
+  let totalBookValue = 0;
+  const rows = assets.map(a=>{
+    const {bookValue, accumulatedDepreciation} = computeAssetBookValue(a);
+    totalBookValue += a.status==="Active" ? bookValue : 0;
+    return {...a, bookValue, accumulatedDepreciation};
+  });
+  return `
+    <div class="card">
+      <h2 style="font-size:16px;">Fixed Assets Register</h2>
+      <div class="warn-banner" style="background:#FBF1DC;border-color:var(--gold);color:#5C4200;">⚠ Book values here are a simplified annualized approximation (WDV or SLM against the rate you set) — not a Schedule II compliant depreciation schedule. Confirm actual rates and treatment with your auditor before relying on this for statutory accounts.</div>
+      <div class="grid grid-2">
+        <div class="kpi"><div class="lbl">Total Original Cost</div><div class="val" style="font-size:18px;">${fmtINR(totalCost)}</div></div>
+        <div class="kpi"><div class="lbl">Total Current Book Value</div><div class="val" style="font-size:18px;">${fmtINR(Math.round(totalBookValue))}</div></div>
+      </div>
+      <table>
+        <thead><tr><th>Asset</th><th>Purchased</th><th>Cost</th><th>Method</th><th>Rate</th><th>Book Value Today</th><th>Status</th><th></th></tr></thead>
+        <tbody>
+        ${rows.length===0 ? `<tr class="empty-row"><td colspan="8">No fixed assets added yet.</td></tr>` :
+          rows.map(a=>`<tr><td>${esc(a.assetName)}</td><td>${esc(a.purchaseDate)}</td><td>${fmtINR(a.cost)}</td><td>${esc(a.depreciationMethod)}</td><td>${a.depreciationRatePct}%</td><td><b>${fmtINR(Math.round(a.bookValue))}</b></td>
+          <td>${a.status==='Active'?`<span class="badge badge-approved">Active</span>`:`<span class="badge badge-new">Disposed</span>`}</td>
+          <td>${a.status==='Active'?`<button class="btn btn-danger btn-sm dispose-asset-btn" data-asset="${a.id}">Dispose</button>`:''}</td></tr>`).join("")}
+        </tbody>
+      </table>
+      <h3 class="section-h">Add Asset</h3>
+      <div class="grid grid-3">
+        <div class="field"><label>Asset name</label><input id="fa-name" placeholder="e.g. Office furniture, Laptop, Vehicle"></div>
+        <div class="field"><label>Purchase date</label><input id="fa-date" type="date" value="${todayStr()}"></div>
+        <div class="field"><label>Cost (₹)</label><input id="fa-cost" type="number"></div>
+        <div class="field"><label>Depreciation method</label><select id="fa-method">${DEPRECIATION_METHODS.map(m=>`<option>${m}</option>`).join("")}</select></div>
+        <div class="field"><label>Depreciation rate (% per year)</label><input id="fa-rate" type="number" step="0.1" placeholder="e.g. 15"></div>
+      </div>
+      <button class="btn btn-gold btn-sm" id="btn-save-asset">Add Asset</button>
+    </div>
+  `;
+}
+
 async function renderAccountingTab(){
   const acct = await computeAccountingSummary();
   const cashBank = [
@@ -3477,6 +3616,8 @@ async function renderAccountingTab(){
     </div>
 
     ${await renderInterestAccrualCard()}
+
+    ${await renderFixedAssetsCard()}
 
     <div class="card">
       <h2 style="font-size:16px;">Trial Balance</h2>
@@ -3663,11 +3804,14 @@ async function renderRbiReturnsSection(){
 const JOURNAL_EXPENSE_CATEGORIES = ["Salaries","DSA Commission","Rent","Electricity","Office Supplies","Professional Fees","Travel","Insurance Premium","Interest on Borrowings","Other Expense"];
 const JOURNAL_INCOME_CATEGORIES = ["Other Income","Investment Income","Miscellaneous Income"];
 
+const DEFAULT_FACILITY_TYPES = ["Term Loan","Cash Credit (CC)","Overdraft (OD)","Working Capital Demand Loan","Other"];
 function defaultCategoryConfig(){
-  return { id:"default", expenseCategories:[...JOURNAL_EXPENSE_CATEGORIES], incomeCategories:[...JOURNAL_INCOME_CATEGORIES], updatedAt:null, updatedBy:null };
+  return { id:"default", expenseCategories:[...JOURNAL_EXPENSE_CATEGORIES], incomeCategories:[...JOURNAL_INCOME_CATEGORIES], facilityTypes:[...DEFAULT_FACILITY_TYPES], updatedAt:null, updatedBy:null };
 }
 async function getCategoryConfig(){
-  return (await db.get("categoryConfig","default")) || defaultCategoryConfig();
+  const cfg = (await db.get("categoryConfig","default")) || defaultCategoryConfig();
+  if(!cfg.facilityTypes) cfg.facilityTypes = [...DEFAULT_FACILITY_TYPES];
+  return cfg;
 }
 const COMPLIANCE_STATUSES = ["Not Started","In Progress","Done","Not Applicable"];
 const DEFAULT_COMPLIANCE_ITEMS = [
@@ -5107,6 +5251,21 @@ function bindEvents(){
   const openNewFund = document.getElementById("btn-open-new-fund");
   if(openNewFund) openNewFund.onclick = ()=>{ document.getElementById("new-fund-form-box").innerHTML = renderNewFundForm(); document.getElementById("btn-save-fund").onclick = handleSaveFund; };
   document.querySelectorAll(".adjust-fund-btn").forEach(btn=> btn.onclick = ()=> handleAdjustFund(btn.dataset.fund));
+  const openNewBorrowing = document.getElementById("btn-open-new-borrowing");
+  if(openNewBorrowing) openNewBorrowing.onclick = ()=>{
+    document.getElementById("new-borrowing-form-box").innerHTML = renderNewBorrowingForm();
+    document.getElementById("btn-save-borrowing").onclick = handleSaveBorrowing;
+    const bbType = document.getElementById("bb-type");
+    const bbAffects = document.getElementById("bb-affects-balance");
+    if(bbType && bbAffects){
+      bbType.onchange = ()=>{ bbAffects.checked = !/CC|OD|Cash Credit|Overdraft/i.test(bbType.value); };
+    }
+  };
+  document.querySelectorAll(".update-utilization-btn").forEach(btn=> btn.onclick = ()=> handleUpdateUtilization(btn.dataset.borrowing));
+  document.querySelectorAll(".close-borrowing-btn").forEach(btn=> btn.onclick = ()=> handleCloseBorrowing(btn.dataset.borrowing));
+  const addFacilityTypeBtn = document.getElementById("btn-add-facility-type");
+  if(addFacilityTypeBtn) addFacilityTypeBtn.onclick = handleAddFacilityType;
+  document.querySelectorAll(".delete-facility-type-btn").forEach(btn=> btn.onclick = ()=> handleDeleteFacilityType(btn.dataset.type));
   const addInitialCapitalBtn = document.getElementById("btn-add-initial-capital");
   if(addInitialCapitalBtn) addInitialCapitalBtn.onclick = handleAddInitialCapital;
 
@@ -5177,6 +5336,9 @@ function bindEvents(){
   if(accrualMonthInput) accrualMonthInput.onchange = ()=>{ session.accrualMonth = accrualMonthInput.value; render(); };
   const logAccrualBtn = document.getElementById("btn-log-accrual");
   if(logAccrualBtn) logAccrualBtn.onclick = handleLogInterestAccrual;
+  const saveAssetBtn = document.getElementById("btn-save-asset");
+  if(saveAssetBtn) saveAssetBtn.onclick = handleSaveFixedAsset;
+  document.querySelectorAll(".dispose-asset-btn").forEach(btn=> btn.onclick = ()=> handleDisposeAsset(btn.dataset.asset));
 
   // Bank Reconciliation
   const reconAccountSelect = document.getElementById("recon-account");
@@ -5465,6 +5627,7 @@ async function handleSavePolicy(){
     const group = inp.dataset.group, idx = Number(inp.dataset.index), field = inp.dataset.field;
     if(policy[group] && policy[group][idx]) policy[group][idx][field] = Number(inp.value)||0;
   });
+  policy.minCibilScore = Number(document.getElementById("pol-min-cibil").value)||0;
   policy.exposure.maxBorrowerExposure = Number(document.getElementById("pol-exp-borrower").value)||0;
   policy.exposure.maxSectorExposurePct = Number(document.getElementById("pol-exp-sector").value)||0;
   policy.exposure.maxBranchExposurePct = Number(document.getElementById("pol-exp-branch").value)||0;
@@ -5549,6 +5712,7 @@ async function handleSaveAppraisal(){
     currentLiabilities: Number(document.getElementById("af-cma-cur-liabilities").value)||0,
     netOperatingIncome: Number(document.getElementById("af-cma-noi").value)||0,
     existingEmi: Number(document.getElementById("af-cma-existing-emi").value)||0,
+    takeHomePay: Number(document.getElementById("af-cma-take-home").value)||0,
   };
   let proposedEmi = 0;
   if(leadId){
@@ -5617,12 +5781,18 @@ async function attemptAutoSanction(lead, customer, appraisal){
   if(!product || !product.active || !product.autoSanctionEnabled) return { sanctioned:false };
 
   const estEmi = estimateMonthlyEmi(lead.amountRequested, product.interestRate, product.tenureMax);
+  const cmaR = appraisal.cmaRatios || {};
   const context = {
     creditScore: customer.creditScore,
     monthlyIncome: customer.income.monthly,
+    takeHomePay: appraisal.cma ? (appraisal.cma.takeHomePay || null) : null,
     riskCategoryScore: RISK_CATEGORY_SCORE[customer.riskCategory] || null,
     amountRequested: lead.amountRequested,
-    foirPct: customer.income.monthly ? (estEmi/customer.income.monthly*100) : null,
+    foirPct: cmaR.foirPct!==undefined && cmaR.foirPct!==null ? cmaR.foirPct : (customer.income.monthly ? (estEmi/customer.income.monthly*100) : null),
+    currentRatio: cmaR.currentRatio!==undefined ? cmaR.currentRatio : null,
+    debtEquityRatio: cmaR.debtEquityRatio!==undefined ? cmaR.debtEquityRatio : null,
+    dscr: cmaR.dscr!==undefined ? cmaR.dscr : null,
+    netWorth: cmaR.netWorth!==undefined ? cmaR.netWorth : null,
   };
   const evalResult = evaluateProductRules(product, context);
   if(!evalResult.passed){
@@ -5905,6 +6075,88 @@ async function handleSaveFund(){
   await db.put("fundAccounts", rec);
   await logAudit(session.user.name, session.user.role, "Fund Source Added", `${name} (${type}) — Opening balance ${fmtINR(balance)}`);
   toast("Fund source added.");
+  render();
+}
+
+async function handleSaveBorrowing(){
+  const u = session.user;
+  const bankName = document.getElementById("bb-bank").value.trim();
+  const facilityType = document.getElementById("bb-type").value;
+  const sanctionedAmount = Number(document.getElementById("bb-amount").value)||0;
+  if(!bankName || sanctionedAmount<=0){ toast("Bank name and sanctioned amount/limit are required."); return; }
+  const affectsFundBalance = document.getElementById("bb-affects-balance").checked;
+  const rec = {
+    id: uid("bbr"), bankName, facilityType, sanctionedAmount,
+    interestRate: Number(document.getElementById("bb-rate").value)||0,
+    tenureMonths: Number(document.getElementById("bb-tenure").value)||null,
+    sanctionDate: document.getElementById("bb-date").value, notes: document.getElementById("bb-notes").value.trim(),
+    affectsFundBalance, utilizedAmount: 0, fundAccountId: null, status:"Active",
+    createdAt: nowISO(), createdBy: u.name
+  };
+  if(affectsFundBalance){
+    const fundAccount = { id: uid("fnd"), name: `${bankName} — ${facilityType}`, type:"Borrowing", balance: sanctionedAmount, createdAt: nowISO(), createdBy: u.name };
+    await db.put("fundAccounts", fundAccount);
+    rec.fundAccountId = fundAccount.id;
+  }
+  await db.put("bankBorrowings", rec);
+  await logAudit(u.name, u.role, "Bank Facility Added", `${bankName} — ${facilityType} — ${fmtINR(sanctionedAmount)}${affectsFundBalance ? ' — credited to fund account' : ' — limit only, not added to Cash/Bank'}`);
+  toast(affectsFundBalance ? "Facility added and credited to a new fund account." : "Facility added as a limit — not added to Cash or Bank, as expected for CC/OD.");
+  render();
+}
+
+async function handleUpdateUtilization(borrowingId){
+  const u = session.user;
+  const b = await db.get("bankBorrowings", borrowingId);
+  if(!b) return;
+  const input = window.prompt(`Utilized amount against "${b.bankName} — ${b.facilityType}" (limit ${fmtINR(b.sanctionedAmount)}), currently ${fmtINR(b.utilizedAmount||0)}:`, b.utilizedAmount||0);
+  if(input===null) return;
+  const newUtilized = Number(input);
+  if(isNaN(newUtilized) || newUtilized<0){ toast("Enter a valid amount."); return; }
+  if(newUtilized > b.sanctionedAmount){ toast("Utilized amount can't exceed the sanctioned limit."); return; }
+  const old = b.utilizedAmount||0;
+  b.utilizedAmount = newUtilized;
+  await db.put("bankBorrowings", b);
+  await logAudit(u.name, u.role, "Bank Facility Utilization Updated", `${b.bankName} — ${b.facilityType}: ${fmtINR(old)} → ${fmtINR(newUtilized)} (does not affect Cash/Bank balances)`);
+  toast("Utilization updated.");
+  render();
+}
+
+async function handleCloseBorrowing(borrowingId){
+  const u = session.user;
+  const b = await db.get("bankBorrowings", borrowingId);
+  if(!b) return;
+  if(!window.confirm(`Mark "${b.bankName} — ${b.facilityType}" as closed?`)) return;
+  b.status = "Closed";
+  await db.put("bankBorrowings", b);
+  await logAudit(u.name, u.role, "Bank Facility Closed", `${b.bankName} — ${b.facilityType}`);
+  toast("Facility closed.");
+  render();
+}
+
+async function handleAddFacilityType(){
+  const u = session.user;
+  const input = document.getElementById("new-facility-type");
+  const name = input.value.trim();
+  if(!name){ toast("Enter a facility type name."); return; }
+  const cfg = await getCategoryConfig();
+  if(cfg.facilityTypes.some(t=>t.toLowerCase()===name.toLowerCase())){ toast("That type already exists."); return; }
+  cfg.facilityTypes.push(name);
+  cfg.updatedAt = nowISO(); cfg.updatedBy = u.name;
+  await db.put("categoryConfig", cfg);
+  await logAudit(u.name, u.role, "Facility Type Added", name);
+  toast("Facility type added.");
+  render();
+}
+
+async function handleDeleteFacilityType(type){
+  const u = session.user;
+  const cfg = await getCategoryConfig();
+  if(cfg.facilityTypes.length<=1){ toast("At least one facility type is required."); return; }
+  cfg.facilityTypes = cfg.facilityTypes.filter(t=>t!==type);
+  cfg.updatedAt = nowISO(); cfg.updatedBy = u.name;
+  await db.put("categoryConfig", cfg);
+  await logAudit(u.name, u.role, "Facility Type Removed", type);
+  toast("Facility type removed.");
   render();
 }
 
@@ -6205,6 +6457,35 @@ async function handleLogInterestAccrual(){
   const { accrued, installmentCount } = await computeMonthlyInterestAccrual(monthLabel);
   await logAudit(u.name, u.role, "Month-End Interest Accrual Logged", `${monthLabel} — ${fmtINR(Math.round(accrued))} across ${installmentCount} installment(s) — memo only, no fund balance affected`);
   toast(`Logged: ${fmtINR(Math.round(accrued))} accrued interest for ${monthLabel}.`);
+  render();
+}
+
+async function handleSaveFixedAsset(){
+  const u = session.user;
+  const assetName = document.getElementById("fa-name").value.trim();
+  const cost = Number(document.getElementById("fa-cost").value);
+  if(!assetName || !cost || cost<=0){ toast("Asset name and cost are required."); return; }
+  await db.put("fixedAssets", {
+    id: uid("fas"), assetName, purchaseDate: document.getElementById("fa-date").value, cost,
+    depreciationMethod: document.getElementById("fa-method").value,
+    depreciationRatePct: Number(document.getElementById("fa-rate").value)||0,
+    status:"Active", createdAt: nowISO(), createdBy: u.name
+  });
+  await logAudit(u.name, u.role, "Fixed Asset Added", `${assetName} — ${fmtINR(cost)}`);
+  toast("Asset added.");
+  render();
+}
+
+async function handleDisposeAsset(assetId){
+  const u = session.user;
+  const asset = await db.get("fixedAssets", assetId);
+  if(!asset) return;
+  if(!window.confirm(`Mark "${asset.assetName}" as disposed?`)) return;
+  asset.status = "Disposed";
+  asset.disposedAt = nowISO();
+  await db.put("fixedAssets", asset);
+  await logAudit(u.name, u.role, "Fixed Asset Disposed", asset.assetName);
+  toast("Asset marked disposed.");
   render();
 }
 
