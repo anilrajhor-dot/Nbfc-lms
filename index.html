@@ -3710,67 +3710,68 @@ function defaultProjectionAssumptions(){
     id:"default",
     loanBookGrowthPct: 20, yieldOnAdvancesPct: 18, costOfFundsPct: 11,
     opexGrowthPct: 15, provisioningPct: 2, otherIncomeGrowthPct: 10,
-    capitalInfusionYear1: 0, capitalInfusionYear2: 0,
+    capitalInfusions: [0,0,0,0,0],
     updatedAt: null, updatedBy: null
   };
 }
 async function getProjectionAssumptions(){
-  return (await db.get("projectionAssumptions","default")) || defaultProjectionAssumptions();
+  const a = (await db.get("projectionAssumptions","default")) || defaultProjectionAssumptions();
+  if(!a.capitalInfusions){
+    // Migrate from the earlier 2-year-only version of this feature.
+    a.capitalInfusions = [a.capitalInfusionYear1||0, a.capitalInfusionYear2||0, 0, 0, 0];
+  }
+  while(a.capitalInfusions.length < 5) a.capitalInfusions.push(0);
+  return a;
 }
 
 async function computeProjections(){
   const sch = await computeScheduleIIIFigures();
   const a = await getProjectionAssumptions();
   const bs0 = sch.balanceSheet, pl0 = sch.profitLoss;
+  const numYears = 5;
 
-  const projectYear = (prevLoans, prevOpex, prevOtherIncome, prevCapital, capitalInfusion)=>{
+  const prevOpexY0 = pl0.financeCosts + pl0.feesCommissionExpense + pl0.employeeBenefits + pl0.depreciation + pl0.otherExpenses;
+  const current = { loans: bs0.grossLoans, interestIncome: pl0.interestIncome, otherIncome: pl0.otherIncome, totalIncome: pl0.totalIncome, opex: prevOpexY0, pbt: pl0.profitBeforeTax, capital: bs0.equityShareCapital, borrowings: bs0.totalBorrowings, otherEquity: bs0.otherEquity, totalAssets: bs0.totalAssets };
+
+  const years = [];
+  let prevLoans = bs0.grossLoans, prevOpex = prevOpexY0, prevOtherIncome = pl0.otherIncome, prevCapital = bs0.equityShareCapital, prevOtherEquity = bs0.otherEquity;
+  const nonLoanAssets = bs0.totalFinancialAssets - bs0.grossLoans + bs0.totalNonFinancialAssets;
+
+  for(let i=0; i<numYears; i++){
+    const infusion = a.capitalInfusions[i] || 0;
     const loans = prevLoans * (1 + a.loanBookGrowthPct/100);
     const interestIncome = loans * (a.yieldOnAdvancesPct/100);
     const otherIncome = prevOtherIncome * (1 + a.otherIncomeGrowthPct/100);
     const totalIncome = interestIncome + otherIncome;
     const provisioning = loans * (a.provisioningPct/100);
     const opex = prevOpex * (1 + a.opexGrowthPct/100);
-    // Finance costs computed on projected borrowings (below), so wire it
-    // in after borrowings are known — placeholder here, filled below.
-    const capital = prevCapital + capitalInfusion; // retained profit added by caller once PBT is known
-    return { loans, interestIncome, otherIncome, totalIncome, provisioning, opex, capital };
-  };
+    const capital = prevCapital + infusion;
+    const borrowings = Math.max(0, loans - (capital + prevOtherEquity));
+    const financeCosts = borrowings * (a.costOfFundsPct/100);
+    const totalExpenses = opex + provisioning + financeCosts;
+    const pbt = totalIncome - totalExpenses;
+    const otherEquity = prevOtherEquity + pbt;
+    const totalAssets = loans + nonLoanAssets;
 
-  const prevOpexY0 = pl0.financeCosts + pl0.feesCommissionExpense + pl0.employeeBenefits + pl0.depreciation + pl0.otherExpenses;
+    years.push({ yearNum: i+1, loans, interestIncome, otherIncome, totalIncome, provisioning, opex, financeCosts, totalExpenses, pbt, capital, otherEquity, borrowings, totalAssets });
+    prevLoans = loans; prevOpex = opex; prevOtherIncome = otherIncome; prevCapital = capital; prevOtherEquity = otherEquity;
+  }
 
-  // Year 1
-  let y1 = projectYear(bs0.grossLoans, prevOpexY0, pl0.otherIncome, bs0.equityShareCapital, a.capitalInfusionYear1);
-  let y1Borrowings = Math.max(0, y1.loans - (y1.capital + bs0.otherEquity)); // funding gap covered by borrowings
-  let y1FinanceCosts = y1Borrowings * (a.costOfFundsPct/100);
-  let y1TotalExpenses = y1.opex + y1.provisioning + y1FinanceCosts;
-  let y1PBT = y1.totalIncome - y1TotalExpenses;
-  let y1RetainedEarnings = bs0.otherEquity + y1PBT;
-
-  // Year 2, chained off Year 1
-  let y2 = projectYear(y1.loans, y1.opex, y1.otherIncome, y1.capital, a.capitalInfusionYear2);
-  let y2Borrowings = Math.max(0, y2.loans - (y2.capital + y1RetainedEarnings));
-  let y2FinanceCosts = y2Borrowings * (a.costOfFundsPct/100);
-  let y2TotalExpenses = y2.opex + y2.provisioning + y2FinanceCosts;
-  let y2PBT = y2.totalIncome - y2TotalExpenses;
-  let y2RetainedEarnings = y1RetainedEarnings + y2PBT;
-
-  return {
-    assumptions: a,
-    current: { loans: bs0.grossLoans, interestIncome: pl0.interestIncome, otherIncome: pl0.otherIncome, totalIncome: pl0.totalIncome, opex: prevOpexY0, pbt: pl0.profitBeforeTax, capital: bs0.equityShareCapital, borrowings: bs0.totalBorrowings, otherEquity: bs0.otherEquity, totalAssets: bs0.totalAssets },
-    year1: { loans: y1.loans, interestIncome: y1.interestIncome, otherIncome: y1.otherIncome, totalIncome: y1.totalIncome, provisioning: y1.provisioning, opex: y1.opex, financeCosts: y1FinanceCosts, totalExpenses: y1TotalExpenses, pbt: y1PBT, capital: y1.capital, otherEquity: y1RetainedEarnings, borrowings: y1Borrowings, totalAssets: y1.loans + (bs0.totalFinancialAssets - bs0.grossLoans) + bs0.totalNonFinancialAssets },
-    year2: { loans: y2.loans, interestIncome: y2.interestIncome, otherIncome: y2.otherIncome, totalIncome: y2.totalIncome, provisioning: y2.provisioning, opex: y2.opex, financeCosts: y2FinanceCosts, totalExpenses: y2TotalExpenses, pbt: y2PBT, capital: y2.capital, otherEquity: y2RetainedEarnings, borrowings: y2Borrowings, totalAssets: y2.loans + (bs0.totalFinancialAssets - bs0.grossLoans) + bs0.totalNonFinancialAssets },
-  };
+  return { assumptions: a, current, years };
 }
 
 async function renderProjectionsTab(){
   const proj = await computeProjections();
   const a = proj.assumptions;
-  const yearLabel1 = "Year 1", yearLabel2 = "Year 2";
-  const row3 = (label, c, y1, y2, bold)=>`<tr><td>${bold?`<b>${label}</b>`:label}</td><td style="text-align:right;">${bold?`<b>${fmtINR(Math.round(c))}</b>`:fmtINR(Math.round(c))}</td><td style="text-align:right;">${bold?`<b>${fmtINR(Math.round(y1))}</b>`:fmtINR(Math.round(y1))}</td><td style="text-align:right;">${bold?`<b>${fmtINR(Math.round(y2))}</b>`:fmtINR(Math.round(y2))}</td></tr>`;
+  const years = proj.years;
+  const rowN = (label, currentVal, getter, bold)=>{
+    const cell = (v)=> bold ? `<b>${fmtINR(Math.round(v))}</b>` : fmtINR(Math.round(v));
+    return `<tr><td>${bold?`<b>${label}</b>`:label}</td><td style="text-align:right;">${cell(currentVal)}</td>${years.map(y=>`<td style="text-align:right;">${cell(getter(y))}</td>`).join("")}</tr>`;
+  };
   return `
     <div class="card">
-      <h2>Financial Projections — Next 2 Years</h2>
-      <p class="sub">Applies your own growth and rate assumptions below to today's actual figures. Only as good as the assumptions — this is a planning tool for management/board discussion, not a forecast guarantee, and should never be presented externally (lenders, investors, RBI) without review and sign-off.</p>
+      <h2>Financial Projections — Next 5 Years</h2>
+      <p class="sub">Applies your own growth and rate assumptions below to today's actual figures, compounding year over year. Only as good as the assumptions — this is a planning tool for management/board discussion, not a forecast guarantee, and should never be presented externally (lenders, investors, RBI) without review and sign-off. Confidence naturally drops the further out you go — Year 5 is a much rougher estimate than Year 1.</p>
       <h3 class="section-h">Assumptions</h3>
       <div class="grid grid-3">
         <div class="field"><label>Loan Book Growth (% p.a.)</label><input id="pj-loan-growth" type="number" step="0.1" value="${a.loanBookGrowthPct}"></div>
@@ -3779,8 +3780,10 @@ async function renderProjectionsTab(){
         <div class="field"><label>Operating Expense Growth (% p.a.)</label><input id="pj-opex-growth" type="number" step="0.1" value="${a.opexGrowthPct}"></div>
         <div class="field"><label>Provisioning (% of Loan Book)</label><input id="pj-provisioning" type="number" step="0.1" value="${a.provisioningPct}"></div>
         <div class="field"><label>Other Income Growth (% p.a.)</label><input id="pj-other-income-growth" type="number" step="0.1" value="${a.otherIncomeGrowthPct}"></div>
-        <div class="field"><label>Planned Capital Infusion — Year 1 (₹)</label><input id="pj-capital-y1" type="number" value="${a.capitalInfusionYear1}"></div>
-        <div class="field"><label>Planned Capital Infusion — Year 2 (₹)</label><input id="pj-capital-y2" type="number" value="${a.capitalInfusionYear2}"></div>
+      </div>
+      <h3 class="section-h">Planned Capital Infusions (₹ per year)</h3>
+      <div class="grid grid-3">
+        ${[0,1,2,3,4].map(i=>`<div class="field"><label>Year ${i+1}</label><input class="pj-capital-input" data-year="${i}" type="number" value="${a.capitalInfusions[i]}"></div>`).join("")}
       </div>
       <button class="btn btn-gold btn-sm" id="btn-save-projection-assumptions">Recalculate</button>
     </div>
@@ -3788,16 +3791,16 @@ async function renderProjectionsTab(){
     <div class="card">
       <h2 style="font-size:16px;">Projected Profit &amp; Loss</h2>
       <table>
-        <thead><tr><th>Line Item</th><th>Current (Actual)</th><th>${yearLabel1}</th><th>${yearLabel2}</th></tr></thead>
+        <thead><tr><th>Line Item</th><th>Current (Actual)</th>${years.map(y=>`<th>Year ${y.yearNum}</th>`).join("")}</tr></thead>
         <tbody>
-          ${row3("Interest Income", proj.current.interestIncome, proj.year1.interestIncome, proj.year2.interestIncome)}
-          ${row3("Other Income", proj.current.otherIncome, proj.year1.otherIncome, proj.year2.otherIncome)}
-          ${row3("Total Income", proj.current.totalIncome, proj.year1.totalIncome, proj.year2.totalIncome, true)}
-          ${row3("Finance Costs", 0, proj.year1.financeCosts, proj.year2.financeCosts)}
-          ${row3("Provisioning", 0, proj.year1.provisioning, proj.year2.provisioning)}
-          ${row3("Operating Expenses", proj.current.opex, proj.year1.opex, proj.year2.opex)}
-          ${row3("Total Expenses", proj.current.opex, proj.year1.totalExpenses, proj.year2.totalExpenses, true)}
-          ${row3("Profit Before Tax", proj.current.pbt, proj.year1.pbt, proj.year2.pbt, true)}
+          ${rowN("Interest Income", proj.current.interestIncome, y=>y.interestIncome)}
+          ${rowN("Other Income", proj.current.otherIncome, y=>y.otherIncome)}
+          ${rowN("Total Income", proj.current.totalIncome, y=>y.totalIncome, true)}
+          ${rowN("Finance Costs", 0, y=>y.financeCosts)}
+          ${rowN("Provisioning", 0, y=>y.provisioning)}
+          ${rowN("Operating Expenses", proj.current.opex, y=>y.opex)}
+          ${rowN("Total Expenses", proj.current.opex, y=>y.totalExpenses, true)}
+          ${rowN("Profit Before Tax", proj.current.pbt, y=>y.pbt, true)}
         </tbody>
       </table>
     </div>
@@ -3805,13 +3808,13 @@ async function renderProjectionsTab(){
     <div class="card">
       <h2 style="font-size:16px;">Projected Balance Sheet (Summary)</h2>
       <table>
-        <thead><tr><th>Line Item</th><th>Current (Actual)</th><th>${yearLabel1}</th><th>${yearLabel2}</th></tr></thead>
+        <thead><tr><th>Line Item</th><th>Current (Actual)</th>${years.map(y=>`<th>Year ${y.yearNum}</th>`).join("")}</tr></thead>
         <tbody>
-          ${row3("Loan Portfolio (Gross)", proj.current.loans, proj.year1.loans, proj.year2.loans)}
-          ${row3("Equity Share Capital", proj.current.capital, proj.year1.capital, proj.year2.capital)}
-          ${row3("Other Equity (Retained Earnings)", proj.current.otherEquity, proj.year1.otherEquity, proj.year2.otherEquity)}
-          ${row3("Borrowings (balancing funding need)", proj.current.borrowings, proj.year1.borrowings, proj.year2.borrowings)}
-          ${row3("Total Assets", proj.current.totalAssets, proj.year1.totalAssets, proj.year2.totalAssets, true)}
+          ${rowN("Loan Portfolio (Gross)", proj.current.loans, y=>y.loans)}
+          ${rowN("Equity Share Capital", proj.current.capital, y=>y.capital)}
+          ${rowN("Other Equity (Retained Earnings)", proj.current.otherEquity, y=>y.otherEquity)}
+          ${rowN("Borrowings (balancing funding need)", proj.current.borrowings, y=>y.borrowings)}
+          ${rowN("Total Assets", proj.current.totalAssets, y=>y.totalAssets, true)}
         </tbody>
       </table>
       <p class="small muted" style="margin-top:10px;">Borrowings here is a balancing figure — the funding needed (loan book growth minus capital and retained earnings) to keep the balance sheet whole. Non-loan assets (cash, investments, fixed assets) are held flat at current levels since projecting those needs separate assumptions this tool doesn't ask for yet.</p>
@@ -7671,8 +7674,11 @@ async function handleSaveProjectionAssumptions(){
   a.opexGrowthPct = Number(document.getElementById("pj-opex-growth").value)||0;
   a.provisioningPct = Number(document.getElementById("pj-provisioning").value)||0;
   a.otherIncomeGrowthPct = Number(document.getElementById("pj-other-income-growth").value)||0;
-  a.capitalInfusionYear1 = Number(document.getElementById("pj-capital-y1").value)||0;
-  a.capitalInfusionYear2 = Number(document.getElementById("pj-capital-y2").value)||0;
+  a.capitalInfusions = [0,0,0,0,0];
+  document.querySelectorAll(".pj-capital-input").forEach(inp=>{
+    a.capitalInfusions[Number(inp.dataset.year)] = Number(inp.value)||0;
+  });
+  delete a.capitalInfusionYear1; delete a.capitalInfusionYear2; // clear the old 2-year fields now that we've migrated
   a.updatedAt = nowISO();
   a.updatedBy = u.name;
   await db.put("projectionAssumptions", a);
