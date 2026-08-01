@@ -2331,7 +2331,7 @@ function renderProductsTab(products){
         <tbody>
         ${sorted.map(p=>`
           <tr>
-            <td>${esc(p.name)}${nameCounts[p.name]>1?` <span class="badge badge-rejected">Duplicate</span>`:''}</td><td>${p.interestRate}% p.a.</td><td>${p.tenureMin}–${p.tenureMax} mo</td>
+            <td><a href="javascript:void(0)" class="edit-product-btn" data-product="${p.id}" style="color:var(--navy-900); font-weight:600; text-decoration:underline; cursor:pointer;">${esc(p.name)}</a>${nameCounts[p.name]>1?` <span class="badge badge-rejected">Duplicate</span>`:''}</td><td>${p.interestRate}% p.a.</td><td>${p.tenureMin}–${p.tenureMax} mo</td>
             <td>${fmtINR(p.maxLoanAmount)}</td><td>${esc(p.securityRequired)}</td>
             <td>${p.active ? `<span class="badge badge-approved">Active</span>` : `<span class="badge badge-new">Draft</span>`}</td>
             <td>
@@ -3327,6 +3327,7 @@ async function ensureRemindersUpToDate(loanAccounts, customers){
         await db.put("reminders", {
           id: uid("rem"), key, loanAccountId: acc.id, customerId: acc.customerId,
           customerName: cust ? cust.personal.name : "—", customerMobile: cust ? cust.personal.mobile : "",
+          customerEmail: cust ? cust.personal.email : "",
           installmentIndex: inst.index, dueDate: inst.dueDate, ruleLabel: rule.label, channels: rule.channels,
           triggerDate: triggerStr, status:"Pending", sentAt:null, sentBy:null, custom:false, createdAt: nowISO()
         });
@@ -3338,6 +3339,10 @@ async function ensureRemindersUpToDate(loanAccounts, customers){
 
 async function renderRemindersTab(loanAccounts, customers){
   await ensureRemindersUpToDate(loanAccounts, customers);
+  if(!session.remindersAutoSentThisSession){
+    session.remindersAutoSentThisSession = true;
+    await handleSendAllDueReminders(true);
+  }
   const showCustomForm = session.showCustomReminderForm;
   const reminders = await db.getAll("reminders");
   const pending = reminders.filter(r=>r.status==="Pending").sort((a,b)=>new Date(a.triggerDate)-new Date(b.triggerDate));
@@ -3359,9 +3364,12 @@ async function renderRemindersTab(loanAccounts, customers){
     </div>` : ""}
     <div class="card">
       <div class="flex-between">
-        <div><h2>Reminders Due</h2><p class="sub">Auto-generated from the EMI schedule (7/3/1 days before, due date, 1/7/15/30 days overdue). "Mark Sent" attempts a real send via WhatsApp/Email if configured under Integrations; otherwise it just logs the reminder. SMS/Push/Voice have no provider hook yet.</p></div>
-        ${session.user.role==="Super Admin" ? `<button class="btn btn-outline btn-sm" id="btn-open-messaging-config" style="margin-right:8px;">Configure Providers</button>` : ""}
-        <button class="btn btn-gold btn-sm" id="btn-open-custom-reminder">+ Custom Reminder</button>
+        <div><h2>Reminders Due</h2><p class="sub">Auto-generated from the EMI schedule (7/3/1 days before, due date, 1/7/15/30 days overdue). WhatsApp/Email reminders are sent automatically the moment you open this tab if a provider is configured under Integrations — no need to click each one. SMS/Push/Voice have no provider hook yet and still need "Mark Sent" logged manually.</p></div>
+        <div class="action-row">
+          ${session.user.role==="Super Admin" ? `<button class="btn btn-outline btn-sm" id="btn-open-messaging-config">Configure Providers</button>` : ""}
+          <button class="btn btn-outline btn-sm" id="btn-send-all-reminders">Send All Due Now</button>
+          <button class="btn btn-gold btn-sm" id="btn-open-custom-reminder">+ Custom Reminder</button>
+        </div>
       </div>
       <table>
         <thead><tr><th>Customer</th><th>Mobile</th><th>Trigger</th><th>Rule</th><th>Channels</th><th></th></tr></thead>
@@ -4171,7 +4179,7 @@ async function renderRbiReturnsSection(){
   return `
     <div class="card">
       <h2 style="font-size:16px;">RBI Returns — Reference (Non-Deposit-Taking NBFC)</h2>
-      <div class="warn-banner" style="background:#FBE7E8;border-color:var(--danger);color:#7A1F27;">⚠ Illustrative starting point, not a definitive filing calendar. The exact forms, thresholds, and due dates depend on your NBFC's layer under Scale Based Regulation, asset size, and the current RBI Master Direction — and RBI has been shifting filings from the COSMOS portal to the XBRL portal. Verify every row with your Company Secretary or compliance officer before relying on it.</div>
+      <div class="warn-banner" style="background:#FBE7E8;border-color:var(--danger);color:#7A1F27;">⚠ Illustrative starting point, not a definitive filing calendar. The exact forms, thresholds, and due dates depend on your NBFC's layer under Scale Based Regulation, asset size, and the current RBI Master Direction — and RBI has been shifting filings from the COSMOS portal to the XBRL portal. Verify every row with your Company Secretary or compliance officer before relying on it. <b>Actual submission to RBI happens on RBI's own COSMOS/XBRL portal — there is no email-based filing path to RBI itself.</b> The "Prepare & Email" feature below sends a data summary to whoever you designate (your CS, auditor, compliance consultant, or internal team) to help them prepare the actual portal filing — it does not submit anything to RBI directly.</div>
       <table>
         <thead><tr><th>Return</th><th>Purpose</th><th>Periodicity</th><th>Typical Due Date Rule</th></tr></thead>
         <tbody>
@@ -4182,16 +4190,17 @@ async function renderRbiReturnsSection(){
 
     <div class="card">
       <div class="flex-between">
-        <div><h2 style="font-size:16px;">RBI Returns Tracker</h2><p class="sub" style="margin-bottom:0;">Log each filing period against a return above, set its due date, and record the submission date once filed. Anything overdue shows here, in Notifications, and as a banner on the Dashboard for Super Admin/Managing Director.</p></div>
+        <div><h2 style="font-size:16px;">RBI Returns Tracker</h2><p class="sub" style="margin-bottom:0;">Log each filing period, set its due date and who should receive the prepared data summary. Anything overdue shows here, in Notifications, and as a banner on the Dashboard for Super Admin/Managing Director.</p></div>
         ${overdueCount>0 ? `<span class="badge badge-rejected">${overdueCount} Overdue</span>` : `<span class="badge badge-approved">All Current</span>`}
       </div>
       <div class="grid grid-4">
         <div class="field"><label>Return</label><select id="rf-code">${RBI_RETURN_REFERENCE.map(r=>`<option value="${esc(r.code)}">${esc(r.code)}</option>`).join("")}<option value="Other">Other</option></select></div>
         <div class="field"><label>Period (e.g. Q1 FY 2026-27)</label><input id="rf-period" placeholder="e.g. FY 2025-26"></div>
         <div class="field"><label>Due date</label><input id="rf-duedate" type="date"></div>
-        <div class="field"><label>&nbsp;</label><button class="btn btn-gold btn-block" id="btn-add-rbi-filing">+ Track This Filing</button></div>
+        <div class="field"><label>Recipient email (optional)</label><input id="rf-email" type="email" placeholder="cs@example.com"></div>
       </div>
-      <table>
+      <button class="btn btn-gold btn-block" id="btn-add-rbi-filing" style="margin-top:10px;">+ Track This Filing</button>
+      <table style="margin-top:10px;">
         <thead><tr><th>Return</th><th>Period</th><th>Due Date</th><th>Status</th><th>Submitted</th><th></th></tr></thead>
         <tbody>
         ${withStatus.length===0 ? `<tr class="empty-row"><td colspan="6">No filings tracked yet.</td></tr>` :
@@ -4200,12 +4209,65 @@ async function renderRbiReturnsSection(){
             <td class="mono">${esc(f.code)}</td><td>${esc(f.period)}</td><td>${esc(f.dueDate)}</td>
             <td>${f.computedStatus==="Submitted"?`<span class="badge badge-approved">Submitted</span>`:f.computedStatus==="Overdue"?`<span class="badge badge-rejected">Overdue</span>`:`<span class="badge badge-new">Upcoming</span>`}</td>
             <td>${f.submittedDate||"—"}</td>
-            <td>${!f.submittedDate ? `<button class="btn btn-outline btn-sm mark-rbi-submitted-btn" data-filing="${f.id}">Mark Submitted</button>` : ""}</td>
+            <td><div class="action-row">
+              <button class="btn btn-outline btn-sm prepare-rbi-summary-btn" data-filing="${f.id}" ${f.recipientEmail?'':'disabled'} title="${f.recipientEmail?'':'Add a recipient email to enable'}">Prepare &amp; Email</button>
+              ${!f.submittedDate ? `<button class="btn btn-outline btn-sm mark-rbi-submitted-btn" data-filing="${f.id}">Mark Submitted</button>` : ""}
+            </div></td>
           </tr>`).join("")}
         </tbody>
       </table>
     </div>
   `;
+}
+
+/** Pulls together the figures already computed elsewhere in the app
+ *  into a readable data summary relevant to preparing an RBI return —
+ *  NOT a completed XBRL filing (this app doesn't replicate RBI's exact
+ *  taxonomy schemas), but enough for whoever prepares the actual portal
+ *  submission to work from real numbers instead of starting blank. */
+async function generateReturnSummaryText(filing){
+  const nbfc = await getNbfcProfile();
+  const sch = await computeScheduleIIIFigures();
+  const acct = await computeAccountingSummary();
+  const sanctions = await db.getAll("sanctions");
+  const largeExposures = [];
+  const byCustomer = {};
+  sanctions.filter(s=>s.status==="Approved").forEach(s=>{ byCustomer[s.customerId] = (byCustomer[s.customerId]||0) + s.sanctionedAmount; });
+  const customers = await db.getAll("customers");
+  Object.entries(byCustomer).forEach(([custId, exposure])=>{
+    if(exposure >= 5000000){ // ₹5 Cr — CRILC large exposure threshold
+      const cust = customers.find(c=>c.id===custId);
+      largeExposures.push(`  - ${cust?cust.personal.name:custId}: ${fmtINR(exposure)}`);
+    }
+  });
+
+  const lines = [
+    `${nbfc.name || "(NBFC name not set — fill in NBFC Profile)"}`,
+    nbfc.registrationNumber ? `RBI Registration No: ${nbfc.registrationNumber}` : "",
+    `Data summary prepared for: ${filing.code} — ${filing.period}`,
+    `As of: ${todayStr()}`,
+    ``,
+    `--- Balance Sheet Summary (Schedule III basis) ---`,
+    `Total Assets: ${fmtINR(Math.round(sch.balanceSheet.totalAssets))}`,
+    `Gross Loans: ${fmtINR(Math.round(sch.balanceSheet.grossLoans))}`,
+    `Net Loans (after impairment): ${fmtINR(Math.round(sch.balanceSheet.netLoans))}`,
+    `Total Borrowings: ${fmtINR(Math.round(sch.balanceSheet.totalBorrowings))}`,
+    `Equity Share Capital: ${fmtINR(Math.round(sch.balanceSheet.equityShareCapital))}`,
+    `Total Equity: ${fmtINR(Math.round(sch.balanceSheet.totalEquity))}`,
+    ``,
+    `--- P&L Summary ---`,
+    `Total Income: ${fmtINR(Math.round(sch.profitLoss.totalIncome))}`,
+    `Total Expenses: ${fmtINR(Math.round(sch.profitLoss.totalExpenses))}`,
+    `Profit Before Tax: ${fmtINR(Math.round(sch.profitLoss.profitBeforeTax))}`,
+    ``,
+    `--- NPA / Provisioning ---`,
+    `Impairment Allowance / NPA Provisioning: ${fmtINR(Math.round(acct.npaProvision))}`,
+    ``,
+    largeExposures.length>0 ? `--- Large Exposures (≥ ₹5 Cr, CRILC threshold reference) ---\n${largeExposures.join("\n")}` : `--- Large Exposures ---\nNone above ₹5 Cr threshold.`,
+    ``,
+    `⚠ This is a data preparation summary from internally recorded figures, not a completed or verified RBI return. Cross-check every figure against your books and the exact schema required for ${filing.code} before using it for any filing.`
+  ].filter(Boolean);
+  return lines.join("\n");
 }
 
 /* ---------------------------------------------------------------------
@@ -5743,6 +5805,8 @@ function bindEvents(){
   const saveCustomReminderBtn = document.getElementById("btn-save-custom-reminder");
   if(saveCustomReminderBtn) saveCustomReminderBtn.onclick = handleSaveCustomReminder;
   document.querySelectorAll(".mark-reminder-sent-btn").forEach(btn=> btn.onclick = ()=> handleMarkReminderSent(btn.dataset.reminder));
+  const sendAllRemindersBtn = document.getElementById("btn-send-all-reminders");
+  if(sendAllRemindersBtn) sendAllRemindersBtn.onclick = ()=> handleSendAllDueReminders(false);
   const openMsgConfig = document.getElementById("btn-open-messaging-config");
   if(openMsgConfig) openMsgConfig.onclick = ()=>{ session.staffTab="apiconfig"; render(); };
   const gotoRbiReturnsBtn = document.getElementById("btn-goto-rbi-returns");
@@ -5875,6 +5939,9 @@ function bindEvents(){
   if(addRbiFilingBtn) addRbiFilingBtn.onclick = handleAddRbiFiling;
   document.querySelectorAll(".mark-rbi-submitted-btn").forEach(btn=>{
     btn.onclick = ()=> handleMarkRbiSubmitted(btn.dataset.filing);
+  });
+  document.querySelectorAll(".prepare-rbi-summary-btn").forEach(btn=>{
+    btn.onclick = ()=> handlePrepareAndEmailReturn(btn.dataset.filing);
   });
 
   // Reports
@@ -6745,21 +6812,22 @@ async function handleForecloseLoan(loanId){
 /* ---------------------------------------------------------------------
    Phase 5 handlers: Reminders
    --------------------------------------------------------------------- */
-async function handleMarkReminderSent(reminderId){
-  const u = session.user;
-  const r = await db.get("reminders", reminderId);
-  if(!r) return;
-  const message = r.ruleLabel.startsWith("Custom:") ? r.ruleLabel.replace("Custom: ","") :
+function reminderMessageFor(r){
+  return r.ruleLabel.startsWith("Custom:") ? r.ruleLabel.replace("Custom: ","") :
     `Reminder: your EMI installment #${r.installmentIndex} of ${r.dueDate ? "due "+r.dueDate : ""} needs attention. Please contact your branch.`;
+}
 
+async function sendReminderMessage(r, u){
+  const message = reminderMessageFor(r);
   let sendResults = [];
   for(const channel of (r.channels||[])){
     const key = channel==="WhatsApp" ? "whatsapp" : channel==="Email" ? "email" : null;
     if(!key) continue; // SMS/Push/Voice have no configured provider hook yet
-    const result = await sendMessage(key, r.customerMobile, "Payment Reminder", message);
+    if(channel==="Email" && !r.customerEmail){ sendResults.push("Email: No email on file for this customer"); continue; }
+    const to = channel==="Email" ? r.customerEmail : r.customerMobile;
+    const result = await sendMessage(key, to, "Payment Reminder", message);
     sendResults.push(`${channel}: ${result.status}`);
   }
-
   r.status = "Sent";
   r.sentAt = nowISO();
   r.sentBy = u.name;
@@ -6767,8 +6835,41 @@ async function handleMarkReminderSent(reminderId){
   await db.put("reminders", r);
   const detail = sendResults.length ? sendResults.join("; ") : "no configured channel — logged only";
   await logAudit(u.name, u.role, "Reminder Sent", `${r.customerName} — ${r.ruleLabel} — ${detail}`);
+  return sendResults;
+}
+
+async function handleMarkReminderSent(reminderId){
+  const u = session.user;
+  const r = await db.get("reminders", reminderId);
+  if(!r) return;
+  const sendResults = await sendReminderMessage(r, u);
   toast(sendResults.length ? "Send attempted: "+sendResults.join(", ") : "Marked as sent (no provider configured for these channels).");
   render();
+}
+
+/** Sends WhatsApp/Email for every currently-due pending reminder in one
+ *  batch. Triggered automatically the first time Reminders is opened in
+ *  a session (so it happens "on clicking the menu," as requested),
+ *  guarded so it only fires once per login rather than on every
+ *  re-render — real messages shouldn't go out repeatedly just because
+ *  the screen redrew. A manual "Send All Due Now" button re-runs it
+ *  anytime, e.g. after adding a new custom reminder mid-session. */
+async function handleSendAllDueReminders(auto){
+  const u = session.user;
+  const pending = (await db.getAll("reminders")).filter(r=>r.status==="Pending" && (r.channels||[]).some(c=>c==="WhatsApp"||c==="Email"));
+  if(pending.length===0){
+    if(!auto) toast("No reminders due right now.");
+    return;
+  }
+  let sentCount = 0, notConfiguredCount = 0;
+  for(const r of pending){
+    const results = await sendReminderMessage(r, u);
+    if(results.some(res=>res.includes("Not Configured"))) notConfiguredCount++;
+    else sentCount++;
+  }
+  await logAudit(u.name, u.role, "Bulk Reminders Sent", `${pending.length} reminder(s) processed — ${auto?'auto-triggered on opening Reminders':'manually triggered'}`);
+  toast(`${pending.length} reminder(s) processed.${notConfiguredCount>0 ? ' '+notConfiguredCount+' need a WhatsApp/Email provider configured under Integrations to actually go out.' : ''}`);
+  if(!auto) render(); // auto-trigger runs inside an in-progress render() pass — calling render() again here would be recursive; the same pass already reflects the updated data since this runs before the pending list is read.
 }
 
 async function handleSaveCustomReminder(){
@@ -6782,6 +6883,7 @@ async function handleSaveCustomReminder(){
   await db.put("reminders", {
     id: uid("rem"), key: uid("custom"), loanAccountId:null, customerId,
     customerName: cust?cust.personal.name:"—", customerMobile: cust?cust.personal.mobile:"",
+    customerEmail: cust?cust.personal.email:"",
     installmentIndex:null, dueDate:null, ruleLabel: "Custom: "+message, channels,
     triggerDate: date, status:"Pending", sentAt:null, sentBy:null, custom:true, createdAt: nowISO()
   });
@@ -7432,13 +7534,29 @@ async function handleAddRbiFiling(){
   const code = document.getElementById("rf-code").value;
   const period = document.getElementById("rf-period").value.trim();
   const dueDate = document.getElementById("rf-duedate").value;
+  const recipientEmail = document.getElementById("rf-email").value.trim();
   if(!period || !dueDate){ toast("Enter a period and a due date."); return; }
   await db.put("rbiReturnFilings", {
-    id: uid("rbf"), code, period, dueDate, submittedDate:null, submittedBy:null,
+    id: uid("rbf"), code, period, dueDate, recipientEmail, submittedDate:null, submittedBy:null,
     createdAt: nowISO(), createdBy: u.name
   });
   await logAudit(u.name, u.role, "RBI Return Filing Tracked", `${code} — ${period} — due ${dueDate}`);
   toast("Filing tracked.");
+  render();
+}
+
+async function handlePrepareAndEmailReturn(filingId){
+  const u = session.user;
+  const filing = await db.get("rbiReturnFilings", filingId);
+  if(!filing || !filing.recipientEmail){ toast("Add a recipient email to this filing first."); return; }
+  toast("Preparing summary…");
+  const summaryText = await generateReturnSummaryText(filing);
+  const result = await sendMessage("email", filing.recipientEmail, `Data summary for ${filing.code} — ${filing.period}`, summaryText);
+  filing.lastPreparedAt = nowISO();
+  filing.lastPreparedBy = u.name;
+  await db.put("rbiReturnFilings", filing);
+  await logAudit(u.name, u.role, "RBI Return Summary Prepared & Emailed", `${filing.code} — ${filing.period} — to ${filing.recipientEmail} — ${result.status}`);
+  toast(result.ok ? `Summary emailed to ${filing.recipientEmail}.` : result.error);
   render();
 }
 
