@@ -1,9 +1,12 @@
 // NBFC LMS — minimal offline app-shell cache.
-// All real data lives in IndexedDB (already available offline); this only
-// makes sure the app shell itself (this HTML/CSS/JS file) loads without a
-// network connection once it's been opened at least once.
+// Network-first: always tries to fetch the latest version when online, so
+// updates show up immediately instead of being stuck on whatever was
+// cached the first time this was opened. Only falls back to the cached
+// copy if the network request actually fails (i.e. genuinely offline).
+// The cache name is versioned — bump CACHE_NAME on future updates to
+// force old cached shells to be discarded on the next visit.
 
-const CACHE_NAME = "ledger-lms-shell-v1";
+const CACHE_NAME = "nbfc-lms-shell-v2";
 const SHELL_FILES = ["./", "./index.html", "./manifest.json"];
 
 self.addEventListener("install", (event) => {
@@ -25,17 +28,14 @@ self.addEventListener("activate", (event) => {
 self.addEventListener("fetch", (event) => {
   if (event.request.method !== "GET") return;
   event.respondWith(
-    caches.match(event.request).then((cached) => {
-      const network = fetch(event.request)
-        .then((response) => {
-          if (response && response.status === 200 && response.type === "basic") {
-            const clone = response.clone();
-            caches.open(CACHE_NAME).then((cache) => cache.put(event.request, clone));
-          }
-          return response;
-        })
-        .catch(() => cached);
-      return cached || network;
-    })
+    fetch(event.request)
+      .then((response) => {
+        if (response && response.status === 200 && response.type === "basic") {
+          const clone = response.clone();
+          caches.open(CACHE_NAME).then((cache) => cache.put(event.request, clone));
+        }
+        return response;
+      })
+      .catch(() => caches.match(event.request))
   );
 });
