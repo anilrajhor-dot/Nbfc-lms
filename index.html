@@ -1552,13 +1552,13 @@ async function render(){
   } else if(route === "borrower-auth"){
     body = renderBorrowerAuth();
   } else {
-    body = renderLanding();
+    body = renderLanding(firstRun);
   }
   app.innerHTML = body;
   bindEvents();
 }
 
-function renderLanding(){
+function renderLanding(firstRun){
   return `
   <div id="app-inner">
     <div class="topbar">
@@ -1589,7 +1589,12 @@ function renderLanding(){
         </div>
       </div>
       <div class="card small muted">
-        Staff and borrowers now sign in with real Firebase accounts (no more plaintext passwords), and access is meant to be enforced by Firestore Security Rules — but that only takes effect once you've published the rules in <code>firestore.rules</code> to your Firebase project (Console → Firestore → Rules). Until you've done that, the database may still be running on older, permissive rules. See <code>SECURITY_MIGRATION.md</code> shipped with this file — you'll need to re-create your Super Admin login once, a one-time step. KYC ID verification is simulated — no live Aadhaar/PAN/CKYC API calls are made.
+        ${firstRun ? `
+        No Super Admin account exists yet in this database — click Staff Login to create one. Staff and borrowers sign in with real Firebase accounts (no plaintext passwords), but that's only actually enforced once you've published the rules in <code>firestore.rules</code> to your Firebase project (Console → Firestore → Rules) — see <code>SECURITY_MIGRATION.md</code> shipped with this file if you haven't yet.
+        ` : `
+        A Super Admin account exists in this database — sign in normally. If you haven't already published <code>firestore.rules</code> to this Firebase project's Console, access still isn't actually locked down; do that first if you haven't (see <code>SECURITY_MIGRATION.md</code>).
+        `}
+        KYC ID verification is simulated — no live Aadhaar/PAN/CKYC API calls are made.
       </div>
     </main>
     <div class="footer-note">NBFC LMS — Developed by Anil Sharma, Former General Manager, Central Bank of India</div>
