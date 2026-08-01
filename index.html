@@ -272,22 +272,37 @@ async function initFirebase(){
   firebaseReady = true;
 }
 
-/** Cleared at the start of every render() pass, and whenever a write
- *  happens. Within one screen load, many different parts (dashboard,
- *  notifications, fund position, portfolio risk, etc.) independently
- *  ask for the same collections — this avoids re-fetching them from
- *  Firestore over and over for a single page load, which was the main
- *  cause of slow loading as the app grew. */
+/** Two layers:
+ *  1. renderCache — cleared at the start of every render() pass. Within
+ *     one screen load, many different parts (dashboard, notifications,
+ *     fund position, portfolio risk, etc.) independently ask for the
+ *     same collections; this avoids re-fetching the same thing several
+ *     times for a single page load.
+ *  2. staleCache — survives ACROSS render() calls for a short window
+ *     (15s). This is what actually fixes slow menu navigation: without
+ *     it, every single tab click re-fetched every collection fresh from
+ *     Firestore even though nothing had changed since the last click a
+ *     second ago. Any write immediately invalidates both layers for that
+ *     collection, so you're never looking at stale data after an action —
+ *     you just don't pay a fresh round-trip for rapid clicking around. */
 let renderCache = {};
+let staleCache = {};
+const STALE_CACHE_MS = 15000;
 function clearRenderCache(){ renderCache = {}; }
 
 const db = {
   async getAll(collectionName){
     await initFirebase();
     if(renderCache[collectionName]) return renderCache[collectionName];
+    const cached = staleCache[collectionName];
+    if(cached && (Date.now()-cached.at) < STALE_CACHE_MS){
+      renderCache[collectionName] = cached.data;
+      return cached.data;
+    }
     const snap = await firestoreDb.collection(collectionName).get();
     const result = snap.docs.map(d => ({ ...d.data(), id: d.id }));
     renderCache[collectionName] = result;
+    staleCache[collectionName] = { data: result, at: Date.now() };
     return result;
   },
   async get(collectionName, id){
@@ -299,12 +314,14 @@ const db = {
     await initFirebase();
     await firestoreDb.collection(collectionName).doc(obj.id).set(obj);
     delete renderCache[collectionName]; // this collection just changed — don't serve a stale list
+    delete staleCache[collectionName];
     return obj;
   },
   async delete(collectionName, id){
     await initFirebase();
     await firestoreDb.collection(collectionName).doc(id).delete();
     delete renderCache[collectionName];
+    delete staleCache[collectionName];
   },
 };
 
@@ -606,7 +623,7 @@ function downloadJSON(filename, obj){
 const ALL_COLLECTIONS = [
   "staff","borrowers","leads","customers","products","appraisals","policyConfig",
   "fundAccounts","sanctions","disbursements","loanAccounts","payments","reminders",
-  "recoveryVisits","apiConfig","aiConfig","nbfcProfile","journalEntries","complianceItems","rbiReturnFilings",
+  "recoveryVisits","apiConfig","aiConfig","nbfcProfile","categoryConfig","journalEntries","complianceItems","rbiReturnFilings",
   "staffSalaries","payrollRuns","dsaAgents","dsaCommissions",
   "shgGroups","shgMembers","shgSavings","shgInternalLoans","microEnterpriseTemplates",
   "bankStatementLines",
@@ -3316,6 +3333,8 @@ async function renderAccountingTab(){
   const fundAccounts = acct.fundAccounts;
   const policy = (await db.get("policyConfig","default")) || defaultPolicyConfig();
   if(!policy.journalLimits) policy.journalLimits = defaultPolicyConfig().journalLimits;
+  const categoryConfig = await getCategoryConfig();
+  session.categoryConfigCache = categoryConfig;
 
   return `
     <div class="card">
@@ -3368,6 +3387,29 @@ async function renderAccountingTab(){
           }).join("")}
         </tbody>
       </table>
+    </div>
+
+    <div class="card">
+      <h2 style="font-size:16px;">Manage Categories</h2>
+      <p class="sub">Add or remove entries from the Type/Category dropdown above. Deleting a category doesn't touch past journal entries already recorded under it — it only affects what's offered going forward.</p>
+      <div class="grid grid-2">
+        <div>
+          <h3 class="section-h">Income Categories</h3>
+          ${categoryConfig.incomeCategories.map(c=>`<div class="action-row" style="margin-bottom:6px;"><span style="flex:1;">${esc(c)}</span><button class="btn btn-danger btn-sm delete-category-btn" data-type="income" data-category="${esc(c)}">Delete</button></div>`).join("")}
+          <div class="action-row" style="margin-top:10px;">
+            <input id="new-income-category" placeholder="New income category">
+            <button class="btn btn-outline btn-sm add-category-btn" data-type="income">+ Add</button>
+          </div>
+        </div>
+        <div>
+          <h3 class="section-h">Expense Categories</h3>
+          ${categoryConfig.expenseCategories.map(c=>`<div class="action-row" style="margin-bottom:6px;"><span style="flex:1;">${esc(c)}</span><button class="btn btn-danger btn-sm delete-category-btn" data-type="expense" data-category="${esc(c)}">Delete</button></div>`).join("")}
+          <div class="action-row" style="margin-top:10px;">
+            <input id="new-expense-category" placeholder="New expense category">
+            <button class="btn btn-outline btn-sm add-category-btn" data-type="expense">+ Add</button>
+          </div>
+        </div>
+      </div>
     </div>
 
     <div class="card">
@@ -3605,6 +3647,13 @@ async function renderRbiReturnsSection(){
    --------------------------------------------------------------------- */
 const JOURNAL_EXPENSE_CATEGORIES = ["Salaries","DSA Commission","Rent","Electricity","Office Supplies","Professional Fees","Travel","Insurance Premium","Interest on Borrowings","Other Expense"];
 const JOURNAL_INCOME_CATEGORIES = ["Other Income","Investment Income","Miscellaneous Income"];
+
+function defaultCategoryConfig(){
+  return { id:"default", expenseCategories:[...JOURNAL_EXPENSE_CATEGORIES], incomeCategories:[...JOURNAL_INCOME_CATEGORIES], updatedAt:null, updatedBy:null };
+}
+async function getCategoryConfig(){
+  return (await db.get("categoryConfig","default")) || defaultCategoryConfig();
+}
 const COMPLIANCE_STATUSES = ["Not Started","In Progress","Done","Not Applicable"];
 const DEFAULT_COMPLIANCE_ITEMS = [
   {category:"Registration & Governance", item:"NBFC Certificate of Registration (CoR) on file and valid"},
@@ -5140,13 +5189,20 @@ function bindEvents(){
   const jfType = document.getElementById("jf-type");
   const jfCategory = document.getElementById("jf-category");
   if(jfType && jfCategory){
+    const catCfg = session.categoryConfigCache || defaultCategoryConfig();
     const paintCategories = ()=>{
-      const opts = jfType.value==="Income" ? JOURNAL_INCOME_CATEGORIES : JOURNAL_EXPENSE_CATEGORIES;
+      const opts = jfType.value==="Income" ? catCfg.incomeCategories : catCfg.expenseCategories;
       jfCategory.innerHTML = opts.map(c=>`<option>${c}</option>`).join("");
     };
     jfType.onchange = paintCategories;
     paintCategories();
   }
+  document.querySelectorAll(".add-category-btn").forEach(btn=>{
+    btn.onclick = ()=> handleAddCategory(btn.dataset.type);
+  });
+  document.querySelectorAll(".delete-category-btn").forEach(btn=>{
+    btn.onclick = ()=> handleDeleteCategory(btn.dataset.type, btn.dataset.category);
+  });
   const saveJournalBtn = document.getElementById("btn-save-journal");
   if(saveJournalBtn) saveJournalBtn.onclick = handleSaveJournalEntry;
   document.querySelectorAll(".approve-journal-btn").forEach(btn=> btn.onclick = ()=> handleApproveJournalEntry(btn.dataset.entry));
@@ -6461,6 +6517,39 @@ async function handleRejectJournalEntry(entryId){
   await db.put("journalEntries", entry);
   await logAudit(u.name, u.role, "Journal Entry Rejected", `${entry.type}: ${entry.category} — ${fmtINR(entry.amount)} — ${reason||"no reason given"}`);
   toast("Entry rejected.");
+  render();
+}
+
+async function handleAddCategory(type){
+  const u = session.user;
+  const inputId = type==="income" ? "new-income-category" : "new-expense-category";
+  const input = document.getElementById(inputId);
+  const name = input.value.trim();
+  if(!name){ toast("Enter a category name."); return; }
+  const cfg = await getCategoryConfig();
+  const listKey = type==="income" ? "incomeCategories" : "expenseCategories";
+  if(cfg[listKey].some(c=>c.toLowerCase()===name.toLowerCase())){ toast("That category already exists."); return; }
+  cfg[listKey].push(name);
+  cfg.updatedAt = nowISO();
+  cfg.updatedBy = u.name;
+  await db.put("categoryConfig", cfg);
+  await logAudit(u.name, u.role, "Journal Category Added", `${type}: ${name}`);
+  toast("Category added.");
+  render();
+}
+
+async function handleDeleteCategory(type, category){
+  const u = session.user;
+  const cfg = await getCategoryConfig();
+  const listKey = type==="income" ? "incomeCategories" : "expenseCategories";
+  if(cfg[listKey].length<=1){ toast("At least one category is required — add a replacement before deleting the last one."); return; }
+  if(!window.confirm(`Remove "${category}" from the ${type} category list? Past journal entries already recorded under it are unaffected.`)) return;
+  cfg[listKey] = cfg[listKey].filter(c=>c!==category);
+  cfg.updatedAt = nowISO();
+  cfg.updatedBy = u.name;
+  await db.put("categoryConfig", cfg);
+  await logAudit(u.name, u.role, "Journal Category Removed", `${type}: ${category}`);
+  toast("Category removed.");
   render();
 }
 
