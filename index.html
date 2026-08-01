@@ -4508,6 +4508,15 @@ async function renderDataManagementTab(){
         </tbody>
       </table>
     </div>
+
+    <div class="card" style="border:2px solid var(--danger); background:#FBE7E8;">
+      <h2 style="color:#7A1F27;">⚠ Danger Zone</h2>
+      <div class="warn-banner" style="background:#fff; border-color:var(--danger); color:#7A1F27;">
+        <b>Be careful — Delete ALL Data will permanently erase everything.</b> Every lead, customer, loan account, payment, sanction, journal entry, staff login except your own, and the audit trail itself. There is no undo, no recycle bin, and no way for anyone — including me — to get it back afterward. Download a backup first if there is any chance you'll want this data again.
+      </div>
+      <p class="sub" style="margin-top:12px;">Meant for clearing out test data before going live, not routine use. Requires two separate confirmations, including typing a phrase, before anything is touched.</p>
+      <button class="btn btn-danger" id="btn-factory-reset">Delete ALL Data</button>
+    </div>
   `;
 }
 
@@ -5224,6 +5233,8 @@ function bindEvents(){
   document.querySelectorAll(".clear-collection-btn").forEach(btn=>{
     btn.onclick = ()=> handleClearCollection(btn.dataset.collection);
   });
+  const factoryResetBtn = document.getElementById("btn-factory-reset");
+  if(factoryResetBtn) factoryResetBtn.onclick = handleFactoryReset;
 }
 
 /* ---------------------------------------------------------------------
@@ -6770,6 +6781,30 @@ async function handleClearCollection(collectionName){
   await logAudit(u.name, u.role, "Collection Cleared", `${collectionName} — ${records.length} record(s) deleted`);
   toast(`Cleared ${records.length} record(s) from ${collectionName}.`);
   render();
+}
+
+async function handleFactoryReset(){
+  const u = session.user;
+  const totalRecords = {};
+  let grandTotal = 0;
+  for(const c of ALL_COLLECTIONS){ totalRecords[c] = (await db.getAll(c)).length; grandTotal += totalRecords[c]; }
+  if(grandTotal===0){ toast("There's nothing to delete."); return; }
+
+  if(!window.confirm(`⚠ BE CAREFUL — this will permanently erase ALL data: ${grandTotal} record(s) across every collection, including your own staff login. There is no undo, no recycle bin, and no way to recover it afterward. Have you downloaded a backup? Click OK only if you are certain.`)) return;
+  const typed = window.prompt(`Last chance. Type DELETE EVERYTHING (exactly, in capitals) to permanently erase all data.`, "");
+  if(typed !== "DELETE EVERYTHING"){ toast("Cancelled — nothing was deleted."); return; }
+
+  // Log the reset before wiping the audit trail itself, so there's a
+  // final record of who did this and when, for whatever it's worth.
+  await logAudit(u.name, u.role, "FACTORY RESET", `${grandTotal} record(s) deleted across all collections — initiated by ${u.name}`);
+
+  for(const c of ALL_COLLECTIONS){
+    const records = await db.getAll(c);
+    for(const rec of records){ await db.delete(c, rec.id); }
+  }
+  toast("Factory reset complete — this NBFC LMS is now empty. Signing you out.");
+  session = {type:null, user:null};
+  setRoute("landing");
 }
 
 async function handleRunCustomerVerification(customerId, serviceKey, field){
