@@ -658,6 +658,20 @@ async function getReconcilableTransactions(fundAccountId){
   return txns;
 }
 
+function parseGenericCsv(text){
+  const lines = text.split(/\r?\n/).filter(l=>l.trim());
+  if(lines.length<2) return [];
+  const headers = lines[0].split(",").map(h=>h.trim());
+  const rows = [];
+  for(let i=1;i<lines.length;i++){
+    const cols = lines[i].split(",").map(c=>c.trim());
+    const row = {};
+    headers.forEach((h,idx)=>{ row[h] = cols[idx]!==undefined ? cols[idx] : ""; });
+    rows.push(row);
+  }
+  return rows;
+}
+
 function parseStatementCsv(text){
   const lines = text.split(/\r?\n/).filter(l=>l.trim());
   if(lines.length<2) return [];
@@ -5242,6 +5256,31 @@ async function renderDataManagementTab(){
     </div>
 
     <div class="card">
+      <h2>Bulk Import — Migrate an Existing Portfolio</h2>
+      <p class="sub">For bringing in real customers and loan accounts from wherever you're tracking them today (Excel, Tally, another system). Download the template, fill it in, upload it back. Suggested order: <b>1) set up your real Loan Products and Fund Accounts manually first</b> (they need to exist before loans can reference them) <b>2) import Customers, 3) import Loan Accounts.</b></p>
+      <div class="warn-banner" style="background:#FBF1DC;border-color:var(--gold);color:#5C4200;">⚠ Importing a loan account creates its EMI schedule and marks past installments as paid for reporting accuracy (NPA classification, portfolio outstanding) — but deliberately does <b>not</b> move any money in Fund Management. Those payments already happened in your old system; re-crediting them here would double-count. Make sure your Fund Account opening balances already reflect your real current cash position (Fund Management → Add Capital) before importing.</div>
+
+      <h3 class="section-h">Step 1 — Customers</h3>
+      <p class="small muted">Columns (exact header names): <span class="mono">Name, Mobile, Aadhaar, PAN, Address, DOB, Gender, MaritalStatus, BusinessName, BusinessType, MonthlyIncome, BankName, BankAccount, BankIFSC, CreditScore, RiskCategory</span></p>
+      <button class="btn btn-outline btn-sm" id="btn-download-customer-template">Download Template</button>
+      <div style="margin-top:10px;">
+        <label class="btn btn-outline" style="cursor:pointer; display:inline-block;">Choose Customers CSV<input type="file" accept=".csv" id="import-customers-file-input" style="display:none;"></label>
+        <span id="import-customers-filename" class="small muted" style="margin-left:10px;"></span>
+      </div>
+      <div style="margin-top:10px;"><button class="btn btn-gold btn-sm" id="btn-import-customers" disabled>Import Customers</button></div>
+
+      <h3 class="section-h" style="margin-top:20px;">Step 2 — Loan Accounts</h3>
+      <p class="small muted">Columns (exact header names): <span class="mono">CustomerMobile, Product, Principal, InterestRate, TenureMonths, DisbursedDate, EmiFrequency, InstallmentsPaid, FundAccountName</span><br>
+      CustomerMobile must match a mobile number already imported in Step 1. Product must match an existing Loan Product name exactly. InstallmentsPaid = how many EMIs have already been paid, in order — leave 0 for a brand-new loan.</p>
+      <button class="btn btn-outline btn-sm" id="btn-download-loans-template">Download Template</button>
+      <div style="margin-top:10px;">
+        <label class="btn btn-outline" style="cursor:pointer; display:inline-block;">Choose Loan Accounts CSV<input type="file" accept=".csv" id="import-loans-file-input" style="display:none;"></label>
+        <span id="import-loans-filename" class="small muted" style="margin-left:10px;"></span>
+      </div>
+      <div style="margin-top:10px;"><button class="btn btn-gold btn-sm" id="btn-import-loans" disabled>Import Loan Accounts</button></div>
+    </div>
+
+    <div class="card">
       <h2>Delete Data</h2>
       <p class="sub">Clears an entire collection. This cannot be undone — export a backup first. Each clear requires typing DELETE to confirm.</p>
       <table>
@@ -6045,6 +6084,40 @@ function bindEvents(){
   }
   const runRestoreBtn = document.getElementById("btn-run-restore");
   if(runRestoreBtn) runRestoreBtn.onclick = handleRestoreBackup;
+
+  const downloadCustomerTemplateBtn = document.getElementById("btn-download-customer-template");
+  if(downloadCustomerTemplateBtn) downloadCustomerTemplateBtn.onclick = ()=>{
+    downloadCSV("customers-import-template.csv",
+      ["Name","Mobile","Aadhaar","PAN","Address","DOB","Gender","MaritalStatus","BusinessName","BusinessType","MonthlyIncome","BankName","BankAccount","BankIFSC","CreditScore","RiskCategory"],
+      [["Sunita Devi","9876543210","123456789012","ABCDE1234F","Wardha, Maharashtra","1985-06-15","Female","Married","Sunita General Store","Kirana store owner","25000","Local Bank","1234567890","BANK0001234","720","Low"]]);
+  };
+  const downloadLoansTemplateBtn = document.getElementById("btn-download-loans-template");
+  if(downloadLoansTemplateBtn) downloadLoansTemplateBtn.onclick = ()=>{
+    downloadCSV("loan-accounts-import-template.csv",
+      ["CustomerMobile","Product","Principal","InterestRate","TenureMonths","DisbursedDate","EmiFrequency","InstallmentsPaid","FundAccountName"],
+      [["9876543210","Business Loan","150000","18","36","2025-01-15","Monthly","6","Head Office Operating Account"]]);
+  };
+  const importCustomersFileInput = document.getElementById("import-customers-file-input");
+  if(importCustomersFileInput){
+    importCustomersFileInput.onchange = ()=>{
+      const f = importCustomersFileInput.files[0];
+      document.getElementById("import-customers-filename").textContent = f ? f.name : "";
+      document.getElementById("btn-import-customers").disabled = !f;
+    };
+  }
+  const importCustomersBtn = document.getElementById("btn-import-customers");
+  if(importCustomersBtn) importCustomersBtn.onclick = handleImportCustomers;
+  const importLoansFileInput = document.getElementById("import-loans-file-input");
+  if(importLoansFileInput){
+    importLoansFileInput.onchange = ()=>{
+      const f = importLoansFileInput.files[0];
+      document.getElementById("import-loans-filename").textContent = f ? f.name : "";
+      document.getElementById("btn-import-loans").disabled = !f;
+    };
+  }
+  const importLoansBtn = document.getElementById("btn-import-loans");
+  if(importLoansBtn) importLoansBtn.onclick = handleImportLoanAccounts;
+
   const saveNbfcProfileBtn = document.getElementById("btn-save-nbfc-profile");
   if(saveNbfcProfileBtn) saveNbfcProfileBtn.onclick = handleSaveNbfcProfile;
   const saveProjectionBtn = document.getElementById("btn-save-projection-assumptions");
@@ -7921,6 +7994,120 @@ async function handleRestoreBackup(){
   };
   reader.readAsText(file);
 }
+
+async function handleImportCustomers(){
+  const u = session.user;
+  const fileInput = document.getElementById("import-customers-file-input");
+  const file = fileInput.files[0];
+  if(!file) return;
+  const reader = new FileReader();
+  reader.onload = async ()=>{
+    try{
+      const rows = parseGenericCsv(reader.result);
+      if(rows.length===0){ toast("No rows found — check the CSV has the expected header row."); return; }
+      const existing = await db.getAll("customers");
+      let created = 0, skipped = 0;
+      for(const row of rows){
+        const mobile = (row.Mobile||"").trim();
+        if(!row.Name || !mobile){ skipped++; continue; }
+        if(existing.some(c=>c.personal.mobile===mobile)){ skipped++; continue; } // avoid duplicate import on re-run
+        const monthlyIncome = Number(row.MonthlyIncome)||null;
+        await db.put("customers", {
+          id: uid("cus"),
+          personal: { name: row.Name, dob: row.DOB||"", gender: row.Gender||"", maritalStatus: row.MaritalStatus||"", mobile, email:"" },
+          family: { name:"", dependents:"" },
+          address: { current: row.Address||"", permanent: row.Address||"" },
+          business: { name: row.BusinessName||"", type: row.BusinessType||"", years:"" },
+          income: { monthly: monthlyIncome, annual: monthlyIncome ? monthlyIncome*12 : null, monthlyExpenses:null, source: row.BusinessType||"" },
+          bank: { name: row.BankName||"", account: row.BankAccount||"", ifsc: row.BankIFSC||"" },
+          nominee: { name:"", relationship:"Spouse", mobile:"" },
+          references: [],
+          existingLoans:"", previousLoans:"", creditScore: Number(row.CreditScore)||null, riskCategory: row.RiskCategory||"Medium",
+          kyc: { aadhaar: row.Aadhaar||"", pan: (row.PAN||"").toUpperCase(), otherIdType:"", otherIdNumber:"", photoBase64:null, docImageBase64:null, signatureBase64:null, gpsLat:null, gpsLng:null },
+          duplicateFlag:false, duplicateReason:"", leadId:null, createdAt: nowISO(), createdBy: u.name+" (Bulk Import)"
+        });
+        created++;
+      }
+      await logAudit(u.name, u.role, "Customers Bulk Imported", `${created} created, ${skipped} skipped (missing data or already exists)`);
+      toast(`Imported ${created} customer(s).${skipped>0 ? ' '+skipped+' skipped (missing name/mobile or already imported).' : ''}`);
+      render();
+    } catch(err){
+      console.error(err);
+      toast("Import failed — check the CSV format matches the template.");
+    }
+  };
+  reader.readAsText(file);
+}
+
+async function handleImportLoanAccounts(){
+  const u = session.user;
+  const fileInput = document.getElementById("import-loans-file-input");
+  const file = fileInput.files[0];
+  if(!file) return;
+  const reader = new FileReader();
+  reader.onload = async ()=>{
+    try{
+      const rows = parseGenericCsv(reader.result);
+      if(rows.length===0){ toast("No rows found — check the CSV has the expected header row."); return; }
+      const customers = await db.getAll("customers");
+      const products = await db.getAll("products");
+      const fundAccounts = await db.getAll("fundAccounts");
+      let created = 0, skipped = 0;
+      const skipReasons = [];
+      for(const row of rows){
+        const customer = customers.find(c=>c.personal.mobile===(row.CustomerMobile||"").trim());
+        const product = products.find(p=>p.name===(row.Product||"").trim());
+        const fundAccount = fundAccounts.find(f=>f.name===(row.FundAccountName||"").trim()) || fundAccounts[0];
+        const principal = Number(row.Principal);
+        if(!customer){ skipped++; skipReasons.push(`No customer with mobile ${row.CustomerMobile}`); continue; }
+        if(!product){ skipped++; skipReasons.push(`No product named "${row.Product}"`); continue; }
+        if(!principal || principal<=0){ skipped++; skipReasons.push(`Invalid principal for ${row.CustomerMobile}`); continue; }
+
+        const loanAccount = {
+          id: uid("loa"), sanctionId:null, customerId: customer.id, product: product.name,
+          principal, interestRate: Number(row.InterestRate)||product.interestRate, tenureMonths: Number(row.TenureMonths)||product.tenureMax,
+          emiFrequency: row.EmiFrequency || product.emiFrequency, disbursedDate: row.DisbursedDate, status:"Active",
+          createdAt: nowISO(), createdBy: u.name+" (Bulk Import)", accountNumber: await generateLoanAccountNumber(),
+          recoveryOfficer:null, recoveryStatus:null, migratedHistorical:true
+        };
+        const gen = generateEmiSchedule(loanAccount);
+        loanAccount.schedule = gen.schedule; loanAccount.emiAmount = gen.emiAmount; loanAccount.totalInstallments = gen.totalInstallments;
+
+        // Mark past installments Paid for reporting accuracy (NPA
+        // classification, portfolio outstanding) WITHOUT moving any
+        // money — those payments already happened in the old system,
+        // and re-crediting them here would double-count against your
+        // opening fund balance.
+        const installmentsPaid = Math.min(Number(row.InstallmentsPaid)||0, loanAccount.schedule.length);
+        for(let k=0; k<installmentsPaid; k++){
+          const inst = loanAccount.schedule[k];
+          inst.status = "Paid"; inst.paidAmount = inst.emiAmount; inst.paidDate = inst.dueDate;
+        }
+        loanAccount.principalOutstanding = loanAccount.schedule.filter(i=>i.status!=="Paid").reduce((s,i)=>s+i.principalComponent,0);
+        await db.put("loanAccounts", loanAccount);
+
+        // A historical disbursement record for audit-trail completeness —
+        // also tagged as not affecting fund balances.
+        await db.put("disbursements", {
+          id: uid("dsb"), sanctionId:null, customerId: customer.id, amount: principal,
+          mode:"Migrated — Historical", date: row.DisbursedDate, utr:"MIGRATED",
+          fundAccountId: fundAccount?fundAccount.id:null, fundAccountName: fundAccount?fundAccount.name:"—",
+          createdAt: nowISO(), createdBy: u.name+" (Bulk Import)", migratedHistorical:true
+        });
+        created++;
+      }
+      await logAudit(u.name, u.role, "Loan Accounts Bulk Imported", `${created} created, ${skipped} skipped`);
+      toast(`Imported ${created} loan account(s).${skipped>0 ? ' '+skipped+' skipped — check console for reasons.' : ''}`);
+      if(skipReasons.length>0) console.warn("Import skip reasons:", skipReasons);
+      render();
+    } catch(err){
+      console.error(err);
+      toast("Import failed — check the CSV format matches the template.");
+    }
+  };
+  reader.readAsText(file);
+}
+
 
 async function handleClearCollection(collectionName){
   const u = session.user;
