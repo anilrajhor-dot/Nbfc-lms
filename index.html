@@ -1682,7 +1682,8 @@ function renderLanding(firstRun){
       </div>
     </main>
     <div class="footer-note">NBFC LMS — Developed by Anil Sharma, Former General Manager, Central Bank of India</div>
-  </div>`;
+  </div>
+  ${renderChangePasswordModal()}`;
 }
 
 function renderStaffLogin(firstRun){
@@ -1709,6 +1710,8 @@ function renderStaffLogin(firstRun){
             <div class="field"><label>Username</label><input id="login-username" placeholder="admin"></div>
             <div class="field"><label>Password</label><input id="login-password" type="password" placeholder="••••••••"></div>
             <button class="btn btn-gold btn-block" id="btn-staff-login">Sign in</button>
+            <button class="btn btn-ghost btn-block" id="btn-show-forgot-password" style="margin-top:8px; color:var(--navy-700);">Forgot password?</button>
+            ${session.showForgotPasswordNote ? `<div class="warn-banner" style="margin-top:10px;">This app doesn't have a self-service email reset link, since logins use a username rather than an email address. If you're regular staff, ask your Super Admin to remove your old account (User Management → Staff Directory → Remove) and set you up fresh. If you ARE the Super Admin and you're locked out with no one else to ask, that needs a manual fix in Firebase Console directly — ask for help with that specifically rather than trying to work around it here.</div>` : ""}
           `}
         </div>
       </div>
@@ -1744,6 +1747,8 @@ function borrowerLoginPanel(){
     <div class="field"><label>Mobile number</label><input id="bl-mobile" placeholder="10-digit mobile number" maxlength="10"></div>
     <div class="field"><label>Password</label><input id="bl-password" type="password" placeholder="••••••••"></div>
     <button class="btn btn-gold btn-block" id="btn-borrower-login">Sign in</button>
+    <button class="btn btn-ghost btn-block" id="btn-show-forgot-password" style="margin-top:8px; color:var(--navy-700);">Forgot password?</button>
+    ${session.showForgotPasswordNote ? `<div class="warn-banner" style="margin-top:10px;">There's no automatic email reset for this account. Contact your branch and ask them to reset your account — once they do, you can register again fresh with your mobile number.</div>` : ""}
   `;
 }
 function borrowerRegisterPanel(){
@@ -1761,6 +1766,21 @@ function borrowerRegisterPanel(){
 /* ---------------------------------------------------------------------
    Staff shell
    --------------------------------------------------------------------- */
+function renderChangePasswordModal(){
+  if(!session.showChangePasswordModal) return "";
+  return `
+    <div style="position:fixed; inset:0; background:rgba(14,26,48,.55); z-index:200; display:flex; align-items:center; justify-content:center; padding:20px;">
+      <div class="card" style="max-width:420px; width:100%; margin:0;">
+        <div class="flex-between"><h2 style="font-size:17px;">Change Password</h2><button class="btn btn-ghost" id="btn-close-change-password" style="color:var(--navy-900);">✕</button></div>
+        <div class="field"><label>Current password</label><input id="cp-current" type="password"></div>
+        <div class="field"><label>New password</label><input id="cp-new" type="password" placeholder="At least 6 characters"></div>
+        <div class="field"><label>Confirm new password</label><input id="cp-confirm" type="password"></div>
+        <button class="btn btn-gold btn-block" id="btn-submit-change-password">Update Password</button>
+      </div>
+    </div>
+  `;
+}
+
 async function renderStaffShell(){
   const u = session.user;
   const [leads, borrowers, customers, products, appraisals, sanctions, loanAccounts, payments, staffList, onboardingDone] = await Promise.all([
@@ -1858,6 +1878,7 @@ async function renderStaffShell(){
           </div>` : ""}
         </div>
         <span class="pill">${esc(u.name)} · <b>${esc(u.role)}</b></span>
+        <button class="btn btn-ghost" id="btn-open-change-password">Change Password</button>
         <button class="btn btn-ghost" data-action="staff-logout">Sign out</button>
       </div>
     </div>
@@ -5246,6 +5267,7 @@ async function renderDataManagementTab(){
 
 async function renderUserManagement(){
   const staff = await db.getAll("staff");
+  const borrowers = await db.getAll("borrowers");
   const isSuperAdmin = session.user.role==="Super Admin";
   const superAdminCount = staff.filter(s=>s.role==="Super Admin").length;
   return `
@@ -5274,6 +5296,17 @@ async function renderUserManagement(){
           return `<tr><td>${esc(s.name)}${s.id===session.user.id?' <span class="badge badge-new">You</span>':''}</td><td class="mono">${esc(s.username)}</td><td><span class="badge badge-role">${esc(s.role)}</span></td><td>${esc(s.branch)||"—"}</td><td>${fmtDate(s.createdAt)}</td>
           ${isSuperAdmin ? `<td>${isLastSuperAdmin ? `<span class="small muted">Only Super Admin — can't remove</span>` : `<button class="btn btn-danger btn-sm remove-staff-btn" data-staff="${s.id}">Remove</button>`}</td>` : ''}</tr>`;
         }).join("")}
+        </tbody>
+      </table>
+    </div>
+    <div class="card">
+      <h2>Borrower Accounts</h2>
+      <p class="sub">Borrowers self-register and manage their own passwords — there's no admin-side reset for them either. If someone's locked out, the practical fix is removing their old account here so they can register again fresh with the same mobile number.</p>
+      <table>
+        <thead><tr><th>Name</th><th>Mobile</th><th>Registered</th><th></th></tr></thead>
+        <tbody>
+        ${borrowers.length===0 ? `<tr class="empty-row"><td colspan="4">No borrower accounts yet.</td></tr>` :
+          borrowers.map(b=>`<tr><td>${esc(b.name)}</td><td class="mono">${esc(b.mobile)}</td><td>${fmtDate(b.createdAt)}</td><td><button class="btn btn-danger btn-sm remove-borrower-btn" data-borrower="${b.id}">Remove</button></td></tr>`).join("")}
         </tbody>
       </table>
     </div>
@@ -5333,6 +5366,7 @@ async function renderBorrowerShell(){
       <div class="brand"><div class="mark">N</div><div class="brand-text"><b>NBFC LMS</b><span>Borrower Portal</span></div></div>
       <div class="topbar-right">
         <span class="pill">${esc(u.name)}</span>
+        <button class="btn btn-ghost" id="btn-open-change-password">Change Password</button>
         <button class="btn btn-ghost" data-action="borrower-logout">Sign out</button>
       </div>
     </div>
@@ -5348,7 +5382,8 @@ async function renderBorrowerShell(){
       ${body}
     </main>
     <div class="footer-note">NBFC LMS — Borrower Portal · Developed by Anil Sharma, Former General Manager, Central Bank of India</div>
-  </div>`;
+  </div>
+  ${renderChangePasswordModal()}`;
 }
 
 function renderBorrowerHelp(){
@@ -5558,6 +5593,15 @@ function bindEvents(){
   if(loginBtn) loginBtn.onclick = handleStaffLogin;
   const showLoginInsteadBtn = document.getElementById("btn-show-login-instead");
   if(showLoginInsteadBtn) showLoginInsteadBtn.onclick = ()=>{ session.forceStaffLoginView = true; render(); };
+  const showForgotPasswordBtn = document.getElementById("btn-show-forgot-password");
+  if(showForgotPasswordBtn) showForgotPasswordBtn.onclick = ()=>{ session.showForgotPasswordNote = true; render(); };
+
+  const openChangePasswordBtn = document.getElementById("btn-open-change-password");
+  if(openChangePasswordBtn) openChangePasswordBtn.onclick = ()=>{ session.showChangePasswordModal = true; render(); };
+  const closeChangePasswordBtn = document.getElementById("btn-close-change-password");
+  if(closeChangePasswordBtn) closeChangePasswordBtn.onclick = ()=>{ session.showChangePasswordModal = false; render(); };
+  const submitChangePasswordBtn = document.getElementById("btn-submit-change-password");
+  if(submitChangePasswordBtn) submitChangePasswordBtn.onclick = handleChangePassword;
 
   const logoutStaff = document.querySelector('[data-action="staff-logout"]');
   if(logoutStaff) logoutStaff.onclick = async ()=>{
@@ -5610,6 +5654,7 @@ function bindEvents(){
   const addStaffBtn = document.getElementById("btn-add-staff");
   if(addStaffBtn) addStaffBtn.onclick = handleAddStaff;
   document.querySelectorAll(".remove-staff-btn").forEach(btn=> btn.onclick = ()=> handleRemoveStaff(btn.dataset.staff));
+  document.querySelectorAll(".remove-borrower-btn").forEach(btn=> btn.onclick = ()=> handleRemoveBorrower(btn.dataset.borrower));
   const loadDemoBtn = document.getElementById("btn-load-demo-data");
   if(loadDemoBtn) loadDemoBtn.onclick = handleLoadDemoData;
   const loadBulkDemoBtn = document.getElementById("btn-load-bulk-demo-data");
@@ -8143,6 +8188,31 @@ async function handleBorrowerRegister(){
   }
 }
 
+async function handleChangePassword(){
+  const currentPassword = document.getElementById("cp-current").value;
+  const newPassword = document.getElementById("cp-new").value;
+  const confirmPassword = document.getElementById("cp-confirm").value;
+  if(!currentPassword || !newPassword){ toast("Fill in both password fields."); return; }
+  if(newPassword.length<6){ toast("New password must be at least 6 characters."); return; }
+  if(newPassword !== confirmPassword){ toast("New password and confirmation don't match."); return; }
+
+  const isBorrower = session.type==="borrower";
+  const authEmail = isBorrower ? borrowerAuthEmail(session.user.mobile) : staffAuthEmail(session.user.username);
+  try{
+    const cred = firebase.auth.EmailAuthProvider.credential(authEmail, currentPassword);
+    await firebase.auth().currentUser.reauthenticateWithCredential(cred);
+    await firebase.auth().currentUser.updatePassword(newPassword);
+    await logAudit(session.user.name, isBorrower?"Borrower":session.user.role, "Password Changed", "Self-service");
+    toast("Password updated.");
+    session.showChangePasswordModal = false;
+    render();
+  } catch(err){
+    console.error(err);
+    toast(err.code && err.code.includes("wrong-password") ? "Current password is incorrect." : friendlyAuthError(err));
+  }
+}
+
+
 async function handleBorrowerLogin(){
   const mobile = document.getElementById("bl-mobile").value.trim();
   const password = document.getElementById("bl-password").value;
@@ -8238,6 +8308,18 @@ async function handleRemoveStaff(staffId){
     render();
   }
 }
+
+async function handleRemoveBorrower(borrowerId){
+  const u = session.user;
+  const borrower = await db.get("borrowers", borrowerId);
+  if(!borrower) return;
+  if(!window.confirm(`Remove ${borrower.name}'s account (mobile ${borrower.mobile})? This deletes their login access immediately — they'll need to register again with the same mobile number. Their past loan applications and any linked customer/loan records are untouched.`)) return;
+  await db.delete("borrowers", borrowerId);
+  await logAudit(u.name, u.role, "Borrower Account Removed", `${borrower.name} — ${borrower.mobile} — removed by ${u.name}`);
+  toast(`${borrower.name}'s account removed — they can register again now.`);
+  render();
+}
+
 
 
 async function handleLoadDemoData(){
