@@ -56,6 +56,7 @@
     padding:14px 24px;
     display:flex; align-items:center; justify-content:space-between;
     border-bottom:3px solid var(--gold);
+    flex-wrap:wrap; gap:10px;
   }
   .brand{display:flex; align-items:center; gap:10px;}
   .brand .mark{
@@ -67,7 +68,7 @@
   .brand-text{display:flex; flex-direction:column; line-height:1.1;}
   .brand-text b{font-family:'Fraunces',serif; font-size:17px; letter-spacing:.2px;}
   .brand-text span{font-size:10.5px; letter-spacing:1.5px; color:var(--gold-soft); text-transform:uppercase;}
-  .topbar-right{display:flex; align-items:center; gap:14px; font-size:13px;}
+  .topbar-right{display:flex; align-items:center; gap:10px; font-size:13px; flex-wrap:wrap; row-gap:8px;}
   .pill{
     background:rgba(255,255,255,.08); border:1px solid rgba(255,255,255,.16);
     padding:5px 12px; border-radius:20px; font-size:12.5px; color:var(--gold-soft);
@@ -576,9 +577,9 @@ function sumJournalByCategory(journalEntries, categories){
 }
 
 async function computeScheduleIIIFigures(){
-  const acct = await computeAccountingSummary();
-  const fixedAssets = await db.getAll("fixedAssets");
-  const bankBorrowings = await db.getAll("bankBorrowings");
+  const [acct, fixedAssets, bankBorrowings] = await Promise.all([
+    computeAccountingSummary(), db.getAll("fixedAssets"), db.getAll("bankBorrowings")
+  ]);
 
   // --- Balance Sheet ---
   const cashAndEquivalents = acct.fundAccounts.filter(a=>a.type==="Cash").reduce((s,a)=>s+a.balance,0);
@@ -8628,10 +8629,10 @@ async function handleRemoveBorrower(borrowerId){
   const u = session.user;
   const borrower = await db.get("borrowers", borrowerId);
   if(!borrower) return;
-  if(!window.confirm(`Remove ${borrower.name}'s account (mobile ${borrower.mobile})? This deletes their login access immediately — they'll need to register again with the same mobile number. Their past loan applications and any linked customer/loan records are untouched.`)) return;
+  if(!window.confirm(`Remove ${borrower.name}'s app access (mobile ${borrower.mobile})? Important: this removes their record from this app, but does NOT delete their underlying login itself — that requires a separate manual step in Firebase Console (Authentication → Users → find and delete the matching entry). Until that's done too, this mobile number CANNOT be used to register again — Firebase will still say it's already registered. Their past loan applications and any linked customer/loan records are untouched either way.`)) return;
   await db.delete("borrowers", borrowerId);
-  await logAudit(u.name, u.role, "Borrower Account Removed", `${borrower.name} — ${borrower.mobile} — removed by ${u.name}`);
-  toast(`${borrower.name}'s account removed — they can register again now.`);
+  await logAudit(u.name, u.role, "Borrower Account Removed", `${borrower.name} — ${borrower.mobile} — removed by ${u.name} (Firestore record only — Firebase Auth login still needs manual deletion in Firebase Console)`);
+  toast(`${borrower.name}'s app record removed. To let them register again with this mobile number, also delete their login in Firebase Console → Authentication → Users.`);
   render();
 }
 
