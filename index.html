@@ -2031,7 +2031,9 @@ function renderNewLeadForm(products, dsaAgents){
         <div class="field"><label>Location</label><input id="nl-location" placeholder="Village/Town, District"></div>
         <div class="field"><label>Occupation / business</label><input id="nl-occupation" placeholder="e.g. Tailoring unit"></div>
         <div class="field"><label>Monthly income (₹)</label><input id="nl-income" type="number" placeholder="e.g. 18000"></div>
-        <div class="field"><label>Existing loan?</label><select id="nl-existing"><option value="No">No</option><option value="Yes">Yes</option></select></div>
+        <div class="field"><label>Existing loan?</label><select id="nl-existing"><option value="No">No</option><option value="Yes">Yes</option></select>
+          <div class="small muted" style="margin-top:4px;">This will also be independently verified against the applicant's credit bureau (CIBIL) report during appraisal — not just what's declared here.</div>
+        </div>
         <div class="field"><label>Product applied</label><select id="nl-product">${opts}</select></div>
         <div class="field"><label>Loan amount required (₹)</label><input id="nl-amount" type="number" placeholder="e.g. 100000"></div>
         <div class="field"><label>Loan purpose</label><input id="nl-purpose" placeholder="e.g. Purchase raw material"></div>
@@ -2191,6 +2193,11 @@ function renderCustomerForm(){
 async function renderCustomerDetail(c){
   if(!c) return `<div class="card">Customer not found.</div>`;
   const cfg = await getApiConfig();
+  const [allLoanAccounts, allSanctions] = await Promise.all([db.getAll("loanAccounts"), db.getAll("sanctions")]);
+  const custLoans = allLoanAccounts.filter(a=>a.customerId===c.id);
+  const custSanctions = allSanctions.filter(s=>s.customerId===c.id && s.status==="Approved" && !s.disbursementId);
+  const activeLoans = custLoans.filter(a=>a.status==="Active");
+  const totalOutstanding = activeLoans.reduce((s,a)=>s+a.principalOutstanding,0);
   const verifyRow = (key, label, resultField)=>{
     const result = c.kyc[resultField];
     const enabled = cfg[key+"Enabled"];
@@ -2208,7 +2215,23 @@ async function renderCustomerDetail(c){
         <button class="btn btn-outline btn-sm" id="btn-back-to-customers">← Back to list</button>
       </div>
       ${c.duplicateFlag ? `<div class="warn-banner">⚠ ${esc(c.duplicateReason)}</div>` : ""}
+      ${custLoans.length>0 || custSanctions.length>0 ? `
+      <h3 class="section-h">Existing Loan Accounts With Us</h3>
       <div class="grid grid-3">
+        <div class="kpi"><div class="lbl">Active Accounts</div><div class="val" style="font-size:18px;">${activeLoans.length}</div></div>
+        <div class="kpi"><div class="lbl">Total Outstanding</div><div class="val" style="font-size:18px;">${fmtINR(totalOutstanding)}</div></div>
+        <div class="kpi"><div class="lbl">Approved, Not Yet Disbursed</div><div class="val" style="font-size:18px;">${custSanctions.length}</div></div>
+      </div>
+      ${custLoans.length>0 ? `
+      <table>
+        <thead><tr><th>Account No.</th><th>Product</th><th>Principal</th><th>Outstanding</th><th>Status</th></tr></thead>
+        <tbody>
+        ${custLoans.map(a=>`<tr><td class="mono">${esc(a.accountNumber)||a.id}</td><td>${esc(a.product)}</td><td>${fmtINR(a.principal)}</td><td>${fmtINR(a.principalOutstanding)}</td><td>${a.status==='Active'?`<span class="badge badge-approved">Active</span>`:`<span class="badge badge-new">${esc(a.status)}</span>`}</td></tr>`).join("")}
+        </tbody>
+      </table>` : ""}
+      ${custSanctions.length>0 ? `<p class="small muted" style="margin-top:8px;">Plus ${custSanctions.length} sanction(s) approved but not yet disbursed — check Sanction &amp; Disbursement.</p>` : ""}
+      ` : `<p class="small muted">No loan accounts with us yet for this customer.</p>`}
+      <div class="grid grid-3" style="margin-top:10px;">
         <div><div class="field"><label>Mobile</label><div class="mono">${esc(c.personal.mobile)||"—"}</div></div></div>
         <div><div class="field"><label>DOB</label><div>${esc(c.personal.dob)||"—"}</div></div></div>
         <div><div class="field"><label>Gender / Marital</label><div>${esc(c.personal.gender)||"—"} / ${esc(c.personal.maritalStatus)||"—"}</div></div></div>
@@ -4946,13 +4969,17 @@ async function renderPayrollSection(){
 }
 
 async function renderDsaSection(){
-  const agents = await db.getAll("dsaAgents");
+  let agents = await db.getAll("dsaAgents");
+  // Backfill referral codes for DSAs created before this feature existed.
+  for(const a of agents){
+    if(!a.referralCode){ a.referralCode = await generateDsaReferralCode(a.name); await db.put("dsaAgents", a); }
+  }
   const commissions = await db.getAll("dsaCommissions");
   const showForm = session.showDsaForm;
   return `
     <div class="card">
       <div class="flex-between">
-        <div><h2 style="font-size:16px;">DSA Agents</h2><p class="sub" style="margin-bottom:0;">Commission % is set per product under Loan Products (Super Admin). Link a DSA to a lead when creating it, under "New Lead."</p></div>
+        <div><h2 style="font-size:16px;">DSA Agents</h2><p class="sub" style="margin-bottom:0;">Commission % is set per product under Loan Products (Super Admin). Link a DSA to a lead manually when staff create it ("New Lead"), or share their Referral Code below for self-service applicants to enter on the Borrower Portal — either way, commission accrues automatically on disbursement.</p></div>
         <button class="btn btn-gold btn-sm" id="btn-open-new-dsa">+ New DSA</button>
       </div>
       ${showForm ? `
@@ -4967,16 +4994,17 @@ async function renderDsaSection(){
       <button class="btn btn-gold btn-sm" id="btn-save-dsa">Save DSA</button>
       ` : ""}
       <table>
-        <thead><tr><th>Name</th><th>Mobile</th><th>Bank A/c</th><th>Accrued (Unpaid)</th><th></th></tr></thead>
+        <thead><tr><th>Name</th><th>Mobile</th><th>Referral Code</th><th>Bank A/c</th><th>Accrued (Unpaid)</th><th></th></tr></thead>
         <tbody>
-        ${agents.length===0 ? `<tr class="empty-row"><td colspan="5">No DSAs added yet.</td></tr>` :
+        ${agents.length===0 ? `<tr class="empty-row"><td colspan="6">No DSAs added yet.</td></tr>` :
           agents.map(d=>{
             const unpaid = commissions.filter(c=>c.dsaId===d.id && c.status==="Accrued").reduce((s,c)=>s+c.commissionAmount,0);
-            return `<tr><td>${esc(d.name)}</td><td class="mono">${esc(d.mobile)||"—"}</td><td class="mono">${esc(d.bankAccount)||"—"}</td><td>${fmtINR(unpaid)}</td>
+            return `<tr><td>${esc(d.name)}</td><td class="mono">${esc(d.mobile)||"—"}</td><td class="mono"><span class="badge badge-approved">${esc(d.referralCode)}</span></td><td class="mono">${esc(d.bankAccount)||"—"}</td><td>${fmtINR(unpaid)}</td>
               <td>${unpaid>0 ? `<button class="btn btn-outline btn-sm pay-dsa-btn" data-dsa="${d.id}">Pay Commissions</button>` : ""}</td></tr>`;
           }).join("")}
         </tbody>
       </table>
+      <p class="small muted" style="margin-top:8px;">Share a DSA's referral code with them directly — they pass it to the borrower, who enters it on the Borrower Portal's Apply form.</p>
     </div>
 
     <div class="card">
@@ -5306,7 +5334,9 @@ function renderApplyForm(products){
       <div class="field"><label>Monthly income (₹)</label><input id="ap-income" type="number" placeholder="e.g. 25000"></div>
       <div class="field"><label>Existing loan?</label>
         <select id="ap-existing"><option value="No">No</option><option value="Yes">Yes</option></select>
+        <div class="small muted" style="margin-top:4px;">We'll also independently check this against your credit bureau (CIBIL) report — please answer accurately, as this will be verified either way.</div>
       </div>
+      <div class="field"><label>Referral code (optional)</label><input id="ap-referral-code" placeholder="If someone referred you, enter their code" style="text-transform:uppercase;"></div>
     </div>
     <button class="btn btn-gold" id="btn-submit-application">Submit Application</button>
   </div>`;
@@ -7028,18 +7058,29 @@ async function handleRunPayroll(){
 /* ---------------------------------------------------------------------
    DSA handlers
    --------------------------------------------------------------------- */
+async function generateDsaReferralCode(name){
+  const existing = new Set((await db.getAll("dsaAgents")).map(d=>d.referralCode).filter(Boolean));
+  const base = (name||"DSA").replace(/[^a-zA-Z]/g,"").toUpperCase().slice(0,4).padEnd(4,"X");
+  let code;
+  do{
+    code = base + Math.floor(100+Math.random()*900);
+  } while(existing.has(code));
+  return code;
+}
+
 async function handleSaveDsaAgent(){
   const u = session.user;
   const name = document.getElementById("dsa-name").value.trim();
   if(!name){ toast("DSA name is required."); return; }
+  const referralCode = await generateDsaReferralCode(name);
   await db.put("dsaAgents", {
     id: uid("dsa"), name, mobile: document.getElementById("dsa-mobile").value.trim(),
     email: document.getElementById("dsa-email").value.trim(), bankAccount: document.getElementById("dsa-account").value.trim(),
-    bankIfsc: document.getElementById("dsa-ifsc").value.trim().toUpperCase(), active:true,
+    bankIfsc: document.getElementById("dsa-ifsc").value.trim().toUpperCase(), active:true, referralCode,
     createdAt: nowISO(), createdBy: u.name
   });
-  await logAudit(u.name, u.role, "DSA Agent Added", name);
-  toast("DSA saved.");
+  await logAudit(u.name, u.role, "DSA Agent Added", `${name} — referral code ${referralCode}`);
+  toast(`DSA saved. Referral code: ${referralCode}`);
   session.showDsaForm = false;
   render();
 }
@@ -8469,15 +8510,23 @@ async function handleSubmitApplication(){
   const occupation = document.getElementById("ap-occupation").value.trim();
   const income = Number(document.getElementById("ap-income").value);
   const existingLoan = document.getElementById("ap-existing").value;
+  const referralCodeInput = document.getElementById("ap-referral-code").value.trim().toUpperCase();
   if(!amountRequested || amountRequested<=0){ toast("Enter a valid loan amount."); return; }
+
+  let dsaId = null, source = "Mobile App / Website — Self Applied";
+  if(referralCodeInput){
+    const matchedDsa = (await db.getAll("dsaAgents")).find(d=>d.referralCode===referralCodeInput && d.active);
+    if(matchedDsa){ dsaId = matchedDsa.id; source = "DSA"; }
+  }
+
   const lead = {
     id: uid("led"), applicantName: u.name, mobile: u.mobile, aadhaar:"", pan:"", location: u.location||"", borrowerId: u.id,
     product, amountRequested, purpose, occupation, monthlyIncome: income||null,
-    existingLoan, source:"Mobile App / Website — Self Applied", status:"New", createdAt: nowISO(), customerId:null
+    existingLoan, source, dsaId, status:"New", createdAt: nowISO(), customerId:null
   };
   await db.put("leads", lead);
-  await logAudit(u.name, "Borrower", "Loan Application Submitted", `${product} — ${fmtINR(amountRequested)}`);
-  toast("Application submitted. You can track its status under My Applications.");
+  await logAudit(u.name, "Borrower", "Loan Application Submitted", `${product} — ${fmtINR(amountRequested)}${dsaId?" — via DSA referral":""}`);
+  toast(referralCodeInput && !dsaId ? "Application submitted — that referral code wasn't recognized, so it was submitted without one." : "Application submitted. You can track its status under My Applications.");
   session.borrowerTab = "status";
   render();
 }
@@ -8538,9 +8587,16 @@ async function checkDuplicateID(aadhaar, pan, excludeId){
   const pClean = (pan||"").trim().toUpperCase();
   const dupAadhaar = aClean && customers.find(c=> c.id!==excludeId && (c.kyc.aadhaar||"").replace(/\D/g,'')===aClean);
   const dupPan = pClean && customers.find(c=> c.id!==excludeId && (c.kyc.pan||"").trim().toUpperCase()===pClean);
-  if(dupAadhaar) return `Aadhaar already registered against customer "${dupAadhaar.personal.name}".`;
-  if(dupPan) return `PAN already registered against customer "${dupPan.personal.name}".`;
-  return null;
+  const dupCustomer = dupAadhaar || dupPan;
+  if(!dupCustomer) return null;
+  const matchedOn = dupAadhaar ? "Aadhaar" : "PAN";
+  const theirLoans = (await db.getAll("loanAccounts")).filter(a=>a.customerId===dupCustomer.id);
+  const theirActive = theirLoans.filter(a=>a.status==="Active");
+  const theirOutstanding = theirActive.reduce((s,a)=>s+a.principalOutstanding,0);
+  const loanNote = theirActive.length>0
+    ? ` This customer already has ${theirActive.length} active loan account(s) with us totaling ${fmtINR(theirOutstanding)} outstanding.`
+    : ` No active loan accounts found for them yet.`;
+  return `${matchedOn} already registered against customer "${dupCustomer.personal.name}".${loanNote}`;
 }
 
 async function handleSaveCustomer(){
