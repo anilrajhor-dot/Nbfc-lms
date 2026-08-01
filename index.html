@@ -3562,15 +3562,16 @@ async function renderAccountingTab(){
         <div class="field"><label>Category</label><select id="jf-category"></select></div>
         <div class="field"><label>Date</label><input id="jf-date" type="date" value="${todayStr()}"></div>
         <div class="field"><label>Amount (₹)</label><input id="jf-amount" type="number"></div>
+        <div class="field"><label>Mode of payment</label><select id="jf-mode">${COLLECTION_MODES.map(m=>`<option>${m}</option>`).join("")}</select></div>
         <div class="field"><label>Fund account</label><select id="jf-account">${fundAccounts.map(a=>`<option value="${a.id}">${esc(a.name)} — Balance ${fmtINR(a.balance)}</option>`).join("")}</select></div>
         <div class="field"><label>Description (optional)</label><input id="jf-description" placeholder="e.g. July office rent"></div>
       </div>
       <button class="btn btn-gold btn-sm" id="btn-save-journal">Record Entry</button>
       <div class="divider"></div>
       <table>
-        <thead><tr><th>Date</th><th>Type</th><th>Category</th><th>Description</th><th>Amount</th><th>Fund Account</th><th>Status</th><th></th></tr></thead>
+        <thead><tr><th>Date</th><th>Type</th><th>Category</th><th>Description</th><th>Amount</th><th>Mode</th><th>Fund Account</th><th>Status</th><th></th></tr></thead>
         <tbody>
-        ${journalSorted.length===0 ? `<tr class="empty-row"><td colspan="8">No journal entries yet.</td></tr>` :
+        ${journalSorted.length===0 ? `<tr class="empty-row"><td colspan="9">No journal entries yet.</td></tr>` :
           journalSorted.map(j=>{
             const status = j.status || "Posted";
             let statusBadgeHtml = status==="Posted" ? `<span class="badge badge-approved">Posted</span>` : status==="Rejected" ? `<span class="badge badge-rejected">Rejected</span>` : `<span class="badge badge-progress">Pending Approval</span>`;
@@ -3586,7 +3587,7 @@ async function renderAccountingTab(){
                 actions = `<span class="small muted">Awaiting a different officer</span>`;
               }
             }
-            return `<tr><td>${esc(j.date)}</td><td>${j.type==='Income'?`<span class="badge badge-approved">Income</span>`:`<span class="badge badge-rejected">Expense</span>`}</td><td>${esc(j.category)}</td><td>${esc(j.description)||"—"}</td><td>${fmtINR(j.amount)}</td><td>${esc(j.fundAccountName)}</td><td>${statusBadgeHtml}</td><td>${actions}</td></tr>`;
+            return `<tr><td>${esc(j.date)}</td><td>${j.type==='Income'?`<span class="badge badge-approved">Income</span>`:`<span class="badge badge-rejected">Expense</span>`}</td><td>${esc(j.category)}</td><td>${esc(j.description)||"—"}</td><td>${fmtINR(j.amount)}</td><td>${esc(j.mode)||"—"}</td><td>${esc(j.fundAccountName)}</td><td>${statusBadgeHtml}</td><td>${actions}</td></tr>`;
           }).join("")}
         </tbody>
       </table>
@@ -6888,6 +6889,7 @@ async function handleSaveJournalEntry(){
   const category = document.getElementById("jf-category").value;
   const date = document.getElementById("jf-date").value;
   const amount = Number(document.getElementById("jf-amount").value);
+  const mode = document.getElementById("jf-mode").value;
   const fundAccountId = document.getElementById("jf-account").value;
   const description = document.getElementById("jf-description").value.trim();
   if(!amount || amount<=0){ toast("Enter a valid amount."); return; }
@@ -6900,7 +6902,7 @@ async function handleSaveJournalEntry(){
   const withinOwnLimit = u.role==="Super Admin" || amount <= ownLimit;
 
   const entry = {
-    id: uid("jnl"), type, category, date, amount, description,
+    id: uid("jnl"), type, category, date, amount, mode, description,
     fundAccountId, fundAccountName: fundAccount.name, createdAt: nowISO(), createdBy: u.name,
     proposedBy: u.name, proposedByRole: u.role,
     status: withinOwnLimit ? "Posted" : "Pending Approval",
