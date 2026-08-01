@@ -8397,8 +8397,15 @@ async function handleSetupAdmin(){
   if(!name || !username || !password){ toast("Please fill in all fields."); return; }
   if(password.length<6){ toast("Password must be at least 6 characters."); return; }
   toast("Creating your account…");
+  let cred = null;
   try{
-    const cred = await firebase.auth().createUserWithEmailAndPassword(staffAuthEmail(username), password);
+    cred = await firebase.auth().createUserWithEmailAndPassword(staffAuthEmail(username), password);
+  } catch(err){
+    console.error(err);
+    toast(friendlyAuthError(err));
+    return;
+  }
+  try{
     const newUid = cred.user.uid;
     const staffRec = { id: newUid, name, username, role:"Super Admin", branch:"Head Office", createdAt: nowISO(), createdBy:"self-setup" };
     await db.put("staff", staffRec);
@@ -8411,7 +8418,8 @@ async function handleSetupAdmin(){
     render();
   } catch(err){
     console.error(err);
-    toast(friendlyAuthError(err));
+    try{ await cred.user.delete(); } catch(cleanupErr){ console.error("Rollback also failed:", cleanupErr); }
+    toast("Something went wrong saving your account — please try again.");
   }
 }
 
@@ -8457,8 +8465,15 @@ async function handleBorrowerRegister(){
   if(!/^\d{10}$/.test(mobile)){ toast("Enter a valid 10-digit mobile number."); return; }
   if(password.length<6){ toast("Password must be at least 6 characters."); return; }
   toast("Creating your account…");
+  let cred = null;
   try{
-    const cred = await firebase.auth().createUserWithEmailAndPassword(borrowerAuthEmail(mobile), password);
+    cred = await firebase.auth().createUserWithEmailAndPassword(borrowerAuthEmail(mobile), password);
+  } catch(err){
+    console.error(err);
+    toast(friendlyAuthError(err));
+    return;
+  }
+  try{
     const rec = { id: cred.user.uid, name, mobile, location, createdAt: nowISO() };
     await db.put("borrowers", rec);
     await logAudit(name, "Borrower", "Self-Registered", "Mobile: "+mobile);
@@ -8468,7 +8483,11 @@ async function handleBorrowerRegister(){
     render();
   } catch(err){
     console.error(err);
-    toast(friendlyAuthError(err));
+    // The Auth account exists but the database record didn't save —
+    // roll back the Auth account too, rather than leaving a stuck,
+    // invisible account behind that blocks this mobile number forever.
+    try{ await cred.user.delete(); } catch(cleanupErr){ console.error("Rollback also failed:", cleanupErr); }
+    toast("Something went wrong saving your details — please try registering again. (If this keeps happening, contact your branch.)");
   }
 }
 
@@ -8536,18 +8555,30 @@ async function handleAddStaff(){
   // Super Admin out mid-session. A throwaway secondary app instance keeps
   // the new account creation isolated from the admin's own session.
   const secondaryApp = firebase.initializeApp(FIREBASE_CONFIG, "Secondary-"+Date.now());
+  let cred = null;
   try{
-    const cred = await secondaryApp.auth().createUserWithEmailAndPassword(staffAuthEmail(username), password);
-    const newUid = cred.user.uid;
-    await secondaryApp.auth().signOut();
-    const rec = { id: newUid, name, username, role, branch, createdAt: nowISO(), createdBy: session.user.name };
+    cred = await secondaryApp.auth().createUserWithEmailAndPassword(staffAuthEmail(username), password);
+  } catch(err){
+    console.error(err);
+    toast(friendlyAuthError(err));
+    await secondaryApp.delete();
+    return;
+  }
+  try{
+    const rec = { id: cred.user.uid, name, username, role, branch, createdAt: nowISO(), createdBy: session.user.name };
     await db.put("staff", rec);
+    await secondaryApp.auth().signOut();
     await logAudit(session.user.name, session.user.role, "Staff User Created", `${name} (${role}) — maker: ${session.user.name}`);
     toast("User created: "+name);
     render();
   } catch(err){
     console.error(err);
-    toast(friendlyAuthError(err));
+    // The Auth account exists but the database record didn't save —
+    // roll back the Auth account too (must do this before signing out
+    // of the secondary instance, since deleting requires being signed
+    // in as that user), rather than leaving a stuck, invisible account.
+    try{ await cred.user.delete(); } catch(cleanupErr){ console.error("Rollback also failed:", cleanupErr); }
+    toast("Something went wrong saving this user — please try again.");
   } finally {
     await secondaryApp.delete();
   }
