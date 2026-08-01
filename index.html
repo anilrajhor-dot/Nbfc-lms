@@ -1473,7 +1473,7 @@ async function ensureSeedPhase3(){
   const products = defaultProducts();
   for(const p of products){ await db.put("products", p); }
   await db.put("policyConfig", defaultPolicyConfig());
-  await db.put("meta", {key:"seededPhase3", value:true});
+  await db.put("meta", {id:"seededPhase3", key:"seededPhase3", value:true});
   await logAudit("System", "System", "Policy & Products Seeded", "Default product catalogue and Credit Policy Engine configuration created");
 }
 
@@ -1484,7 +1484,7 @@ async function ensureSeedPhase4(){
     id: uid("fnd"), name:"Head Office Operating Account", type:"Capital",
     balance: 5000000, createdAt: nowISO(), createdBy:"system"
   });
-  await db.put("meta", {key:"seededPhase4", value:true});
+  await db.put("meta", {id:"seededPhase4", key:"seededPhase4", value:true});
   await logAudit("System", "System", "Fund Source Seeded", "Demo opening balance of ₹50,00,000 created — replace with actual capital/bank figures before real use");
 }
 
@@ -1499,7 +1499,7 @@ async function ensureSeedCompliance(){
       notes:"", updatedBy:null, updatedAt:null, createdAt: nowISO()
     });
   }
-  await db.put("meta", {key:"seededCompliance", value:true});
+  await db.put("meta", {id:"seededCompliance", key:"seededCompliance", value:true});
   await logAudit("System", "System", "Compliance Checklist Seeded", `${DEFAULT_COMPLIANCE_ITEMS.length} default items checked/created — a self-tracking checklist, not a regulatory filing system`);
 }
 
@@ -1514,7 +1514,7 @@ async function ensureSeedYearEndClosing(){
       notes:"", updatedBy:null, updatedAt:null, createdAt: nowISO()
     });
   }
-  await db.put("meta", {key:"seededYearEndClosing", value:true});
+  await db.put("meta", {id:"seededYearEndClosing", key:"seededYearEndClosing", value:true});
   await logAudit("System", "System", "Year-End Closing Checklist Seeded", `${YEAR_END_CLOSING_ITEMS.length} post-audit closing items checked/created`);
 }
 
@@ -1529,7 +1529,7 @@ async function ensureSeedMicroEnterpriseTemplates(){
       id: uid("met"), ...t, monthlyProfit, createdAt: nowISO(), createdBy:"system"
     });
   }
-  await db.put("meta", {key:"seededMicroEnterprise", value:true});
+  await db.put("meta", {id:"seededMicroEnterprise", key:"seededMicroEnterprise", value:true});
   await logAudit("System", "System", "Micro Enterprise Templates Seeded", `${DEFAULT_MICRO_ENTERPRISE_TEMPLATES.length} illustrative business-type reference templates checked/created`);
 }
 
@@ -2958,13 +2958,23 @@ async function renderFundsTab(){
         <div><h2>Fund Sources</h2><p class="sub">Capital, bank accounts, borrowings and investments that make up your funding base.</p></div>
         <button class="btn btn-gold btn-sm" id="btn-open-new-fund">+ Add Fund Source</button>
       </div>
+      ${(()=>{
+        const nameTypeCounts = {};
+        fundPos.accounts.forEach(a=>{ const k=a.name+"||"+a.type; nameTypeCounts[k]=(nameTypeCounts[k]||0)+1; });
+        const hasDupes = Object.values(nameTypeCounts).some(c=>c>1);
+        return hasDupes ? `<div class="warn-banner" style="background:#FBE7E8;border-color:var(--danger);color:#7A1F27;">⚠ Some fund sources share the same name and type — flagged "Possible Duplicate" below. Because real balances are involved, this isn't auto-merged: check each one's history, manually move balances into a single account via "Adjust Balance" if they should be one account, then delete the emptied duplicate under Data Management once you're sure.</div>` : "";
+      })()}
       <div id="new-fund-form-box"></div>
       <table>
         <thead><tr><th>Name</th><th>Type</th><th>Balance</th><th></th></tr></thead>
         <tbody>
         ${fundPos.accounts.length===0 ? `<tr class="empty-row"><td colspan="4">No fund sources yet.</td></tr>` :
-          fundPos.accounts.map(a=>`<tr><td>${esc(a.name)}</td><td>${esc(a.type)}</td><td>${fmtINR(a.balance)}</td>
-            <td><button class="btn btn-outline btn-sm adjust-fund-btn" data-fund="${a.id}">Adjust Balance</button></td></tr>`).join("")}
+          (()=>{
+            const nameTypeCounts = {};
+            fundPos.accounts.forEach(a=>{ const k=a.name+"||"+a.type; nameTypeCounts[k]=(nameTypeCounts[k]||0)+1; });
+            return fundPos.accounts.map(a=>`<tr><td>${esc(a.name)}${nameTypeCounts[a.name+"||"+a.type]>1?` <span class="badge badge-rejected">Possible Duplicate</span>`:''}</td><td>${esc(a.type)}</td><td>${fmtINR(a.balance)}</td>
+            <td><button class="btn btn-outline btn-sm adjust-fund-btn" data-fund="${a.id}">Adjust Balance</button></td></tr>`).join("");
+          })()}
         </tbody>
       </table>
     </div>
@@ -7254,7 +7264,7 @@ async function handleSaveOnboardingFund(){
 
 async function handleFinishOnboarding(){
   const u = session.user;
-  await db.put("meta", {key:"onboardingComplete", value:true});
+  await db.put("meta", {id:"onboardingComplete", key:"onboardingComplete", value:true});
   await logAudit(u.name, u.role, "Onboarding Completed", "");
   session.staffTab = "dashboard";
   render();
@@ -7534,7 +7544,7 @@ async function handleSetupAdmin(){
     const newUid = cred.user.uid;
     const staffRec = { id: newUid, name, username, role:"Super Admin", branch:"Head Office", createdAt: nowISO(), createdBy:"self-setup" };
     await db.put("staff", staffRec);
-    await db.put("meta", { key:"setupStatus", initialized:true });
+    await db.put("meta", {id:"setupStatus", key:"setupStatus", initialized:true});
     await logAudit(name, "Super Admin", "Account Created", "First-run Super Admin setup — real Firebase Auth account");
     session = {type:"staff", user: staffRec};
     await logAudit(name, "Super Admin", "Login", "");
