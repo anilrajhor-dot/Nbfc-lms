@@ -495,6 +495,74 @@ async function computeAccountingSummary(){
   };
 }
 
+/* ---------------------------------------------------------------------
+   Bank Reconciliation — upload a CSV of your NBFC's actual bank
+   statement and auto-match it against transactions the app itself
+   recorded against that fund account (disbursements, EMI collections,
+   journal entries). There's no live bank-fetch here — that needs a real
+   banking API/Account Aggregator connection on your bank's side — this
+   is the practical upload-and-match version.
+   --------------------------------------------------------------------- */
+async function getReconcilableTransactions(fundAccountId){
+  const disbursements = (await db.getAll("disbursements")).filter(d=>d.fundAccountId===fundAccountId);
+  const payments = (await db.getAll("payments")).filter(p=>p.fundAccountId===fundAccountId);
+  const journalEntries = (await db.getAll("journalEntries")).filter(j=>j.fundAccountId===fundAccountId && (!j.status || j.status==="Posted"));
+  const txns = [];
+  disbursements.forEach(d=> txns.push({ id:d.id, type:"Disbursement", date:d.date, amount:-d.amount, description:"Loan Disbursement — "+d.id }));
+  payments.forEach(p=> txns.push({ id:p.id, type:"Payment", date:p.date, amount:p.amount, description:"EMI Collection — "+p.id }));
+  journalEntries.forEach(j=> txns.push({ id:j.id, type:"Journal", date:j.date, amount: j.type==="Income"?j.amount:-j.amount, description:j.category+(j.description?" — "+j.description:"") }));
+  return txns;
+}
+
+function parseStatementCsv(text){
+  const lines = text.split(/\r?\n/).filter(l=>l.trim());
+  if(lines.length<2) return [];
+  const header = lines[0].split(",").map(h=>h.trim().toLowerCase());
+  const idx = (names)=> header.findIndex(h=>names.includes(h));
+  const dateIdx = idx(["date"]);
+  const descIdx = idx(["description","narration","particulars"]);
+  const debitIdx = idx(["debit","withdrawal","dr"]);
+  const creditIdx = idx(["credit","deposit","cr"]);
+  const amountIdx = idx(["amount"]);
+  const rows = [];
+  for(let i=1;i<lines.length;i++){
+    const cols = lines[i].split(",").map(c=>c.trim());
+    const date = dateIdx>=0 ? cols[dateIdx] : "";
+    const description = descIdx>=0 ? cols[descIdx] : "";
+    let amount;
+    if(debitIdx>=0 && creditIdx>=0){
+      const debit = Number(cols[debitIdx])||0, credit = Number(cols[creditIdx])||0;
+      amount = credit - debit;
+    } else if(amountIdx>=0){
+      amount = Number(cols[amountIdx])||0;
+    } else continue;
+    if(!date) continue;
+    rows.push({ date, description, amount });
+  }
+  return rows;
+}
+
+async function reconcileStatementLines(fundAccountId, parsedRows, batchId){
+  const txns = await getReconcilableTransactions(fundAccountId);
+  const existingLines = await db.getAll("bankStatementLines");
+  const alreadyMatchedIds = new Set(existingLines.filter(l=>l.matched).map(l=>l.matchedId));
+  const lines = [];
+  for(const row of parsedRows){
+    const match = txns.find(t=>
+      !alreadyMatchedIds.has(t.id) &&
+      Math.abs(new Date(t.date)-new Date(row.date)) <= 2*24*60*60*1000 &&
+      Math.abs(Math.abs(t.amount)-Math.abs(row.amount)) < 1
+    );
+    if(match) alreadyMatchedIds.add(match.id);
+    lines.push({
+      id: uid("bsl"), fundAccountId, date: row.date, description: row.description, amount: row.amount,
+      matched: !!match, matchedType: match?match.type:null, matchedId: match?match.id:null,
+      batchId, uploadedAt: nowISO()
+    });
+  }
+  return lines;
+}
+
 function downloadCSV(filename, headers, rows){
   const esc2 = (v)=> { const s = (v===null||v===undefined) ? "" : String(v); return /[",\n]/.test(s) ? '"'+s.replace(/"/g,'""')+'"' : s; };
   const lines = [headers.map(esc2).join(","), ...rows.map(r=>r.map(esc2).join(","))];
@@ -520,9 +588,10 @@ function downloadJSON(filename, obj){
 const ALL_COLLECTIONS = [
   "staff","borrowers","leads","customers","products","appraisals","policyConfig",
   "fundAccounts","sanctions","disbursements","loanAccounts","payments","reminders",
-  "recoveryVisits","apiConfig","nbfcProfile","journalEntries","complianceItems","rbiReturnFilings",
+  "recoveryVisits","apiConfig","aiConfig","nbfcProfile","journalEntries","complianceItems","rbiReturnFilings",
   "staffSalaries","payrollRuns","dsaAgents","dsaCommissions",
   "shgGroups","shgMembers","shgSavings","shgInternalLoans","microEnterpriseTemplates",
+  "bankStatementLines",
   "auditLog","meta"
 ];
 
@@ -655,6 +724,7 @@ const VERIFICATION_SERVICES = [
   {key:"whatsapp",   label:"WhatsApp Messaging",           defaultEndpoint:"/api/v1/whatsapp/send"},
   {key:"email",      label:"Email Messaging",              defaultEndpoint:"/api/v1/email/send"},
   {key:"payout",     label:"Bank Payout / Disbursement (RazorpayX, Cashfree Payouts, Decentro, etc.)", defaultEndpoint:"/api/v1/payout/transfer"},
+  {key:"accountAggregator", label:"Account Aggregator Consent (Setu, Anumati, CAMS Finserv, OneMoney, etc.)", defaultEndpoint:"/api/v1/aa/consent"},
 ];
 
 const STAFF_HELP = [
@@ -718,6 +788,12 @@ const STAFF_HELP = [
     {q:"How do I back up my data?", a:"Data Management tab (Super Admin) → \"Download Full Backup (JSON)\" — every collection in one file. \"Restore from File\" merges a backup back in; per-collection \"Clear\" requires typing DELETE to confirm."},
     {q:"Where do I set up the NBFC's official details?", a:"NBFC Profile tab (Super Admin) — Name, Address, RBI Registration Number, CIN, GST, PAN, TAN. Once filled in, it appears as a letterhead at the top of every printed Sanction Letter."},
   ]},
+  {section:"Bank Reconciliation, AI Provider & Financial Documents", items:[
+    {q:"Does Bank Reconciliation fetch my statement automatically?", a:"No — you upload a CSV export from your bank, and the app matches each line against what it itself recorded (disbursements, collections, journal entries) by date and amount. A live automatic fetch would need a real banking API or Account Aggregator connection on your bank's side."},
+    {q:"What CSV format does the bank statement need?", a:"Any order of columns, but it needs a Date column, a Description column, and either separate Debit/Credit columns or one Amount column. Dates in YYYY-MM-DD work best."},
+    {q:"How do I make AI features work outside Claude.ai?", a:"Integrations tab → AI Provider. Point it at a small server-side proxy you control (Cloudflare Worker, Firebase Function, etc.) that holds your API key and forwards requests in the same shape as Anthropic's /v1/messages endpoint. Without one configured, AI features only work while this file runs inside Claude.ai."},
+    {q:"Why can't the app just log into a customer's Income Tax or bank portal directly?", a:"Storing someone's government/banking passwords would violate the Terms of Service of those portals and create a serious security liability. The proper channel is the RBI-sanctioned Account Aggregator framework, or asking the applicant to upload their ITR/GST/bank statement as a document — both are what's built here."},
+  ]},
 ];
 
 const BORROWER_HELP = [
@@ -735,6 +811,61 @@ function defaultApiConfig(){
 
 async function getApiConfig(){
   return (await db.get("apiConfig","default")) || defaultApiConfig();
+}
+
+/* ---------------------------------------------------------------------
+   AI Provider — lets AI features work outside Claude.ai's runtime.
+   ---------------------------------------------------------------------
+   Browsers can't call api.anthropic.com directly with an embedded key
+   from a standalone-hosted page (no CORS allowance, and exposing a raw
+   key in client code is unsafe regardless). The real fix is a small
+   server-side proxy you control — a Cloudflare Worker, Firebase Cloud
+   Function, or any tiny backend — that holds your Anthropic (or other
+   LLM) API key and forwards requests. Point baseUrl at that proxy.
+   If nothing is configured, this falls back to the direct Claude.ai
+   artifact call, which only works while this file runs inside Claude.ai.
+   --------------------------------------------------------------------- */
+function defaultAiConfig(){
+  return { id:"default", enabled:false, baseUrl:"", apiKey:"", model:"claude-sonnet-4-6", updatedAt:null, updatedBy:null };
+}
+async function getAiConfig(){
+  return (await db.get("aiConfig","default")) || defaultAiConfig();
+}
+
+/** Sends a chat-style message list and returns {ok, text, source, error}.
+ *  Tries the configured custom AI provider first (expects the same
+ *  request/response shape as Anthropic's /v1/messages — your proxy
+ *  should accept that shape and forward it), then falls back to the
+ *  direct in-artifact Claude call. */
+async function callAiChat(messages, maxTokens){
+  const cfg = await getAiConfig();
+  if(cfg.enabled && cfg.baseUrl){
+    try{
+      const response = await fetch(cfg.baseUrl.replace(/\/$/,""), {
+        method:"POST",
+        headers:{ "Content-Type":"application/json", ...(cfg.apiKey ? {"Authorization":"Bearer "+cfg.apiKey} : {}) },
+        body: JSON.stringify({ model: cfg.model||"claude-sonnet-4-6", max_tokens: maxTokens||800, messages })
+      });
+      const data = await response.json();
+      const text = (data.content||[]).filter(b=>b.type==="text").map(b=>b.text).join("\n");
+      if(text) return { ok:true, text, source:"custom" };
+      return { ok:false, text:"", source:"custom", error:"Custom AI provider returned no text." };
+    } catch(err){
+      return { ok:false, text:"", source:"custom", error:"Custom AI provider unreachable — check the URL under Integrations." };
+    }
+  }
+  try{
+    const response = await fetch("https://api.anthropic.com/v1/messages", {
+      method:"POST", headers:{ "Content-Type":"application/json" },
+      body: JSON.stringify({ model:"claude-sonnet-4-6", max_tokens: maxTokens||800, messages })
+    });
+    const data = await response.json();
+    const text = (data.content||[]).filter(b=>b.type==="text").map(b=>b.text).join("\n");
+    if(text) return { ok:true, text, source:"claude-artifact" };
+    return { ok:false, text:"", source:"claude-artifact", error:"No response — this only works inside Claude.ai's artifact runtime, or with a custom AI provider configured under Integrations." };
+  } catch(err){
+    return { ok:false, text:"", source:"claude-artifact", error:"Couldn't reach an AI service. Configure a custom provider under Integrations to use AI features outside Claude.ai." };
+  }
 }
 
 function defaultNbfcProfile(){
@@ -1485,6 +1616,8 @@ async function renderStaffShell(){
     tabContent = await renderFundsTab();
   } else if(tab === "accounting" && canManageFunds){
     tabContent = await renderAccountingTab();
+  } else if(tab === "bankrecon" && canManageFunds){
+    tabContent = await renderBankReconTab();
   } else if(tab === "payrolldsa" && canManageFunds){
     tabContent = await renderPayrollDsaTab();
   } else if(tab === "shgrural"){
@@ -1561,6 +1694,7 @@ async function renderStaffShell(){
         <button class="tab ${tab==='reminders'?'active':''}" data-tab="reminders">Reminders</button>
         ${canManageFunds ? `<button class="tab ${tab==='funds'?'active':''}" data-tab="funds">Fund Management</button>`:""}
         ${canManageFunds ? `<button class="tab ${tab==='accounting'?'active':''}" data-tab="accounting">Accounting</button>`:""}
+        ${canManageFunds ? `<button class="tab ${tab==='bankrecon'?'active':''}" data-tab="bankrecon">Bank Reconciliation</button>`:""}
         ${canManageFunds ? `<button class="tab ${tab==='payrolldsa'?'active':''}" data-tab="payrolldsa">Payroll &amp; DSA</button>`:""}
         <button class="tab ${tab==='shgrural'?'active':''}" data-tab="shgrural">SHG / Rural Finance</button>
         <button class="tab ${tab==='emicalc'?'active':''}" data-tab="emicalc">EMI Calculator</button>
@@ -1920,6 +2054,38 @@ async function renderCustomerDetail(c){
         ${c.kyc.gpsLat ? `<div class="kyc-upload-box"><div class="small">GPS Location</div><div class="mono small" style="margin-top:8px;">${c.kyc.gpsLat.toFixed(5)}, ${c.kyc.gpsLng.toFixed(5)}</div></div>` : ""}
       </div>
       <p class="small muted" style="margin-top:14px;">Created ${fmtDate(c.createdAt)} by ${esc(c.createdBy)}</p>
+      <h3 class="section-h">Financial Document Verification</h3>
+      <p class="small muted">No credentials are ever stored here — documents only, uploaded by the applicant or staff, or fetched via a consented Account Aggregator connection once one is configured.</p>
+      <div class="grid grid-2">
+        <div class="field"><label>Account Aggregator consent</label>
+          <div>${c.aaConsentStatus ? `<span class="badge ${c.aaConsentStatus==='Granted'?'badge-approved':'badge-progress'}">${esc(c.aaConsentStatus)}</span>` : `<span class="badge badge-new">Not Requested</span>`}
+          <button class="btn btn-outline btn-sm request-aa-btn" data-customer="${c.id}" style="margin-left:8px;" ${cfg.accountAggregatorEnabled?'':'disabled'}>${cfg.accountAggregatorEnabled?'Request Consent':'Not Configured'}</button></div>
+        </div>
+      </div>
+      <div class="kyc-upload-row" style="margin-top:10px;">
+        <div class="kyc-upload-box">
+          <div class="small">ITR Acknowledgment</div>
+          ${c.financialDocs?.itrDocBase64 ? `<img src="${c.financialDocs.itrDocBase64}" style="display:block;">` : ""}
+          <input type="file" accept="image/*,application/pdf" class="findoc-file-input" data-customer="${c.id}" data-doc="itrDocBase64">
+          <button class="btn btn-outline btn-sm auto-read-itr-btn" data-customer="${c.id}" style="margin-top:6px; width:100%;">Auto-read ITR Income</button>
+          ${c.financialDocs?.itrDeclaredIncome ? `<div class="small" style="margin-top:6px;">ITR shows: <b>${fmtINR(c.financialDocs.itrDeclaredIncome)}</b>/yr${c.income.annual ? ` — declared: ${fmtINR(c.income.annual)}/yr — ${Math.abs(c.financialDocs.itrDeclaredIncome-c.income.annual) > c.income.annual*0.2 ? '<span class="badge badge-rejected">Mismatch &gt;20%</span>' : '<span class="badge badge-approved">Consistent</span>'}` : ''}</div>` : ""}
+        </div>
+        <div class="kyc-upload-box">
+          <div class="small">GST Returns</div>
+          ${c.financialDocs?.gstDocBase64 ? `<img src="${c.financialDocs.gstDocBase64}" style="display:block;">` : ""}
+          <input type="file" accept="image/*,application/pdf" class="findoc-file-input" data-customer="${c.id}" data-doc="gstDocBase64">
+        </div>
+        <div class="kyc-upload-box">
+          <div class="small">Bank Statement</div>
+          ${c.financialDocs?.bankStmtDocBase64 ? `<img src="${c.financialDocs.bankStmtDocBase64}" style="display:block;">` : ""}
+          <input type="file" accept="image/*,application/pdf" class="findoc-file-input" data-customer="${c.id}" data-doc="bankStmtDocBase64">
+        </div>
+        <div class="kyc-upload-box">
+          <div class="small">Company Financial Statements</div>
+          ${c.financialDocs?.companyFinDocBase64 ? `<img src="${c.financialDocs.companyFinDocBase64}" style="display:block;">` : ""}
+          <input type="file" accept="image/*,application/pdf" class="findoc-file-input" data-customer="${c.id}" data-doc="companyFinDocBase64">
+        </div>
+      </div>
     </div>
   `;
 }
@@ -2546,6 +2712,59 @@ async function renderSanctionLetter(sanction, customers, products){
 /* ---------------------------------------------------------------------
    Fund Management tab (Phase 4)
    --------------------------------------------------------------------- */
+/* ---------------------------------------------------------------------
+   Bank Reconciliation tab
+   --------------------------------------------------------------------- */
+async function renderBankReconTab(){
+  const fundAccounts = await db.getAll("fundAccounts");
+  const selectedAccountId = session.reconFundAccountId || (fundAccounts[0] && fundAccounts[0].id);
+  const lines = selectedAccountId ? (await db.getAll("bankStatementLines")).filter(l=>l.fundAccountId===selectedAccountId).sort((a,b)=>new Date(b.date)-new Date(a.date)) : [];
+  const matchedCount = lines.filter(l=>l.matched).length;
+  const txns = selectedAccountId ? await getReconcilableTransactions(selectedAccountId) : [];
+  const matchedTxnIds = new Set(lines.filter(l=>l.matched).map(l=>l.matchedId));
+  const unmatchedTxns = txns.filter(t=>!matchedTxnIds.has(t.id));
+
+  return `
+    <div class="card">
+      <h2>Bank Reconciliation</h2>
+      <p class="sub">Upload your NBFC's actual bank statement as a CSV and it's auto-matched against what the app itself recorded for that account (disbursements, EMI collections, journal entries). There's no live bank-fetch here — that would need a real banking API or Account Aggregator connection on your bank's side, which I can help design once you have one.</p>
+      <div class="grid grid-2">
+        <div class="field"><label>Fund account</label><select id="recon-account">${fundAccounts.map(a=>`<option value="${a.id}" ${a.id===selectedAccountId?'selected':''}>${esc(a.name)} — Balance ${fmtINR(a.balance)}</option>`).join("")}</select></div>
+        <div class="field"><label>Statement CSV</label><input type="file" id="recon-file-input" accept=".csv,text/csv"></div>
+      </div>
+      <p class="small muted">Expected columns (any order): <span class="mono">Date</span>, <span class="mono">Description</span>, and either <span class="mono">Debit</span>/<span class="mono">Credit</span> or a single <span class="mono">Amount</span> column. Dates should be in YYYY-MM-DD format.</p>
+      <button class="btn btn-gold btn-sm" id="btn-upload-statement">Upload &amp; Reconcile</button>
+    </div>
+
+    <div class="card">
+      <div class="flex-between">
+        <h2 style="font-size:16px;">Statement Lines</h2>
+        <span class="badge ${matchedCount===lines.length && lines.length>0 ? 'badge-approved':'badge-progress'}">${matchedCount}/${lines.length} Matched</span>
+      </div>
+      <table>
+        <thead><tr><th>Date</th><th>Description</th><th>Amount</th><th>Status</th><th></th></tr></thead>
+        <tbody>
+        ${lines.length===0 ? `<tr class="empty-row"><td colspan="5">No statement uploaded for this account yet.</td></tr>` :
+          lines.map(l=>`
+          <tr>
+            <td>${esc(l.date)}</td><td>${esc(l.description)}</td><td>${l.amount<0?'−':''}${fmtINR(Math.abs(l.amount))}</td>
+            <td>${l.matched?`<span class="badge badge-approved">Matched — ${esc(l.matchedType)}</span>`:`<span class="badge badge-rejected">Unmatched</span>`}</td>
+            <td>${!l.matched ? `
+              <div class="action-row">
+                <select class="manual-match-select" data-line="${l.id}" style="padding:5px 8px; border-radius:6px; border:1px solid var(--line); font-size:12px;">
+                  <option value="">— Link to —</option>
+                  ${unmatchedTxns.map(t=>`<option value="${t.id}" data-type="${t.type}">${esc(t.type)}: ${esc(t.description)} (${fmtINR(Math.abs(t.amount))})</option>`).join("")}
+                </select>
+                <button class="btn btn-outline btn-sm mark-no-record-btn" data-line="${l.id}">No System Record</button>
+              </div>` : ""}
+            </td>
+          </tr>`).join("")}
+        </tbody>
+      </table>
+    </div>
+  `;
+}
+
 async function renderFundsTab(){
   const fundPos = await computeFundPosition();
   const disbursements = await db.getAll("disbursements");
@@ -3689,10 +3908,22 @@ function renderAiAssistant(){
    --------------------------------------------------------------------- */
 async function renderApiConfigTab(){
   const cfg = await getApiConfig();
+  const aiCfg = await getAiConfig();
   return `
     <div class="card">
+      <h2>AI Provider</h2>
+      <p class="sub">The AI Assistant, AI Advisor, floating help, and Auto-read ID all call Claude directly by default — which only works while this file runs inside Claude.ai. To make AI features work on your own hosted site (e.g. GitHub Pages), point this at a small server-side proxy you control (a Cloudflare Worker, Firebase Cloud Function, or any tiny backend) that holds your Anthropic API key and forwards the request — browsers can't safely call api.anthropic.com directly with an embedded key. Your proxy should accept and return the same JSON shape as Anthropic's <span class="mono">/v1/messages</span> endpoint.</p>
+      <div class="grid grid-3">
+        <div class="field"><label>Enable custom provider</label><select id="ai-enabled"><option value="false" ${!aiCfg.enabled?'selected':''}>Off — use Claude.ai directly</option><option value="true" ${aiCfg.enabled?'selected':''}>On — use my proxy</option></select></div>
+        <div class="field"><label>Proxy URL</label><input id="ai-baseurl" value="${esc(aiCfg.baseUrl)}" placeholder="https://your-proxy.example.com/chat"></div>
+        <div class="field"><label>API Key (sent to your proxy, not to Anthropic directly)</label><input id="ai-key" type="password" value="${esc(aiCfg.apiKey)}"></div>
+      </div>
+      <button class="btn btn-gold btn-sm" id="btn-save-ai-config">Save AI Provider</button>
+      <span class="small muted" style="margin-left:10px;">${aiCfg.updatedAt ? "Last updated "+fmtDate(aiCfg.updatedAt)+" by "+esc(aiCfg.updatedBy) : "Not yet configured — using Claude.ai directly"}</span>
+    </div>
+    <div class="card">
       <h2>Integrations</h2>
-      <p class="sub">Plug in licensed providers for KYC/fraud checks and outbound messaging. No vendor is connected yet — this wires the plumbing so verification checks, reminders, and sanction letters can actually be sent the moment credentials are added. WhatsApp/Email here send the instant someone in the app clicks — for messages to go out automatically on a schedule with nobody logged in, you'd also need a server-side scheduler (Firebase Cloud Functions + Cloud Scheduler, which needs the paid Blaze plan) — ask if you want help setting that up.</p>
+      <p class="sub">Plug in licensed providers for KYC/fraud checks, outbound messaging, and bank payouts. No vendor is connected yet — this wires the plumbing so verification checks, reminders, and sanction letters can actually be sent the moment credentials are added. WhatsApp/Email here send the instant someone in the app clicks — for messages to go out automatically on a schedule with nobody logged in, you'd also need a server-side scheduler (Firebase Cloud Functions + Cloud Scheduler, which needs the paid Blaze plan) — ask if you want help setting that up.</p>
       <div class="warn-banner" style="background:#FBF1DC;border-color:var(--gold);color:#5C4200;">⚠ Most verification providers block direct browser calls (CORS) and expect server-side integration for security. If a check below fails with a network/CORS error once configured, you'll likely need a small backend relay rather than calling the vendor straight from this page — flag that to me and I can help design one.</div>
       <div class="grid grid-3">
         <div class="field"><label>Provider name</label><input id="api-provider" value="${esc(cfg.provider)}" placeholder="e.g. Surepass"></div>
@@ -4806,6 +5037,18 @@ function bindEvents(){
   const logAccrualBtn = document.getElementById("btn-log-accrual");
   if(logAccrualBtn) logAccrualBtn.onclick = handleLogInterestAccrual;
 
+  // Bank Reconciliation
+  const reconAccountSelect = document.getElementById("recon-account");
+  if(reconAccountSelect) reconAccountSelect.onchange = ()=>{ session.reconFundAccountId = reconAccountSelect.value; render(); };
+  const uploadStatementBtn = document.getElementById("btn-upload-statement");
+  if(uploadStatementBtn) uploadStatementBtn.onclick = handleUploadStatement;
+  document.querySelectorAll(".manual-match-select").forEach(sel=>{
+    sel.onchange = ()=>{ if(sel.value) handleManualMatch(sel.dataset.line, sel.value, sel.selectedOptions[0].dataset.type); };
+  });
+  document.querySelectorAll(".mark-no-record-btn").forEach(btn=>{
+    btn.onclick = ()=> handleMarkNoSystemRecord(btn.dataset.line);
+  });
+
   // Payroll & DSA
   document.querySelectorAll(".tab[data-paytab]").forEach(el=>{
     el.onclick = ()=>{ session.payrollSubTab = el.getAttribute("data-paytab"); session.showSalaryForm=false; session.showDsaForm=false; render(); };
@@ -4907,11 +5150,22 @@ function bindEvents(){
   // Verification API config
   const saveApiConfigBtn = document.getElementById("btn-save-api-config");
   if(saveApiConfigBtn) saveApiConfigBtn.onclick = handleSaveApiConfig;
+  const saveAiConfigBtn = document.getElementById("btn-save-ai-config");
+  if(saveAiConfigBtn) saveAiConfigBtn.onclick = handleSaveAiConfig;
   document.querySelectorAll(".run-verify-btn").forEach(btn=>{
     btn.onclick = ()=> handleRunCustomerVerification(btn.dataset.customer, btn.dataset.service, btn.dataset.field);
   });
   document.querySelectorAll(".run-appraisal-verify-btn").forEach(btn=>{
     btn.onclick = ()=> handleRunAppraisalVerification(btn.dataset.appraisal, btn.dataset.service, btn.dataset.field);
+  });
+  document.querySelectorAll(".findoc-file-input").forEach(inp=>{
+    inp.onchange = (e)=> handleUploadFinancialDoc(e, inp.dataset.customer, inp.dataset.doc);
+  });
+  document.querySelectorAll(".auto-read-itr-btn").forEach(btn=>{
+    btn.onclick = ()=> handleAutoReadItr(btn.dataset.customer);
+  });
+  document.querySelectorAll(".request-aa-btn").forEach(btn=>{
+    btn.onclick = ()=> handleRequestAaConsent(btn.dataset.customer);
   });
 
   // Data Management
@@ -5736,6 +5990,61 @@ async function handleLogInterestAccrual(){
 }
 
 /* ---------------------------------------------------------------------
+   Bank Reconciliation handlers
+   --------------------------------------------------------------------- */
+async function handleUploadStatement(){
+  const u = session.user;
+  const fundAccountId = document.getElementById("recon-account").value;
+  const fileInput = document.getElementById("recon-file-input");
+  const file = fileInput.files[0];
+  if(!file){ toast("Choose a CSV file first."); return; }
+  const reader = new FileReader();
+  reader.onload = async ()=>{
+    try{
+      const parsedRows = parseStatementCsv(reader.result);
+      if(parsedRows.length===0){ toast("No rows found — check the CSV has Date + Description + Debit/Credit (or Amount) columns."); return; }
+      const batchId = uid("batch");
+      const lines = await reconcileStatementLines(fundAccountId, parsedRows, batchId);
+      for(const line of lines){ line.uploadedBy = u.name; await db.put("bankStatementLines", line); }
+      const matchedCount = lines.filter(l=>l.matched).length;
+      await logAudit(u.name, u.role, "Bank Statement Uploaded", `${lines.length} lines — ${matchedCount} auto-matched, ${lines.length-matchedCount} need review`);
+      session.reconFundAccountId = fundAccountId;
+      toast(`Uploaded ${lines.length} lines — ${matchedCount} matched automatically.`);
+      render();
+    } catch(err){
+      toast("Couldn't parse that file — check it's a plain CSV export from your bank.");
+    }
+  };
+  reader.readAsText(file);
+}
+
+async function handleManualMatch(lineId, txnId, txnType){
+  const u = session.user;
+  const line = await db.get("bankStatementLines", lineId);
+  if(!line) return;
+  line.matched = true;
+  line.matchedType = txnType;
+  line.matchedId = txnId;
+  await db.put("bankStatementLines", line);
+  await logAudit(u.name, u.role, "Bank Statement Line Manually Matched", `${line.description} → ${txnType} ${txnId}`);
+  toast("Matched.");
+  render();
+}
+
+async function handleMarkNoSystemRecord(lineId){
+  const u = session.user;
+  const line = await db.get("bankStatementLines", lineId);
+  if(!line) return;
+  line.matched = true;
+  line.matchedType = "No System Record";
+  line.matchedId = null;
+  await db.put("bankStatementLines", line);
+  await logAudit(u.name, u.role, "Bank Statement Line Reconciled (No System Record)", line.description);
+  toast("Marked reconciled.");
+  render();
+}
+
+/* ---------------------------------------------------------------------
    Payroll handlers
    --------------------------------------------------------------------- */
 async function handleSaveSalaryStructure(){
@@ -6188,23 +6497,13 @@ async function handleSendChat(){
   input.value = "";
   render();
 
-  try{
-    const systemContext = "You are a helpful assistant embedded in NBFC LMS, a prototype NBFC loan management system. Answer concisely and practically for a banking/NBFC operations audience. If asked about specific customer data you don't have, say so rather than inventing figures.";
-    const apiMessages = session.chatMessages.map(m=>({role:m.role, content:m.content}));
-    apiMessages.unshift({role:"user", content: systemContext});
-    apiMessages.splice(1,0,{role:"assistant", content:"Understood — I'll answer as an assistant embedded in NBFC LMS."});
+  const systemContext = "You are a helpful assistant embedded in NBFC LMS, a prototype NBFC loan management system. Answer concisely and practically for a banking/NBFC operations audience. If asked about specific customer data you don't have, say so rather than inventing figures.";
+  const apiMessages = session.chatMessages.map(m=>({role:m.role, content:m.content}));
+  apiMessages.unshift({role:"user", content: systemContext});
+  apiMessages.splice(1,0,{role:"assistant", content:"Understood — I'll answer as an assistant embedded in NBFC LMS."});
 
-    const response = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ model: "claude-sonnet-4-6", max_tokens: 1000, messages: apiMessages })
-    });
-    const data = await response.json();
-    const textResponses = (data.content||[]).filter(b=>b.type==="text").map(b=>b.text).join("\n");
-    session.chatMessages.push({role:"assistant", content: textResponses || "(No response — this feature only works inside Claude.ai's artifact runtime.)"});
-  } catch(err){
-    session.chatMessages.push({role:"assistant", content:"Couldn't reach the AI service. This tab only works while running inside Claude.ai — see the warning above."});
-  }
+  const result = await callAiChat(apiMessages, 1000);
+  session.chatMessages.push({role:"assistant", content: result.ok ? result.text : result.error});
   render();
 }
 
@@ -6217,23 +6516,13 @@ async function handleSendBorrowerChat(){
   input.value = "";
   render();
 
-  try{
-    const systemContext = "You are a friendly loan advisor for NBFC LMS, an NBFC's borrower-facing loan application portal. Explain loan products, documents needed, and how the application process works in plain language. Never invent specific approval decisions, interest rates, or amounts for the person you're talking to — direct them to contact the branch for anything specific to their own application.";
-    const apiMessages = session.borrowerChatMessages.map(m=>({role:m.role, content:m.content}));
-    apiMessages.unshift({role:"user", content: systemContext});
-    apiMessages.splice(1,0,{role:"assistant", content:"Understood — I'll help as a loan advisor for this NBFC's borrowers."});
+  const systemContext = "You are a friendly loan advisor for NBFC LMS, an NBFC's borrower-facing loan application portal. Explain loan products, documents needed, and how the application process works in plain language. Never invent specific approval decisions, interest rates, or amounts for the person you're talking to — direct them to contact the branch for anything specific to their own application.";
+  const apiMessages = session.borrowerChatMessages.map(m=>({role:m.role, content:m.content}));
+  apiMessages.unshift({role:"user", content: systemContext});
+  apiMessages.splice(1,0,{role:"assistant", content:"Understood — I'll help as a loan advisor for this NBFC's borrowers."});
 
-    const response = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ model: "claude-sonnet-4-6", max_tokens: 1000, messages: apiMessages })
-    });
-    const data = await response.json();
-    const textResponses = (data.content||[]).filter(b=>b.type==="text").map(b=>b.text).join("\n");
-    session.borrowerChatMessages.push({role:"assistant", content: textResponses || "(No response — this feature only works inside Claude.ai's artifact runtime.)"});
-  } catch(err){
-    session.borrowerChatMessages.push({role:"assistant", content:"Couldn't reach the AI service right now — this only works while running inside Claude.ai."});
-  }
+  const result = await callAiChat(apiMessages, 1000);
+  session.borrowerChatMessages.push({role:"assistant", content: result.ok ? result.text : result.error});
   render();
 }
 
@@ -6345,6 +6634,20 @@ async function handleSaveApiConfig(){
   render();
 }
 
+async function handleSaveAiConfig(){
+  const u = session.user;
+  const cfg = await getAiConfig();
+  cfg.enabled = document.getElementById("ai-enabled").value === "true";
+  cfg.baseUrl = document.getElementById("ai-baseurl").value.trim();
+  cfg.apiKey = document.getElementById("ai-key").value;
+  cfg.updatedAt = nowISO();
+  cfg.updatedBy = u.name;
+  await db.put("aiConfig", cfg);
+  await logAudit(u.name, u.role, "AI Provider Configured", cfg.enabled ? `Custom proxy: ${cfg.baseUrl}` : "Reverted to direct Claude.ai calls");
+  toast("AI provider saved.");
+  render();
+}
+
 /* ---------------------------------------------------------------------
    Data Management: backup, restore, delete
    --------------------------------------------------------------------- */
@@ -6431,6 +6734,69 @@ async function handleRunAppraisalVerification(appraisalId, serviceKey, field){
   await db.put("appraisals", appraisal);
   await logAudit(u.name, u.role, "Fraud/Litigation Check Run", `${cust?cust.personal.name:appraisal.customerId} — ${serviceKey} — ${result.status}`);
   toast(result.ok ? "Check complete: "+result.status : result.error);
+  render();
+}
+
+/* ---------------------------------------------------------------------
+   Financial Document Verification handlers (ITR/GST/Bank Statement/
+   Company Financials + Account Aggregator consent)
+   --------------------------------------------------------------------- */
+async function handleUploadFinancialDoc(e, customerId, docKey){
+  const file = e.target.files[0];
+  if(!file) return;
+  const u = session.user;
+  const reader = new FileReader();
+  reader.onload = async ()=>{
+    const cust = await db.get("customers", customerId);
+    if(!cust) return;
+    cust.financialDocs = cust.financialDocs || {};
+    cust.financialDocs[docKey] = reader.result;
+    await db.put("customers", cust);
+    await logAudit(u.name, u.role, "Financial Document Uploaded", `${cust.personal.name} — ${docKey}`);
+    toast("Document uploaded.");
+    render();
+  };
+  reader.readAsDataURL(file);
+}
+
+async function handleAutoReadItr(customerId){
+  const u = session.user;
+  const cust = await db.get("customers", customerId);
+  if(!cust || !cust.financialDocs?.itrDocBase64){ toast("Upload the ITR acknowledgment first."); return; }
+  toast("Reading document…");
+  try{
+    const base64Data = cust.financialDocs.itrDocBase64.split(",")[1];
+    const mediaType = cust.financialDocs.itrDocBase64.match(/data:(.*?);base64/)[1];
+    if(mediaType==="application/pdf"){ toast("Auto-read currently supports image uploads (JPG/PNG) of the ITR, not PDF — take a photo/screenshot of the acknowledgment page instead."); return; }
+    const result = await callAiChat([{ role:"user", content:[
+      { type:"image", source:{ type:"base64", media_type:mediaType, data:base64Data } },
+      { type:"text", text:"This is an Indian Income Tax Return (ITR) acknowledgment. Respond ONLY with JSON, no markdown, no preamble: {\"grossTotalIncome\": number in rupees or 0 if not found, \"assessmentYear\":\"string or empty\"}" }
+    ]}], 300);
+    if(!result.ok){ toast(result.error); return; }
+    const parsed = JSON.parse(result.text.replace(/```json|```/g,"").trim());
+    if(parsed.grossTotalIncome){
+      cust.financialDocs.itrDeclaredIncome = parsed.grossTotalIncome;
+      await db.put("customers", cust);
+      await logAudit(u.name, u.role, "ITR Auto-Read", `${cust.personal.name} — Gross Total Income ${fmtINR(parsed.grossTotalIncome)}${parsed.assessmentYear?" (AY "+parsed.assessmentYear+")":""}`);
+      toast("ITR income extracted — please verify against the document before relying on it.");
+      render();
+    } else {
+      toast("Couldn't find an income figure on that document — enter it manually if needed.");
+    }
+  } catch(err){
+    toast("Auto-read failed — this feature needs an AI provider (Claude.ai runtime, or a vision-capable proxy under Integrations).");
+  }
+}
+
+async function handleRequestAaConsent(customerId){
+  const u = session.user;
+  const cust = await db.get("customers", customerId);
+  if(!cust) return;
+  const result = await callVerificationApi("accountAggregator", { customer_name: cust.personal.name, mobile: cust.personal.mobile });
+  cust.aaConsentStatus = result.ok ? "Requested" : "Not Configured";
+  await db.put("customers", cust);
+  await logAudit(u.name, u.role, "Account Aggregator Consent Requested", `${cust.personal.name} — ${result.status}`);
+  toast(result.ok ? "Consent request sent — status: "+result.status : result.error);
   render();
 }
 
@@ -7084,24 +7450,17 @@ async function handleSendFloatingHelp(){
   messages.push({role:"user", content:text});
   input.value = "";
   renderFloatingHelpPanel();
-  try{
-    const isBorrower = session.type==="borrower";
-    const systemContext = isBorrower
-      ? "You are a friendly loan advisor for NBFC LMS, a borrower-facing loan application portal. Explain loan products, documents needed, and the application process in plain language. Never invent specific approval decisions, interest rates, or amounts — direct the person to their branch for anything specific to their own application."
-      : "You are a helpful assistant embedded in NBFC LMS, an NBFC Loan Management System, answering a staff member's quick question from wherever they are in the app. Be concise and practical for a banking/NBFC operations audience.";
-    const apiMessages = messages.map(m=>({role:m.role, content:m.content}));
-    apiMessages.unshift({role:"user", content: systemContext});
-    apiMessages.splice(1,0,{role:"assistant", content:"Understood."});
-    const response = await fetch("https://api.anthropic.com/v1/messages", {
-      method:"POST", headers:{ "Content-Type":"application/json" },
-      body: JSON.stringify({ model:"claude-sonnet-4-6", max_tokens:800, messages: apiMessages })
-    });
-    const data = await response.json();
-    const textResponses = (data.content||[]).filter(b=>b.type==="text").map(b=>b.text).join("\n");
-    messages.push({role:"assistant", content: textResponses || "(No response — this only works inside Claude.ai's artifact runtime.)"});
-  } catch(err){
-    messages.push({role:"assistant", content:"Couldn't reach the AI service — this only works while running inside Claude.ai."});
-  }
+
+  const isBorrower = session.type==="borrower";
+  const systemContext = isBorrower
+    ? "You are a friendly loan advisor for NBFC LMS, a borrower-facing loan application portal. Explain loan products, documents needed, and the application process in plain language. Never invent specific approval decisions, interest rates, or amounts — direct the person to their branch for anything specific to their own application."
+    : "You are a helpful assistant embedded in NBFC LMS, an NBFC Loan Management System, answering a staff member's quick question from wherever they are in the app. Be concise and practical for a banking/NBFC operations audience.";
+  const apiMessages = messages.map(m=>({role:m.role, content:m.content}));
+  apiMessages.unshift({role:"user", content: systemContext});
+  apiMessages.splice(1,0,{role:"assistant", content:"Understood."});
+
+  const result = await callAiChat(apiMessages, 800);
+  messages.push({role:"assistant", content: result.ok ? result.text : result.error});
   renderFloatingHelpPanel();
 }
 
