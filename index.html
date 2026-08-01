@@ -1607,6 +1607,8 @@ function renderLanding(firstRun){
 }
 
 function renderStaffLogin(firstRun){
+  const showLoginAnyway = session.forceStaffLoginView;
+  const effectiveFirstRun = firstRun && !showLoginAnyway;
   return `
   <div id="app-inner">
     <div class="topbar">
@@ -1616,18 +1618,18 @@ function renderStaffLogin(firstRun){
     <main>
       <div class="auth-shell">
         <div class="card">
-          <h2>${firstRun ? "Set up Super Admin" : "Staff Login"}</h2>
-          <p class="sub">${firstRun ? "No staff accounts exist yet. Create the first Super Admin account." : "Enter your credentials to access the LMS."}</p>
-          ${firstRun ? `
+          <h2>${effectiveFirstRun ? "Set up Super Admin" : "Staff Login"}</h2>
+          <p class="sub">${effectiveFirstRun ? "No staff accounts exist yet. Create the first Super Admin account." : "Enter your credentials to access the LMS."}</p>
+          ${effectiveFirstRun ? `
             <div class="field"><label>Full name</label><input id="su-name" placeholder="e.g. Anil Sharma"></div>
             <div class="field"><label>Username</label><input id="su-username" placeholder="Choose a username"></div>
             <div class="field"><label>Password</label><input id="su-password" type="password" placeholder="Choose a password"></div>
             <button class="btn btn-gold btn-block" id="btn-setup-admin">Create Super Admin & Continue</button>
+            <button class="btn btn-ghost btn-block" id="btn-show-login-instead" style="margin-top:10px;">Already have an account? Sign in instead</button>
           ` : `
             <div class="field"><label>Username</label><input id="login-username" placeholder="admin"></div>
             <div class="field"><label>Password</label><input id="login-password" type="password" placeholder="••••••••"></div>
             <button class="btn btn-gold btn-block" id="btn-staff-login">Sign in</button>
-            <p class="small muted" style="margin-top:12px;">Demo account (first run): <span class="mono">admin / admin123</span></p>
           `}
         </div>
       </div>
@@ -5121,6 +5123,8 @@ function bindEvents(){
   if(setupBtn) setupBtn.onclick = handleSetupAdmin;
   const loginBtn = document.getElementById("btn-staff-login");
   if(loginBtn) loginBtn.onclick = handleStaffLogin;
+  const showLoginInsteadBtn = document.getElementById("btn-show-login-instead");
+  if(showLoginInsteadBtn) showLoginInsteadBtn.onclick = ()=>{ session.forceStaffLoginView = true; render(); };
 
   const logoutStaff = document.querySelector('[data-action="staff-logout"]');
   if(logoutStaff) logoutStaff.onclick = async ()=>{
@@ -7572,6 +7576,15 @@ async function handleStaffLogin(){
     }
     session = {type:"staff", user: match};
     await logAudit(match.name, match.role, "Login", "");
+    // Self-heal: if this Super Admin exists but the setup flag never
+    // saved correctly (a bug from before, now fixed), set it now rather
+    // than leaving the app permanently thinking no admin exists.
+    if(match.role==="Super Admin"){
+      const setupStatus = await db.get("meta","setupStatus");
+      if(!setupStatus || !setupStatus.initialized){
+        await db.put("meta", {id:"setupStatus", key:"setupStatus", initialized:true});
+      }
+    }
     await ensureAllSeeds();
     toast("Welcome back, "+match.name+".");
     render();
