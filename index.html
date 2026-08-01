@@ -1011,6 +1011,27 @@ function estimateMonthlyEmi(principal, annualRatePct, tenureMonths){
   return principal * r * Math.pow(1+r, tenureMonths) / (Math.pow(1+r, tenureMonths) - 1);
 }
 
+/** EMI with an optional moratorium: interest accrues monthly during the
+ *  moratorium and is capitalized (added to principal) at its end — the
+ *  standard treatment — then EMI is computed on the increased principal
+ *  over the remaining tenure. Pass moratoriumMonths=0 for a plain EMI. */
+function calculateEmiWithMoratorium(principal, annualRatePct, tenureMonths, moratoriumMonths){
+  const r = (annualRatePct/100)/12;
+  moratoriumMonths = Math.min(moratoriumMonths||0, Math.max(0,tenureMonths-1));
+  let effectivePrincipal = principal;
+  let capitalizedInterest = 0;
+  for(let m=0; m<moratoriumMonths; m++){
+    const interest = effectivePrincipal*r;
+    capitalizedInterest += interest;
+    effectivePrincipal += interest;
+  }
+  const repaymentMonths = Math.max(1, tenureMonths - moratoriumMonths);
+  const emi = estimateMonthlyEmi(effectivePrincipal, annualRatePct, repaymentMonths);
+  const totalPayment = emi*repaymentMonths;
+  const totalInterest = totalPayment - principal;
+  return { principal, effectivePrincipal, capitalizedInterest, moratoriumMonths, repaymentMonths, emi, totalPayment, totalInterest };
+}
+
 /* ---------------------------------------------------------------------
    Applicant-level CMA calculator (FOIR / DSCR / Debt-Equity / Current
    Ratio / Net Worth) — standard banking ratios computed from figures
@@ -1436,11 +1457,15 @@ async function renderStaffShell(){
   const canManagePolicy = u.role==="Super Admin" || u.role==="Credit Manager";
   const canManageFunds = ["Super Admin","Accounts","Operations Manager","Credit Manager"].includes(u.role);
   const canSeeReports = [...DASHBOARD_ROLES, "Accounts"].includes(u.role);
+  const onboardingDone = await db.get("meta","onboardingComplete");
+  const needsOnboarding = u.role==="Super Admin" && !onboardingDone;
 
   let tabContent = "";
-  const tab = session.staffTab || "dashboard";
+  const tab = session.staffTab || (needsOnboarding ? "onboarding" : "dashboard");
 
-  if(tab === "dashboard"){
+  if(tab === "onboarding" && u.role==="Super Admin"){
+    tabContent = await renderOnboardingTab();
+  } else if(tab === "dashboard"){
     tabContent = await renderManagementDashboard(leads, borrowers, customers, staffCount, appraisals, sanctions, loanAccounts, payments);
   } else if(tab === "leads"){
     tabContent = renderLeadsQueue(leads, products, await db.getAll("dsaAgents"));
@@ -1464,6 +1489,8 @@ async function renderStaffShell(){
     tabContent = await renderPayrollDsaTab();
   } else if(tab === "shgrural"){
     tabContent = await renderShgRuralTab();
+  } else if(tab === "emicalc"){
+    tabContent = renderEmiCalculatorCard();
   } else if(tab === "ratios" && canSeeReports){
     tabContent = await renderRatiosComplianceTab();
   } else if(tab === "reports" && canSeeReports){
@@ -1536,6 +1563,7 @@ async function renderStaffShell(){
         ${canManageFunds ? `<button class="tab ${tab==='accounting'?'active':''}" data-tab="accounting">Accounting</button>`:""}
         ${canManageFunds ? `<button class="tab ${tab==='payrolldsa'?'active':''}" data-tab="payrolldsa">Payroll &amp; DSA</button>`:""}
         <button class="tab ${tab==='shgrural'?'active':''}" data-tab="shgrural">SHG / Rural Finance</button>
+        <button class="tab ${tab==='emicalc'?'active':''}" data-tab="emicalc">EMI Calculator</button>
         ${canSeeReports ? `<button class="tab ${tab==='ratios'?'active':''}" data-tab="ratios">Ratios &amp; Compliance</button>`:""}
         ${canSeeReports ? `<button class="tab ${tab==='reports'?'active':''}" data-tab="reports">Reports &amp; MIS</button>`:""}
         <button class="tab ${tab==='ai'?'active':''}" data-tab="ai">AI Insights</button>
@@ -3931,6 +3959,64 @@ async function renderMicroEnterpriseTemplatesTab(){
   `;
 }
 
+/* ---------------------------------------------------------------------
+   EMI Calculator (shared — used in both Staff Console and Borrower Portal)
+   --------------------------------------------------------------------- */
+function renderEmiCalculatorCard(){
+  const r = session.emiCalcResult;
+  return `
+    <div class="card">
+      <h2>EMI Calculator</h2>
+      <p class="sub">Compare EMI with and without a moratorium. During a moratorium, interest accrues and is added to the principal (capitalized) — EMI is then recalculated over the remaining tenure, same treatment your loan accounts use.</p>
+      <div class="grid grid-4">
+        <div class="field"><label>Loan amount (₹)</label><input id="emic-principal" type="number" placeholder="e.g. 150000" value="${session.emiCalcInputs?.principal||''}"></div>
+        <div class="field"><label>Interest rate (% p.a.)</label><input id="emic-rate" type="number" step="0.1" placeholder="e.g. 18" value="${session.emiCalcInputs?.rate||''}"></div>
+        <div class="field"><label>Tenure (months)</label><input id="emic-tenure" type="number" placeholder="e.g. 36" value="${session.emiCalcInputs?.tenure||''}"></div>
+        <div class="field"><label>Moratorium (months)</label><input id="emic-moratorium" type="number" placeholder="e.g. 3" value="${session.emiCalcInputs?.moratorium||''}"></div>
+      </div>
+      <button class="btn btn-gold" id="btn-calc-emi">Calculate</button>
+      ${r ? `
+      <div class="divider"></div>
+      <div class="grid grid-2">
+        <div>
+          <h3 class="section-h">Without Moratorium</h3>
+          <table><tbody>
+            <tr><td>EMI Amount</td><td style="text-align:right;"><b>${fmtINR(Math.round(r.without.emi))}</b></td></tr>
+            <tr><td>Repayment Period</td><td style="text-align:right;">${r.without.repaymentMonths} months</td></tr>
+            <tr><td>Total Interest</td><td style="text-align:right;">${fmtINR(Math.round(r.without.totalInterest))}</td></tr>
+            <tr><td>Total Payment</td><td style="text-align:right;">${fmtINR(Math.round(r.without.totalPayment))}</td></tr>
+          </tbody></table>
+        </div>
+        <div>
+          <h3 class="section-h">With ${r.with.moratoriumMonths}-Month Moratorium</h3>
+          <table><tbody>
+            <tr><td>Capitalized Interest (added to principal)</td><td style="text-align:right;">${fmtINR(Math.round(r.with.capitalizedInterest))}</td></tr>
+            <tr><td>EMI Amount (after moratorium)</td><td style="text-align:right;"><b>${fmtINR(Math.round(r.with.emi))}</b></td></tr>
+            <tr><td>Repayment Period</td><td style="text-align:right;">${r.with.repaymentMonths} months</td></tr>
+            <tr><td>Total Interest</td><td style="text-align:right;">${fmtINR(Math.round(r.with.totalInterest))}</td></tr>
+            <tr><td>Total Payment</td><td style="text-align:right;">${fmtINR(Math.round(r.with.totalPayment))}</td></tr>
+          </tbody></table>
+        </div>
+      </div>
+      ` : ""}
+    </div>
+  `;
+}
+
+function handleCalculateEmi(){
+  const principal = Number(document.getElementById("emic-principal").value);
+  const rate = Number(document.getElementById("emic-rate").value);
+  const tenure = Number(document.getElementById("emic-tenure").value);
+  const moratorium = Number(document.getElementById("emic-moratorium").value)||0;
+  if(!principal || !rate || !tenure){ toast("Enter loan amount, rate, and tenure."); return; }
+  session.emiCalcInputs = {principal, rate, tenure, moratorium};
+  session.emiCalcResult = {
+    without: calculateEmiWithMoratorium(principal, rate, tenure, 0),
+    with: calculateEmiWithMoratorium(principal, rate, tenure, moratorium),
+  };
+  render();
+}
+
 async function renderPayrollDsaTab(){
   const sub = session.payrollSubTab || "payroll";
   return `
@@ -4059,6 +4145,56 @@ async function renderDsaSection(){
 /* ---------------------------------------------------------------------
    NBFC Company Profile
    --------------------------------------------------------------------- */
+/* ---------------------------------------------------------------------
+   First-run Onboarding: Profile, then Fund Accounts, before Dashboard
+   --------------------------------------------------------------------- */
+async function renderOnboardingTab(){
+  const p = await getNbfcProfile();
+  const fundAccounts = await db.getAll("fundAccounts");
+  return `
+    <div class="card">
+      <h2>Welcome — let's set a few things up</h2>
+      <p class="sub">Two quick steps before you get to the Dashboard: your NBFC's registration details, then your fund sources. You can change any of this later — this is just to get real numbers in place from the start.</p>
+    </div>
+    <div class="card">
+      <h3 class="section-h" style="margin-top:0;">Step 1 — NBFC Profile</h3>
+      <div class="grid grid-2">
+        <div class="field"><label>NBFC Name</label><input id="ob-name" value="${esc(p.name)}"></div>
+        <div class="field"><label>Registered Address</label><input id="ob-address" value="${esc(p.address)}"></div>
+        <div class="field"><label>RBI Registration Number (CoR)</label><input id="ob-registration" value="${esc(p.registrationNumber)}"></div>
+        <div class="field"><label>GST Number</label><input id="ob-gst" value="${esc(p.gstNumber)}"></div>
+        <div class="field"><label>PAN</label><input id="ob-pan" value="${esc(p.panNumber)}" style="text-transform:uppercase;"></div>
+        <div class="field"><label>TAN</label><input id="ob-tan" value="${esc(p.tanNumber)}" style="text-transform:uppercase;"></div>
+      </div>
+      <button class="btn btn-outline btn-sm" id="btn-save-onboarding-profile">Save Profile Details</button>
+      <span class="small muted" style="margin-left:8px;">${p.name ? "✓ Saved" : "Not yet saved"}</span>
+    </div>
+    <div class="card">
+      <h3 class="section-h" style="margin-top:0;">Step 2 — Fund Sources (Capital, Bank Accounts, Borrowings)</h3>
+      <p class="small muted">A demo account may already be listed below from initial setup — edit its balance to your real opening figure, or add your actual accounts and adjust/remove the demo one under Fund Management later.</p>
+      <div class="grid grid-3">
+        <div class="field"><label>Name</label><input id="ob-fund-name" placeholder="e.g. HDFC Current A/c 00231"></div>
+        <div class="field"><label>Type</label><select id="ob-fund-type">${FUND_ACCOUNT_TYPES.map(t=>`<option>${t}</option>`).join("")}</select></div>
+        <div class="field"><label>Opening balance (₹)</label><input id="ob-fund-balance" type="number"></div>
+      </div>
+      <button class="btn btn-outline btn-sm" id="btn-save-onboarding-fund">+ Add Fund Source</button>
+      <table style="margin-top:14px;">
+        <thead><tr><th>Name</th><th>Type</th><th>Balance</th></tr></thead>
+        <tbody>
+        ${fundAccounts.length===0 ? `<tr class="empty-row"><td colspan="3">No fund sources yet.</td></tr>` :
+          fundAccounts.map(a=>`<tr><td>${esc(a.name)}</td><td>${esc(a.type)}</td><td>${fmtINR(a.balance)}</td></tr>`).join("")}
+        </tbody>
+      </table>
+    </div>
+    <div class="card">
+      <div class="action-row">
+        <button class="btn btn-gold" id="btn-finish-onboarding">Finish Setup &amp; Go to Dashboard</button>
+        <button class="btn btn-outline" id="btn-skip-onboarding">Skip for now</button>
+      </div>
+    </div>
+  `;
+}
+
 async function renderNbfcProfileTab(){
   const p = await getNbfcProfile();
   return `
@@ -4186,6 +4322,14 @@ async function renderBorrowerShell(){
   const myLeads = allLeads.filter(l=>l.borrowerId===u.id).sort((a,b)=>new Date(b.createdAt)-new Date(a.createdAt));
   const tab = session.borrowerTab || "apply";
 
+  let body;
+  if(tab==='apply') body = renderApplyForm(products);
+  else if(tab==='eligibility') body = await renderEligibilityChecker(products);
+  else if(tab==='emicalc') body = renderEmiCalculatorCard();
+  else if(tab==='status') body = renderMyApplications(myLeads);
+  else if(tab==='advisor') body = renderBorrowerAdvisor();
+  else body = renderBorrowerHelp();
+
   return `
   <div id="app-inner">
     <div class="topbar">
@@ -4198,11 +4342,13 @@ async function renderBorrowerShell(){
     <main>
       <div class="tabs">
         <button class="tab ${tab==='apply'?'active':''}" data-btab="apply">Apply for a Loan</button>
+        <button class="tab ${tab==='eligibility'?'active':''}" data-btab="eligibility">Check Eligibility</button>
+        <button class="tab ${tab==='emicalc'?'active':''}" data-btab="emicalc">EMI Calculator</button>
         <button class="tab ${tab==='status'?'active':''}" data-btab="status">My Applications (${myLeads.length})</button>
         <button class="tab ${tab==='advisor'?'active':''}" data-btab="advisor">AI Advisor</button>
         <button class="tab ${tab==='help'?'active':''}" data-btab="help">Help</button>
       </div>
-      ${tab==='apply' ? renderApplyForm(products) : tab==='status' ? renderMyApplications(myLeads) : tab==='advisor' ? renderBorrowerAdvisor() : renderBorrowerHelp()}
+      ${body}
     </main>
     <div class="footer-note">NBFC LMS — Borrower Portal · Developed by Anil Sharma, Former General Manager, Central Bank of India</div>
   </div>`;
@@ -4238,7 +4384,10 @@ function renderBorrowerAdvisor(){
 
 function renderApplyForm(products){
   const active = (products||[]).filter(p=>p.active);
-  const opts = active.length ? active.map(p=>`<option>${esc(p.name)}</option>`).join("") : LOAN_PRODUCTS.map(p=>`<option>${p}</option>`).join("");
+  if(active.length===0){
+    return `<div class="card"><h2>Apply for a Loan</h2><p class="sub">No loan products are currently available for application. Please check back later.</p></div>`;
+  }
+  const opts = active.map(p=>`<option>${esc(p.name)}</option>`).join("");
   return `
   <div class="card">
     <h2>Apply for a Loan</h2>
@@ -4257,6 +4406,110 @@ function renderApplyForm(products){
     </div>
     <button class="btn btn-gold" id="btn-submit-application">Submit Application</button>
   </div>`;
+}
+
+/* ---------------------------------------------------------------------
+   Borrower Eligibility Checker + In-Principle Indication
+   ---------------------------------------------------------------------
+   Runs a product's rule engine using only what a self-service applicant
+   has entered (income, expenses, requested amount) — it can't evaluate
+   rules needing credit score or risk category since no bureau check or
+   appraisal has happened yet. Those show as "checked at appraisal."
+   Never creates a real Sanction record — this is indicative only.
+   --------------------------------------------------------------------- */
+function evaluateProductRulesPartial(product, context){
+  const rules = product.rules || [];
+  const results = rules.map(r=>{
+    const actual = context[r.field];
+    if(actual===undefined || actual===null) return { field:r.field, operator:r.operator, value:r.value, actual:null, status:"Unknown — checked at appraisal" };
+    return { field:r.field, operator:r.operator, value:r.value, actual, status: evaluateRule(actual, r.operator, r.value) ? "Pass" : "Fail" };
+  });
+  return { results, anyFail: results.some(r=>r.status==="Fail"), allKnownPass: !results.some(r=>r.status==="Fail"), fullyKnown: !results.some(r=>r.status.startsWith("Unknown")) };
+}
+
+async function renderEligibilityChecker(products){
+  const active = (products||[]).filter(p=>p.active);
+  if(active.length===0){
+    return `<div class="card"><h2>Check Eligibility</h2><p class="sub">No loan products are currently available.</p></div>`;
+  }
+  const r = session.eligibilityResult;
+  return `
+    <div class="card">
+      <h2>Check Eligibility</h2>
+      <p class="sub">Select a product and enter your income and expenses to get an indicative eligible amount. This is not a sanction — final approval always depends on KYC, credit check, and full appraisal.</p>
+      <div class="grid grid-3">
+        <div class="field"><label>Loan product</label><select id="el-product">${active.map(p=>`<option value="${p.id}" ${session.eligibilityInputs?.productId===p.id?'selected':''}>${esc(p.name)}</option>`).join("")}</select></div>
+        <div class="field"><label>Monthly income (₹)</label><input id="el-income" type="number" value="${session.eligibilityInputs?.income||''}"></div>
+        <div class="field"><label>Monthly expenses (₹)</label><input id="el-expenses" type="number" value="${session.eligibilityInputs?.expenses||''}"></div>
+      </div>
+      <button class="btn btn-gold" id="btn-check-eligibility">Check Eligibility</button>
+      ${r ? `
+      <div class="divider"></div>
+      <div class="grid grid-3">
+        <div class="kpi"><div class="lbl">Disposable Income</div><div class="val" style="font-size:18px;">${fmtINR(r.disposable)}</div></div>
+        <div class="kpi"><div class="lbl">Indicative Max EMI</div><div class="val" style="font-size:18px;">${fmtINR(Math.round(r.maxEmi))}</div></div>
+        <div class="kpi"><div class="lbl">Indicative Eligible Amount</div><div class="val" style="font-size:18px;">${fmtINR(Math.round(r.eligibleAmount))}</div></div>
+      </div>
+      ${r.inPrinciple ? `
+      <div class="warn-banner" style="background:#E4F3E8;border-color:var(--ok);color:#1D4E33; margin-top:14px;">
+        🎉 <b>In-Principle Eligible</b> — based on the income and expenses you entered, you appear to meet this product's criteria for an indicative sanction of approximately <b>${fmtINR(Math.round(r.eligibleAmount))}</b>. This is subject to KYC, credit bureau check, and full appraisal by our Credit team — it is not a final sanction.
+      </div>
+      <button class="btn btn-outline btn-sm" id="btn-print-eligibility" style="margin-top:10px;">Print In-Principle Letter</button>
+      ` : `
+      <div class="warn-banner" style="background:#FBF1DC;border-color:var(--gold);color:#5C4200; margin-top:14px;">
+        Indicative eligibility only — up to ${fmtINR(Math.round(r.eligibleAmount))}, subject to full appraisal including credit history and verification.${!r.fullyKnown ? " Some criteria for this product can only be checked once KYC and a credit bureau check are done." : ""}
+      </div>
+      `}
+      <div id="printable-eligibility" style="margin-top:16px;">
+        <h3 class="section-h">In-Principle Eligibility Summary</h3>
+        <p class="small muted">Prototype indicative document — not a sanction letter.</p>
+        <table><tbody>
+          <tr><td>Applicant</td><td>${esc(session.user.name)}</td></tr>
+          <tr><td>Product</td><td>${esc(r.productName)}</td></tr>
+          <tr><td>Monthly Income</td><td>${fmtINR(r.income)}</td></tr>
+          <tr><td>Monthly Expenses</td><td>${fmtINR(r.expenses)}</td></tr>
+          <tr><td>Indicative Eligible Amount</td><td><b>${fmtINR(Math.round(r.eligibleAmount))}</b></td></tr>
+          <tr><td>Date</td><td>${todayStr()}</td></tr>
+        </tbody></table>
+      </div>
+      ` : ""}
+    </div>
+  `;
+}
+
+async function handleCheckEligibility(){
+  const productId = document.getElementById("el-product").value;
+  const income = Number(document.getElementById("el-income").value);
+  const expenses = Number(document.getElementById("el-expenses").value)||0;
+  if(!income || income<=0){ toast("Enter your monthly income."); return; }
+  const products = await db.getAll("products");
+  const product = products.find(p=>p.id===productId);
+  if(!product){ toast("Select a product."); return; }
+
+  const disposable = Math.max(0, income - expenses);
+  const maxEmi = disposable * 0.7; // serviceability cushion, leaves 30% of disposable as buffer
+  const eligibleAmount = maxEmi>0 ? estimateEligiblePrincipal(maxEmi, product.interestRate, product.tenureMax) : 0;
+  const cappedAmount = product.maxLoanAmount ? Math.min(eligibleAmount, product.maxLoanAmount) : eligibleAmount;
+  const foirPct = income>0 ? (maxEmi/income*100) : null;
+
+  const ruleCheck = evaluateProductRulesPartial(product, { monthlyIncome:income, amountRequested:cappedAmount, foirPct });
+  const inPrinciple = product.autoSanctionEnabled && ruleCheck.allKnownPass && cappedAmount>0;
+
+  session.eligibilityInputs = {productId, income, expenses};
+  session.eligibilityResult = {
+    productName: product.name, income, expenses, disposable, maxEmi,
+    eligibleAmount: cappedAmount, inPrinciple, fullyKnown: ruleCheck.fullyKnown
+  };
+  render();
+}
+
+/** Inverse of the EMI formula — the principal a given monthly payment can
+ *  service over a tenure at a given rate. */
+function estimateEligiblePrincipal(monthlyEmi, annualRatePct, tenureMonths){
+  const r = (annualRatePct/100)/12;
+  if(!tenureMonths) return 0;
+  if(r===0) return monthlyEmi*tenureMonths;
+  return monthlyEmi * (Math.pow(1+r,tenureMonths)-1) / (r*Math.pow(1+r,tenureMonths));
 }
 
 function renderMyApplications(myLeads){
@@ -4350,6 +4603,10 @@ function bindEvents(){
 
   const submitAppBtn = document.getElementById("btn-submit-application");
   if(submitAppBtn) submitAppBtn.onclick = handleSubmitApplication;
+  const checkEligibilityBtn = document.getElementById("btn-check-eligibility");
+  if(checkEligibilityBtn) checkEligibilityBtn.onclick = handleCheckEligibility;
+  const printEligibilityBtn = document.getElementById("btn-print-eligibility");
+  if(printEligibilityBtn) printEligibilityBtn.onclick = ()=> window.print();
 
   document.querySelectorAll(".lead-status-select").forEach(sel=>{
     sel.onchange = ()=> handleLeadStatusChange(sel.dataset.lead, sel.value);
@@ -4582,6 +4839,8 @@ function bindEvents(){
   const saveShgLoanBtn = document.getElementById("btn-save-shg-loan");
   if(saveShgLoanBtn) saveShgLoanBtn.onclick = handleSaveShgInternalLoan;
   document.querySelectorAll(".mark-shg-loan-repaid-btn").forEach(btn=> btn.onclick = ()=> handleMarkShgLoanRepaid(btn.dataset.loan));
+  const calcEmiBtn = document.getElementById("btn-calc-emi");
+  if(calcEmiBtn) calcEmiBtn.onclick = handleCalculateEmi;
 
   const openNewMicroTemplate = document.getElementById("btn-open-new-micro-template");
   if(openNewMicroTemplate) openNewMicroTemplate.onclick = ()=>{ session.showMicroTemplateForm=true; session.editingMicroTemplate=null; render(); };
@@ -4670,6 +4929,14 @@ function bindEvents(){
   if(runRestoreBtn) runRestoreBtn.onclick = handleRestoreBackup;
   const saveNbfcProfileBtn = document.getElementById("btn-save-nbfc-profile");
   if(saveNbfcProfileBtn) saveNbfcProfileBtn.onclick = handleSaveNbfcProfile;
+  const saveOnboardingProfileBtn = document.getElementById("btn-save-onboarding-profile");
+  if(saveOnboardingProfileBtn) saveOnboardingProfileBtn.onclick = handleSaveOnboardingProfile;
+  const saveOnboardingFundBtn = document.getElementById("btn-save-onboarding-fund");
+  if(saveOnboardingFundBtn) saveOnboardingFundBtn.onclick = handleSaveOnboardingFund;
+  const finishOnboardingBtn = document.getElementById("btn-finish-onboarding");
+  if(finishOnboardingBtn) finishOnboardingBtn.onclick = handleFinishOnboarding;
+  const skipOnboardingBtn = document.getElementById("btn-skip-onboarding");
+  if(skipOnboardingBtn) skipOnboardingBtn.onclick = handleFinishOnboarding;
   document.querySelectorAll(".clear-collection-btn").forEach(btn=>{
     btn.onclick = ()=> handleClearCollection(btn.dataset.collection);
   });
@@ -6020,6 +6287,43 @@ async function handleSaveNbfcProfile(){
   await db.put("nbfcProfile", p);
   await logAudit(u.name, u.role, "NBFC Profile Updated", p.name || "(unnamed)");
   toast("NBFC profile saved.");
+  render();
+}
+
+async function handleSaveOnboardingProfile(){
+  const u = session.user;
+  const p = await getNbfcProfile();
+  p.name = document.getElementById("ob-name").value.trim();
+  p.address = document.getElementById("ob-address").value.trim();
+  p.registrationNumber = document.getElementById("ob-registration").value.trim();
+  p.gstNumber = document.getElementById("ob-gst").value.trim();
+  p.panNumber = document.getElementById("ob-pan").value.trim().toUpperCase();
+  p.tanNumber = document.getElementById("ob-tan").value.trim().toUpperCase();
+  p.updatedAt = nowISO();
+  p.updatedBy = u.name;
+  await db.put("nbfcProfile", p);
+  await logAudit(u.name, u.role, "NBFC Profile Updated (Onboarding)", p.name || "(unnamed)");
+  toast("Profile saved.");
+  render();
+}
+
+async function handleSaveOnboardingFund(){
+  const u = session.user;
+  const name = document.getElementById("ob-fund-name").value.trim();
+  const type = document.getElementById("ob-fund-type").value;
+  const balance = Number(document.getElementById("ob-fund-balance").value)||0;
+  if(!name){ toast("Fund source name is required."); return; }
+  await db.put("fundAccounts", { id: uid("fnd"), name, type, balance, createdAt: nowISO(), createdBy: u.name });
+  await logAudit(u.name, u.role, "Fund Source Added (Onboarding)", `${name} (${type}) — ${fmtINR(balance)}`);
+  toast("Fund source added.");
+  render();
+}
+
+async function handleFinishOnboarding(){
+  const u = session.user;
+  await db.put("meta", {key:"onboardingComplete", value:true});
+  await logAudit(u.name, u.role, "Onboarding Completed", "");
+  session.staffTab = "dashboard";
   render();
 }
 
