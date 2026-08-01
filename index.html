@@ -2120,89 +2120,102 @@ function renderCustomersList(customers){
 }
 
 function renderCustomerForm(){
+  const editing = session.editingCustomer || null;
   const prefill = session.leadPrefill || {};
   const p = (v)=> v===undefined||v===null ? "" : v;
+  // Reads from the customer being edited first, falls back to lead
+  // prefill for a brand-new customer, else blank.
+  const ev = (path, prefillKey)=>{
+    if(editing){
+      const parts = path.split(".");
+      let v = editing;
+      for(const part of parts){ v = v ? v[part] : undefined; }
+      return p(v);
+    }
+    return prefillKey!==undefined ? p(prefill[prefillKey]) : "";
+  };
+  const sel = (currentVal, optionVal)=> currentVal===optionVal ? "selected" : "";
   return `
     <div class="card">
       <div class="flex-between">
-        <h2>${session.convertLeadId ? "Convert Lead to Customer" : "New Customer"}</h2>
+        <h2>${editing ? "Edit Customer — "+esc(editing.personal.name) : session.convertLeadId ? "Convert Lead to Customer" : "New Customer"}</h2>
         <button class="btn btn-outline btn-sm" id="btn-cancel-customer">Cancel</button>
       </div>
-      <p class="sub">Complete the profile below. Fields carried over from the lead are pre-filled — please verify them.</p>
+      <p class="sub">${editing ? "Correcting details on an existing customer — including data brought in via Bulk Import." : "Complete the profile below. Fields carried over from the lead are pre-filled — please verify them."}</p>
 
       <h3 class="section-h">Personal Details</h3>
       <div class="grid grid-3">
-        <div class="field"><label>Full name</label><input id="c-name" value="${esc(p(prefill.applicantName))}"></div>
-        <div class="field"><label>Date of birth</label><input id="c-dob" type="date"></div>
-        <div class="field"><label>Gender</label><select id="c-gender">${GENDERS.map(g=>`<option>${g}</option>`).join("")}</select></div>
-        <div class="field"><label>Marital status</label><select id="c-marital">${MARITAL.map(m=>`<option>${m}</option>`).join("")}</select></div>
-        <div class="field"><label>Mobile</label><input id="c-mobile" value="${esc(p(prefill.mobile))}" maxlength="10"></div>
-        <div class="field"><label>Email</label><input id="c-email" type="email"></div>
+        <div class="field"><label>Full name</label><input id="c-name" value="${esc(ev("personal.name","applicantName"))}"></div>
+        <div class="field"><label>Date of birth</label><input id="c-dob" type="date" value="${esc(ev("personal.dob"))}"></div>
+        <div class="field"><label>Gender</label><select id="c-gender">${GENDERS.map(g=>`<option ${sel(ev("personal.gender"),g)}>${g}</option>`).join("")}</select></div>
+        <div class="field"><label>Marital status</label><select id="c-marital">${MARITAL.map(m=>`<option ${sel(ev("personal.maritalStatus"),m)}>${m}</option>`).join("")}</select></div>
+        <div class="field"><label>Mobile</label><input id="c-mobile" value="${esc(ev("personal.mobile","mobile"))}" maxlength="10"></div>
+        <div class="field"><label>Email</label><input id="c-email" type="email" value="${esc(ev("personal.email"))}"></div>
       </div>
 
       <h3 class="section-h">Family Details</h3>
       <div class="grid grid-2">
-        <div class="field"><label>Father's / Spouse's name</label><input id="c-family-name"></div>
-        <div class="field"><label>Dependents</label><input id="c-dependents" type="number" placeholder="e.g. 3"></div>
+        <div class="field"><label>Father's / Spouse's name</label><input id="c-family-name" value="${esc(ev("family.name"))}"></div>
+        <div class="field"><label>Dependents</label><input id="c-dependents" type="number" placeholder="e.g. 3" value="${esc(ev("family.dependents"))}"></div>
       </div>
 
       <h3 class="section-h">Address</h3>
       <div class="grid grid-2">
-        <div class="field"><label>Current address</label><textarea id="c-addr-current">${esc(p(prefill.location))}</textarea></div>
-        <div class="field"><label>Permanent address</label><textarea id="c-addr-permanent"></textarea></div>
+        <div class="field"><label>Current address</label><textarea id="c-addr-current">${esc(ev("address.current","location"))}</textarea></div>
+        <div class="field"><label>Permanent address</label><textarea id="c-addr-permanent">${esc(ev("address.permanent"))}</textarea></div>
       </div>
 
       <h3 class="section-h">Business &amp; Income</h3>
       <div class="grid grid-3">
-        <div class="field"><label>Business name</label><input id="c-biz-name"></div>
-        <div class="field"><label>Business type / occupation</label><input id="c-biz-type" value="${esc(p(prefill.occupation))}"></div>
-        <div class="field"><label>Years in operation</label><input id="c-biz-years" type="number"></div>
-        <div class="field"><label>Monthly income (₹)</label><input id="c-income-monthly" type="number" value="${esc(p(prefill.monthlyIncome))}"></div>
-        <div class="field"><label>Annual income (₹)</label><input id="c-income-annual" type="number" placeholder="Auto-calculated as monthly × 12"></div>
-        <div class="field"><label>Monthly expenses (₹)</label><input id="c-expenses-monthly" type="number"></div>
-        <div class="field"><label>Income source</label><input id="c-income-source"></div>
+        <div class="field"><label>Business name</label><input id="c-biz-name" value="${esc(ev("business.name"))}"></div>
+        <div class="field"><label>Business type / occupation</label><input id="c-biz-type" value="${esc(ev("business.type","occupation"))}"></div>
+        <div class="field"><label>Years in operation</label><input id="c-biz-years" type="number" value="${esc(ev("business.years"))}"></div>
+        <div class="field"><label>Monthly income (₹)</label><input id="c-income-monthly" type="number" value="${esc(ev("income.monthly","monthlyIncome"))}"></div>
+        <div class="field"><label>Annual income (₹)</label><input id="c-income-annual" type="number" placeholder="Auto-calculated as monthly × 12" value="${esc(ev("income.annual"))}"></div>
+        <div class="field"><label>Monthly expenses (₹)</label><input id="c-expenses-monthly" type="number" value="${esc(ev("income.monthlyExpenses"))}"></div>
+        <div class="field"><label>Income source</label><input id="c-income-source" value="${esc(ev("income.source"))}"></div>
       </div>
 
       <h3 class="section-h">Bank &amp; Nominee</h3>
       <div class="grid grid-3">
-        <div class="field"><label>Bank name</label><input id="c-bank-name"></div>
-        <div class="field"><label>Account number</label><input id="c-bank-account"></div>
-        <div class="field"><label>IFSC</label><input id="c-bank-ifsc" style="text-transform:uppercase;"></div>
-        <div class="field"><label>Nominee name</label><input id="c-nom-name"></div>
-        <div class="field"><label>Relationship</label><select id="c-nom-relation">${RELATIONSHIP_OPTIONS.map(r=>`<option>${r}</option>`).join("")}</select></div>
-        <div class="field"><label>Nominee mobile</label><input id="c-nom-mobile" maxlength="10"></div>
+        <div class="field"><label>Bank name</label><input id="c-bank-name" value="${esc(ev("bank.name"))}"></div>
+        <div class="field"><label>Account number</label><input id="c-bank-account" value="${esc(ev("bank.account"))}"></div>
+        <div class="field"><label>IFSC</label><input id="c-bank-ifsc" style="text-transform:uppercase;" value="${esc(ev("bank.ifsc"))}"></div>
+        <div class="field"><label>Nominee name</label><input id="c-nom-name" value="${esc(ev("nominee.name"))}"></div>
+        <div class="field"><label>Relationship</label><select id="c-nom-relation">${RELATIONSHIP_OPTIONS.map(r=>`<option ${sel(ev("nominee.relationship"),r)}>${r}</option>`).join("")}</select></div>
+        <div class="field"><label>Nominee mobile</label><input id="c-nom-mobile" maxlength="10" value="${esc(ev("nominee.mobile"))}"></div>
       </div>
 
       <h3 class="section-h">References</h3>
       <div class="grid grid-2">
-        <div class="field"><label>Reference 1 (name, mobile, relation)</label><input id="c-ref1" placeholder="e.g. Suresh Patil, 9876543210, Neighbour"></div>
-        <div class="field"><label>Reference 2 (name, mobile, relation)</label><input id="c-ref2" placeholder="e.g. Meena Rao, 9876500000, Relative"></div>
+        <div class="field"><label>Reference 1 (name, mobile, relation)</label><input id="c-ref1" placeholder="e.g. Suresh Patil, 9876543210, Neighbour" value="${esc(editing && editing.references ? (editing.references[0]||"") : "")}"></div>
+        <div class="field"><label>Reference 2 (name, mobile, relation)</label><input id="c-ref2" placeholder="e.g. Meena Rao, 9876500000, Relative" value="${esc(editing && editing.references ? (editing.references[1]||"") : "")}"></div>
       </div>
 
       <h3 class="section-h">Loan History &amp; Risk</h3>
       <div class="grid grid-2">
-        <div class="field"><label>Existing loans</label><textarea id="c-existing-loans" placeholder="Lender, amount, outstanding">${esc(p(prefill.existingLoan==="Yes" ? "Reported at lead stage — details pending" : ""))}</textarea></div>
-        <div class="field"><label>Previous loans (closed)</label><textarea id="c-previous-loans"></textarea></div>
-        <div class="field"><label>Credit score</label><input id="c-credit-score" type="number" placeholder="e.g. 720"></div>
-        <div class="field"><label>Risk category</label><select id="c-risk">${RISK_CATEGORIES.map(r=>`<option>${r}</option>`).join("")}</select></div>
+        <div class="field"><label>Existing loans</label><textarea id="c-existing-loans" placeholder="Lender, amount, outstanding">${esc(editing ? ev("existingLoans") : p(prefill.existingLoan==="Yes" ? "Reported at lead stage — details pending" : ""))}</textarea></div>
+        <div class="field"><label>Previous loans (closed)</label><textarea id="c-previous-loans">${esc(ev("previousLoans"))}</textarea></div>
+        <div class="field"><label>Credit score</label><input id="c-credit-score" type="number" placeholder="e.g. 720" value="${esc(ev("creditScore"))}"></div>
+        <div class="field"><label>Risk category</label><select id="c-risk">${RISK_CATEGORIES.map(r=>`<option ${sel(ev("riskCategory"),r)}>${r}</option>`).join("")}</select></div>
       </div>
 
       <h3 class="section-h">Digital KYC</h3>
       <div class="grid grid-2">
-        <div class="field"><label>Aadhaar number</label><input id="c-aadhaar" maxlength="12" placeholder="12-digit Aadhaar"></div>
-        <div class="field"><label>PAN number</label><input id="c-pan" maxlength="10" style="text-transform:uppercase;" placeholder="ABCDE1234F"></div>
-        <div class="field"><label>Additional ID type</label><select id="c-other-id-type"><option value="">— None —</option>${ID_TYPES.map(t=>`<option>${t}</option>`).join("")}</select></div>
-        <div class="field"><label>Additional ID number</label><input id="c-other-id-number"></div>
+        <div class="field"><label>Aadhaar number</label><input id="c-aadhaar" maxlength="12" placeholder="12-digit Aadhaar" value="${esc(ev("kyc.aadhaar"))}"></div>
+        <div class="field"><label>PAN number</label><input id="c-pan" maxlength="10" style="text-transform:uppercase;" placeholder="ABCDE1234F" value="${esc(ev("kyc.pan"))}"></div>
+        <div class="field"><label>Additional ID type</label><select id="c-other-id-type"><option value="">— None —</option>${ID_TYPES.map(t=>`<option ${sel(ev("kyc.otherIdType"),t)}>${t}</option>`).join("")}</select></div>
+        <div class="field"><label>Additional ID number</label><input id="c-other-id-number" value="${esc(ev("kyc.otherIdNumber"))}"></div>
       </div>
       <div class="kyc-upload-row">
         <div class="kyc-upload-box">
           <div class="small">Photograph</div>
-          <img id="photoBase64-preview">
+          <img id="photoBase64-preview" ${editing && editing.kyc.photoBase64 ? `src="${editing.kyc.photoBase64}"` : ''}>
           <input type="file" accept="image/*" data-draftkey="photoBase64" class="kyc-file-input">
         </div>
         <div class="kyc-upload-box">
           <div class="small">ID Document Scan</div>
-          <img id="docImageBase64-preview">
+          <img id="docImageBase64-preview" ${editing && editing.kyc.docImageBase64 ? `src="${editing.kyc.docImageBase64}"` : ''}>
           <input type="file" accept="image/*" data-draftkey="docImageBase64" class="kyc-file-input">
           <button type="button" class="btn btn-outline btn-sm" id="btn-ocr-doc" style="margin-top:6px; width:100%;">Auto-read ID</button>
         </div>
@@ -2213,14 +2226,14 @@ function renderCustomerForm(){
         </div>
         <div class="kyc-upload-box" style="width:200px;">
           <div class="small" style="margin-bottom:6px;">GPS Geo-tag</div>
-          <div class="gps-box" id="gps-display">Not captured</div>
+          <div class="gps-box" id="gps-display">${editing && editing.kyc.gpsLat ? `${editing.kyc.gpsLat}, ${editing.kyc.gpsLng}` : "Not captured"}</div>
           <button type="button" class="btn btn-outline btn-sm" id="btn-capture-gps" style="margin-top:8px;">Capture Location</button>
         </div>
       </div>
       <p class="hint" style="margin-top:10px;">Aadhaar/PAN entered here are checked against existing customers and flagged if duplicated. ID verification (Aadhaar/CKYC/etc.) is simulated in this prototype — no live regulatory API is called. "Auto-read ID" uses Claude's vision model to pre-fill fields from the uploaded scan — it only works while this file runs inside Claude.ai.</p>
 
       <div class="divider"></div>
-      <button class="btn btn-gold" id="btn-save-customer">Save Customer</button>
+      <button class="btn btn-gold" id="btn-save-customer" data-customer="${editing?editing.id:''}">${editing ? "Save Changes" : "Save Customer"}</button>
     </div>
   `;
 }
@@ -2247,7 +2260,10 @@ async function renderCustomerDetail(c){
     <div class="card">
       <div class="flex-between">
         <h2>${esc(c.personal.name)}</h2>
-        <button class="btn btn-outline btn-sm" id="btn-back-to-customers">← Back to list</button>
+        <div class="action-row">
+          <button class="btn btn-gold btn-sm" id="btn-edit-customer" data-customer="${c.id}">Edit</button>
+          <button class="btn btn-outline btn-sm" id="btn-back-to-customers">← Back to list</button>
+        </div>
       </div>
       ${c.duplicateFlag ? `<div class="warn-banner">⚠ ${esc(c.duplicateReason)}</div>` : ""}
       ${custLoans.length>0 || custSanctions.length>0 ? `
@@ -3251,12 +3267,35 @@ async function renderLoanAccountDetail(acc, customers){
   const payments = (await db.getAll("payments")).filter(p=>p.loanAccountId===acc.id).sort((a,b)=>new Date(b.createdAt)-new Date(a.createdAt));
   const today = todayStr();
   const totalPaid = payments.reduce((s,p)=>s+p.amount,0);
+  const canCorrect = ["Super Admin","Credit Manager"].includes(session.user.role);
+  const showCorrectForm = session.showCorrectLoanForm;
   return `
     <div class="card">
       <div class="flex-between">
         <h2>Loan Account — ${esc(cust?cust.personal.name:'')} <span class="small mono muted">(${esc(acc.accountNumber)||acc.id})</span></h2>
-        <button class="btn btn-outline btn-sm" id="btn-back-to-loans">← Back to list</button>
+        <div class="action-row">
+          ${canCorrect ? `<button class="btn btn-outline btn-sm" id="btn-open-correct-loan">Correct Terms</button>` : ""}
+          <button class="btn btn-outline btn-sm" id="btn-back-to-loans">← Back to list</button>
+        </div>
       </div>
+      ${showCorrectForm ? `
+      <div class="warn-banner" style="background:${payments.length>0?'#FBE7E8':'#FBF1DC'};border-color:${payments.length>0?'var(--danger)':'var(--gold)'};color:${payments.length>0?'#7A1F27':'#5C4200'};">
+        ⚠ This rebuilds the EMI schedule from scratch and re-marks installments Paid based on the count below — it does not move any money.
+        ${payments.length>0 ? `<b> This account already has ${payments.length} real EMI collection(s) recorded (₹${Math.round(totalPaid).toLocaleString('en-IN')} collected) — regenerating will make those collection records reference installments that no longer line up with the new schedule. Only proceed if you're certain, and reconcile collections manually afterward.</b>` : ` This account has no recorded collections yet, so it's safe to correct freely.`}
+      </div>
+      <div class="grid grid-3">
+        <div class="field"><label>Principal (₹)</label><input id="cl-principal" type="number" value="${acc.principal}"></div>
+        <div class="field"><label>Interest rate (% p.a.)</label><input id="cl-rate" type="number" step="0.1" value="${acc.interestRate}"></div>
+        <div class="field"><label>Tenure (months)</label><input id="cl-tenure" type="number" value="${acc.tenureMonths}"></div>
+        <div class="field"><label>Disbursed date</label><input id="cl-disbursed" type="date" value="${acc.disbursedDate}"></div>
+        <div class="field"><label>Account number</label><input id="cl-account-number" value="${esc(acc.accountNumber)||''}"></div>
+        <div class="field"><label>Installments already paid</label><input id="cl-installments-paid" type="number" value="${(acc.schedule||[]).filter(i=>i.status==='Paid').length}"></div>
+      </div>
+      <div class="action-row">
+        <button class="btn btn-danger btn-sm" id="btn-save-correct-loan" data-loan="${acc.id}">Regenerate &amp; Save</button>
+        <button class="btn btn-outline btn-sm" id="btn-cancel-correct-loan">Cancel</button>
+      </div>
+      ` : ""}
       <div class="grid grid-4">
         <div class="kpi"><div class="lbl">Principal</div><div class="val" style="font-size:18px;">${fmtINR(acc.principal)}</div></div>
         <div class="kpi"><div class="lbl">Principal Outstanding</div><div class="val" style="font-size:18px;">${fmtINR(acc.principalOutstanding)}</div></div>
@@ -5724,14 +5763,21 @@ function bindEvents(){
 
   // Customers
   const openNewCustomer = document.getElementById("btn-open-new-customer");
-  if(openNewCustomer) openNewCustomer.onclick = ()=>{ session.custSubview="new"; session.convertLeadId=null; session.leadPrefill=null; resetCustomerDraft(); render(); };
+  if(openNewCustomer) openNewCustomer.onclick = ()=>{ session.custSubview="new"; session.editingCustomer=null; session.convertLeadId=null; session.leadPrefill=null; resetCustomerDraft(); render(); };
   const cancelCustomer = document.getElementById("btn-cancel-customer");
-  if(cancelCustomer) cancelCustomer.onclick = ()=>{ session.custSubview="list"; render(); };
+  if(cancelCustomer) cancelCustomer.onclick = ()=>{ session.custSubview = session.editingCustomer ? "view" : "list"; session.viewingCustomerId = session.editingCustomer ? session.editingCustomer.id : session.viewingCustomerId; session.editingCustomer=null; render(); };
   const backToCustomers = document.getElementById("btn-back-to-customers");
   if(backToCustomers) backToCustomers.onclick = ()=>{ session.custSubview="list"; render(); };
   document.querySelectorAll(".view-customer-btn").forEach(btn=>{
     btn.onclick = ()=>{ session.custSubview="view"; session.viewingCustomerId=btn.dataset.customer; render(); };
   });
+  const editCustomerBtn = document.getElementById("btn-edit-customer");
+  if(editCustomerBtn) editCustomerBtn.onclick = async ()=>{
+    session.editingCustomer = await db.get("customers", editCustomerBtn.dataset.customer);
+    session.custSubview = "new";
+    resetCustomerDraft();
+    render();
+  };
   const saveCustomerBtn = document.getElementById("btn-save-customer");
   if(saveCustomerBtn) saveCustomerBtn.onclick = handleSaveCustomer;
   const monthlyIncomeInput = document.getElementById("c-income-monthly");
@@ -5861,6 +5907,12 @@ function bindEvents(){
   document.querySelectorAll(".view-loan-btn").forEach(btn=> btn.onclick = ()=>{ session.loanSubview="view"; session.viewingLoanId=btn.dataset.loan; render(); });
   const backToLoans = document.getElementById("btn-back-to-loans");
   if(backToLoans) backToLoans.onclick = ()=>{ session.loanSubview="list"; render(); };
+  const openCorrectLoan = document.getElementById("btn-open-correct-loan");
+  if(openCorrectLoan) openCorrectLoan.onclick = ()=>{ session.showCorrectLoanForm=true; render(); };
+  const cancelCorrectLoan = document.getElementById("btn-cancel-correct-loan");
+  if(cancelCorrectLoan) cancelCorrectLoan.onclick = ()=>{ session.showCorrectLoanForm=false; render(); };
+  const saveCorrectLoanBtn = document.getElementById("btn-save-correct-loan");
+  if(saveCorrectLoanBtn) saveCorrectLoanBtn.onclick = ()=> handleCorrectLoanTerms(saveCorrectLoanBtn.dataset.loan);
   const openCollect = document.getElementById("btn-open-collect");
   if(openCollect) openCollect.onclick = ()=>{ session.loanSubview="collect"; session.collectingLoanId=session.viewingLoanId; render(); };
   const cancelCollect = document.getElementById("btn-cancel-collect");
@@ -6899,6 +6951,51 @@ function handleViewReceipt(paymentId){
     session.loanSubview = "receipt";
     render();
   });
+}
+
+async function handleCorrectLoanTerms(loanId){
+  const u = session.user;
+  const acc = await db.get("loanAccounts", loanId);
+  if(!acc) return;
+  const principal = Number(document.getElementById("cl-principal").value);
+  const interestRate = Number(document.getElementById("cl-rate").value);
+  const tenureMonths = Number(document.getElementById("cl-tenure").value);
+  const disbursedDate = document.getElementById("cl-disbursed").value;
+  const accountNumber = document.getElementById("cl-account-number").value.trim();
+  const installmentsPaid = Number(document.getElementById("cl-installments-paid").value)||0;
+  if(!principal || principal<=0 || !interestRate || !tenureMonths || !disbursedDate){ toast("Fill in all loan terms with valid values."); return; }
+
+  const existingPayments = (await db.getAll("payments")).filter(p=>p.loanAccountId===loanId);
+  if(existingPayments.length>0){
+    if(!window.confirm(`This account has ${existingPayments.length} real collection(s) recorded. Regenerating the schedule will make those records reference installments that may no longer match. Continue anyway?`)) return;
+  }
+  if(accountNumber && accountNumber!==acc.accountNumber){
+    const clash = (await db.getAll("loanAccounts")).find(a=>a.id!==loanId && a.accountNumber===accountNumber);
+    if(clash){ toast("That account number is already in use by another loan account."); return; }
+  }
+
+  acc.principal = principal;
+  acc.interestRate = interestRate;
+  acc.tenureMonths = tenureMonths;
+  acc.disbursedDate = disbursedDate;
+  if(accountNumber) acc.accountNumber = accountNumber;
+
+  const gen = generateEmiSchedule(acc);
+  acc.schedule = gen.schedule; acc.emiAmount = gen.emiAmount; acc.totalInstallments = gen.totalInstallments;
+  const toMark = Math.min(installmentsPaid, acc.schedule.length);
+  for(let k=0; k<toMark; k++){
+    const inst = acc.schedule[k];
+    inst.status = "Paid"; inst.paidAmount = inst.emiAmount; inst.paidDate = inst.dueDate;
+  }
+  acc.principalOutstanding = acc.schedule.filter(i=>i.status!=="Paid").reduce((s,i)=>s+i.principalComponent,0);
+  acc.correctedAt = nowISO();
+  acc.correctedBy = u.name;
+  await db.put("loanAccounts", acc);
+
+  await logAudit(u.name, u.role, "Loan Account Terms Corrected", `${acc.accountNumber} — principal ${fmtINR(principal)}, rate ${interestRate}%, tenure ${tenureMonths}mo, ${toMark} installments marked paid${existingPayments.length>0?' — WARNING: had '+existingPayments.length+' real collection record(s) at time of correction':''}`);
+  toast("Loan terms corrected and schedule regenerated.");
+  session.showCorrectLoanForm = false;
+  render();
 }
 
 async function handleForecloseLoan(loanId){
@@ -8998,12 +9095,15 @@ async function handleSaveCustomer(){
   const mobile = val("c-mobile");
   if(!name){ toast("Customer name is required."); return; }
 
+  const existingId = document.getElementById("btn-save-customer").dataset.customer;
+  const existing = existingId ? await db.get("customers", existingId) : null;
+
   const aadhaar = val("c-aadhaar");
   const pan = val("c-pan").toUpperCase();
-  const duplicateReason = await checkDuplicateID(aadhaar, pan, null);
+  const duplicateReason = await checkDuplicateID(aadhaar, pan, existingId||null);
 
   const customer = {
-    id: uid("cus"),
+    id: existingId || uid("cus"),
     personal: { name, dob: val("c-dob"), gender: val("c-gender"), maritalStatus: val("c-marital"), mobile, email: val("c-email") },
     family: { name: val("c-family-name"), dependents: val("c-dependents") },
     address: { current: val("c-addr-current"), permanent: val("c-addr-permanent") },
@@ -9019,24 +9119,30 @@ async function handleSaveCustomer(){
     kyc: {
       aadhaar, pan,
       otherIdType: val("c-other-id-type"), otherIdNumber: val("c-other-id-number"),
-      photoBase64: customerDraft.photoBase64, docImageBase64: customerDraft.docImageBase64,
-      signatureBase64: sigPadCtx ? document.getElementById("sig-pad").toDataURL() : null,
-      gpsLat: customerDraft.gpsLat, gpsLng: customerDraft.gpsLng
+      // Preserve existing KYC images/signature/GPS unless a new one was
+      // actively captured during this edit session.
+      photoBase64: customerDraft.photoBase64 || (existing ? existing.kyc.photoBase64 : null),
+      docImageBase64: customerDraft.docImageBase64 || (existing ? existing.kyc.docImageBase64 : null),
+      signatureBase64: existing ? existing.kyc.signatureBase64 : (sigPadCtx ? document.getElementById("sig-pad").toDataURL() : null),
+      gpsLat: customerDraft.gpsLat || (existing ? existing.kyc.gpsLat : null),
+      gpsLng: customerDraft.gpsLng || (existing ? existing.kyc.gpsLng : null)
     },
     duplicateFlag: !!duplicateReason,
     duplicateReason: duplicateReason || "",
-    leadId: session.convertLeadId || null,
-    createdAt: nowISO(),
-    createdBy: session.user.name
+    leadId: existing ? existing.leadId : (session.convertLeadId || null),
+    createdAt: existing ? existing.createdAt : nowISO(),
+    createdBy: existing ? existing.createdBy : session.user.name,
+    updatedAt: existing ? nowISO() : null,
+    updatedBy: existing ? session.user.name : null
   };
 
   await db.put("customers", customer);
-  await logAudit(session.user.name, session.user.role, "Customer Created", `${name}${session.convertLeadId ? " (converted from lead)" : ""}`);
+  await logAudit(session.user.name, session.user.role, existing ? "Customer Updated" : "Customer Created", `${name}${session.convertLeadId && !existing ? " (converted from lead)" : ""}`);
   if(duplicateReason){
     await logAudit(session.user.name, session.user.role, "Duplicate ID Flagged", `${name}: ${duplicateReason}`);
   }
 
-  if(session.convertLeadId){
+  if(session.convertLeadId && !existing){
     const lead = await db.get("leads", session.convertLeadId);
     if(lead){
       lead.status = "Converted into Loan Application";
@@ -9046,8 +9152,10 @@ async function handleSaveCustomer(){
     }
   }
 
-  toast(duplicateReason ? "Customer saved — duplicate ID flagged for review." : "Customer saved.");
-  session.custSubview = "list";
+  toast(duplicateReason ? "Customer saved — duplicate ID flagged for review." : (existing ? "Changes saved." : "Customer saved."));
+  session.custSubview = existing ? "view" : "list";
+  session.viewingCustomerId = existing ? existing.id : session.viewingCustomerId;
+  session.editingCustomer = null;
   session.convertLeadId = null;
   session.leadPrefill = null;
   resetCustomerDraft();
