@@ -283,16 +283,21 @@ async function initFirebase(){
  *     fund position, portfolio risk, etc.) independently ask for the
  *     same collections; this avoids re-fetching the same thing several
  *     times for a single page load.
- *  2. staleCache — survives ACROSS render() calls for a short window
- *     (15s). This is what actually fixes slow menu navigation: without
- *     it, every single tab click re-fetched every collection fresh from
+ *  2. staleCache — survives ACROSS render() calls for a longer window.
+ *     This is what actually fixes slow menu navigation: without it,
+ *     every single tab click re-fetched every collection fresh from
  *     Firestore even though nothing had changed since the last click a
- *     second ago. Any write immediately invalidates both layers for that
- *     collection, so you're never looking at stale data after an action —
- *     you just don't pay a fresh round-trip for rapid clicking around. */
+ *     moment ago. Bumped up further after moving to real Security Rules —
+ *     every read now costs an extra staff/{uid} lookup for Firestore to
+ *     evaluate isStaff()/isSuperAdmin(), which is real, unavoidable
+ *     latency that real access control adds; caching more aggressively
+ *     is the lever available to offset it. Any write immediately
+ *     invalidates both layers for that collection, so you're never
+ *     looking at stale data after an action — you just don't pay a
+ *     fresh round-trip (rule evaluation and all) for rapid clicking. */
 let renderCache = {};
 let staleCache = {};
-const STALE_CACHE_MS = 45000;
+const STALE_CACHE_MS = 90000;
 function clearRenderCache(){ renderCache = {}; }
 
 const db = {
@@ -1677,17 +1682,16 @@ function borrowerRegisterPanel(){
    --------------------------------------------------------------------- */
 async function renderStaffShell(){
   const u = session.user;
-  const [leads, borrowers, customers, products, appraisals, sanctions, loanAccounts, payments, staffList] = await Promise.all([
+  const [leads, borrowers, customers, products, appraisals, sanctions, loanAccounts, payments, staffList, onboardingDone] = await Promise.all([
     db.getAll("leads"), db.getAll("borrowers"), db.getAll("customers"), db.getAll("products"),
     db.getAll("appraisals"), db.getAll("sanctions"), db.getAll("loanAccounts"), db.getAll("payments"),
-    db.getAll("staff")
+    db.getAll("staff"), db.get("meta","onboardingComplete")
   ]);
   const staffCount = staffList.length;
   const newLeads = leads.filter(l=>l.status==="New").length;
   const canManagePolicy = u.role==="Super Admin" || u.role==="Credit Manager";
   const canManageFunds = ["Super Admin","Accounts","Operations Manager","Credit Manager"].includes(u.role);
   const canSeeReports = [...DASHBOARD_ROLES, "Accounts"].includes(u.role);
-  const onboardingDone = await db.get("meta","onboardingComplete");
   const needsOnboarding = u.role==="Super Admin" && !onboardingDone;
 
   let tabContent = "";
@@ -1748,10 +1752,12 @@ async function renderStaffShell(){
   }
 
   const canSeeDashboard = DASHBOARD_ROLES.includes(u.role);
-  const fundPos = await computeFundPosition();
-  const emiPos = await computeEmiPosition(loanAccounts, payments);
-  const riskPos = await computePortfolioRisk(loanAccounts, payments);
-  const notifications = await computeNotifications();
+  const [fundPos, emiPos, riskPos, notifications] = await Promise.all([
+    computeFundPosition(),
+    computeEmiPosition(loanAccounts, payments),
+    computePortfolioRisk(loanAccounts, payments),
+    computeNotifications()
+  ]);
 
   return `
   <div id="app-inner">
