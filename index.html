@@ -263,11 +263,16 @@ async function initFirebase(){
   }
   firebase.initializeApp(FIREBASE_CONFIG);
   firestoreDb = firebase.firestore();
-  // Anonymous auth: required so Firestore security rules can require
-  // request.auth != null (blocks the database being wide open to anyone
-  // on the internet who finds the project config). This is NOT the same
-  // as real staff/borrower login — see the Security Rules note shipped
-  // alongside this file for what this does and doesn't protect against.
+  // Anonymous auth here is now ONLY a bootstrap step — it satisfies
+  // "request.auth != null" so the app can read the single public
+  // meta/setupStatus flag (used to decide whether to show first-run
+  // setup or the login screen) before anyone has actually logged in.
+  // It grants NO access to real data: the Firestore Security Rules
+  // shipped alongside this file only grant access to collections once
+  // the signed-in UID matches a real staff/{uid} or borrowers/{uid}
+  // document — which an anonymous session never does. Real access
+  // requires actual staff or borrower login (email/password against
+  // Firebase Auth), handled in handleStaffLogin/handleBorrowerLogin.
   await firebase.auth().signInAnonymously();
   firebaseReady = true;
 }
@@ -326,6 +331,27 @@ const db = {
 };
 
 function uid(prefix){ return prefix+"_"+Date.now().toString(36)+Math.random().toString(36).slice(2,7); }
+
+/** Firebase Auth's Email/Password provider needs an email-shaped
+ *  identifier even though staff and borrowers just enter a username or
+ *  mobile number in the app UI — these build a synthetic, deterministic
+ *  one from what they actually typed. Nothing is ever sent to these
+ *  addresses; they're only used as Firebase Auth account identifiers. */
+function staffAuthEmail(username){
+  return username.trim().toLowerCase().replace(/[^a-z0-9._-]/g,"") + "@staff.nbfclms.local";
+}
+function borrowerAuthEmail(mobile){
+  return mobile.trim() + "@borrower.nbfclms.local";
+}
+function friendlyAuthError(err){
+  const code = err && err.code || "";
+  if(code.includes("wrong-password") || code.includes("user-not-found") || code.includes("invalid-credential")) return "Invalid username/mobile or password.";
+  if(code.includes("email-already-in-use")) return "That username or mobile number is already registered.";
+  if(code.includes("weak-password")) return "Password is too weak — use at least 6 characters.";
+  if(code.includes("network-request-failed")) return "Network error — check your connection and try again.";
+  return "Something went wrong: " + (err && err.message || err);
+}
+
 function nowISO(){ return new Date().toISOString(); }
 function fmtDate(iso){ const d=new Date(iso); return d.toLocaleDateString('en-IN',{day:'2-digit',month:'short',year:'numeric'})+" "+d.toLocaleTimeString('en-IN',{hour:'2-digit',minute:'2-digit'}); }
 function fmtINR(n){ if(n===null||n===undefined||isNaN(n)) return "—"; return "₹"+Number(n).toLocaleString('en-IN'); }
@@ -1427,17 +1453,13 @@ function toast(msg){
 }
 
 /* ---------------------------------------------------------------------
-   First-run seed
+   First-run: removed. Super Admin creation now happens exclusively
+   through the Setup Admin screen (handleSetupAdmin), which creates a
+   real Firebase Auth account with a password the person actually
+   chooses. The previous version of this function auto-created a
+   hardcoded "admin"/"admin123" staff record on every boot — a real
+   security hole, and unnecessary now that Setup Admin exists.
    --------------------------------------------------------------------- */
-async function ensureSeed(){
-  const metaFlag = await db.get("meta","seeded");
-  if(metaFlag) return;
-  await db.put("staff", {
-    id: uid("stf"), name:"System Administrator", username:"admin", password:"admin123",
-    role:"Super Admin", branch:"Head Office", createdAt: nowISO(), createdBy:"system"
-  });
-  await db.put("meta", {key:"seeded", value:true});
-}
 
 async function ensureSeedPhase3(){
   const flag = await db.get("meta","seededPhase3");
@@ -1513,8 +1535,11 @@ async function render(){
   const app = document.getElementById("app");
   app.innerHTML = `<div style="padding:60px;text-align:center;color:#5C6579;">Loading…</div>`;
 
-  const staffList = await db.getAll("staff");
-  const firstRun = staffList.length === 0;
+  // Only meta/setupStatus is readable pre-login (see Security Rules) —
+  // the real staff collection is locked down and can't be enumerated
+  // by anyone who hasn't actually authenticated as staff.
+  const setupStatus = await db.get("meta","setupStatus");
+  const firstRun = !setupStatus || !setupStatus.initialized;
 
   let body = "";
   if(session.type === "staff"){
@@ -1563,7 +1588,7 @@ function renderLanding(){
         </div>
       </div>
       <div class="card small muted">
-        Data is now stored in your Firebase project (shared across staff and borrowers), not just this browser. Do not enter real customer or financial data until Firestore Security Rules and proper staff/borrower authentication are in place — see the setup notes shipped with this file. KYC ID verification is simulated — no live Aadhaar/PAN/CKYC API calls are made.
+        Staff and borrowers now sign in with real Firebase accounts (no more plaintext passwords), and access is meant to be enforced by Firestore Security Rules — but that only takes effect once you've published the rules in <code>firestore.rules</code> to your Firebase project (Console → Firestore → Rules). Until you've done that, the database may still be running on older, permissive rules. See <code>SECURITY_MIGRATION.md</code> shipped with this file — you'll need to re-create your Super Admin login once, a one-time step. KYC ID verification is simulated — no live Aadhaar/PAN/CKYC API calls are made.
       </div>
     </main>
     <div class="footer-note">NBFC LMS — Developed by Anil Sharma, Former General Manager, Central Bank of India</div>
@@ -5069,9 +5094,21 @@ function bindEvents(){
   if(loginBtn) loginBtn.onclick = handleStaffLogin;
 
   const logoutStaff = document.querySelector('[data-action="staff-logout"]');
-  if(logoutStaff) logoutStaff.onclick = ()=>{ logAudit(session.user.name, session.user.role, "Logout", ""); session={type:null,user:null}; setRoute("landing"); };
+  if(logoutStaff) logoutStaff.onclick = async ()=>{
+    await logAudit(session.user.name, session.user.role, "Logout", "");
+    session={type:null,user:null};
+    await firebase.auth().signOut();
+    await firebase.auth().signInAnonymously();
+    setRoute("landing");
+  };
   const logoutBorrower = document.querySelector('[data-action="borrower-logout"]');
-  if(logoutBorrower) logoutBorrower.onclick = ()=>{ logAudit(session.user.name, "Borrower", "Logout", ""); session={type:null,user:null}; setRoute("landing"); };
+  if(logoutBorrower) logoutBorrower.onclick = async ()=>{
+    await logAudit(session.user.name, "Borrower", "Logout", "");
+    session={type:null,user:null};
+    await firebase.auth().signOut();
+    await firebase.auth().signInAnonymously();
+    setRoute("landing");
+  };
 
   const toggleNotifs = document.getElementById("btn-toggle-notifs");
   if(toggleNotifs) toggleNotifs.onclick = ()=>{ session.showNotifPanel = !session.showNotifPanel; render(); };
@@ -7302,7 +7339,7 @@ async function handleFactoryReset(){
   for(const c of ALL_COLLECTIONS){ totalRecords[c] = (await db.getAll(c)).length; grandTotal += totalRecords[c]; }
   if(grandTotal===0){ toast("There's nothing to delete."); return; }
 
-  if(!window.confirm(`⚠ BE CAREFUL — this will permanently erase ALL data: ${grandTotal} record(s) across every collection, including your own staff login. There is no undo, no recycle bin, and no way to recover it afterward. Have you downloaded a backup? Click OK only if you are certain.`)) return;
+  if(!window.confirm(`⚠ BE CAREFUL — this will permanently erase ALL data: ${grandTotal} record(s) across every collection, including your own staff Firestore record. There is no undo, no recycle bin, and no way to recover it afterward. Note: this does not delete Firebase Auth accounts themselves (only Firestore data) — old logins will need a fresh Setup Admin run with a new username afterward. Have you downloaded a backup? Click OK only if you are certain.`)) return;
   const typed = window.prompt(`Last chance. Type DELETE EVERYTHING (exactly, in capitals) to permanently erase all data.`, "");
   if(typed !== "DELETE EVERYTHING"){ toast("Cancelled — nothing was deleted."); return; }
 
@@ -7316,6 +7353,8 @@ async function handleFactoryReset(){
   }
   toast("Factory reset complete — this NBFC LMS is now empty. Signing you out.");
   session = {type:null, user:null};
+  await firebase.auth().signOut();
+  await firebase.auth().signInAnonymously();
   setRoute("landing");
 }
 
@@ -7468,26 +7507,48 @@ async function handleSetupAdmin(){
   const username = document.getElementById("su-username").value.trim();
   const password = document.getElementById("su-password").value;
   if(!name || !username || !password){ toast("Please fill in all fields."); return; }
-  const staffRec = { id: uid("stf"), name, username, password, role:"Super Admin", branch:"Head Office", createdAt: nowISO(), createdBy:"self-setup" };
-  await db.put("staff", staffRec);
-  await db.put("meta", {key:"seeded", value:true});
-  await logAudit(name, "Super Admin", "Account Created", "First-run Super Admin setup");
-  session = {type:"staff", user: staffRec};
-  await logAudit(name, "Super Admin", "Login", "");
-  toast("Super Admin created. Welcome, "+name+".");
-  render();
+  if(password.length<6){ toast("Password must be at least 6 characters."); return; }
+  toast("Creating your account…");
+  try{
+    const cred = await firebase.auth().createUserWithEmailAndPassword(staffAuthEmail(username), password);
+    const newUid = cred.user.uid;
+    const staffRec = { id: newUid, name, username, role:"Super Admin", branch:"Head Office", createdAt: nowISO(), createdBy:"self-setup" };
+    await db.put("staff", staffRec);
+    await db.put("meta", { key:"setupStatus", initialized:true });
+    await logAudit(name, "Super Admin", "Account Created", "First-run Super Admin setup — real Firebase Auth account");
+    session = {type:"staff", user: staffRec};
+    await logAudit(name, "Super Admin", "Login", "");
+    await ensureAllSeeds();
+    toast("Super Admin created. Welcome, "+name+".");
+    render();
+  } catch(err){
+    console.error(err);
+    toast(friendlyAuthError(err));
+  }
 }
 
 async function handleStaffLogin(){
   const username = document.getElementById("login-username").value.trim();
   const password = document.getElementById("login-password").value;
-  const staffList = await db.getAll("staff");
-  const match = staffList.find(s=>s.username===username && s.password===password);
-  if(!match){ toast("Invalid username or password."); return; }
-  session = {type:"staff", user: match};
-  await logAudit(match.name, match.role, "Login", "");
-  toast("Welcome back, "+match.name+".");
-  render();
+  if(!username || !password){ toast("Enter your username and password."); return; }
+  try{
+    const cred = await firebase.auth().signInWithEmailAndPassword(staffAuthEmail(username), password);
+    const match = await db.get("staff", cred.user.uid);
+    if(!match){
+      toast("Account exists in Firebase Auth but not in staff records — contact your Super Admin.");
+      await firebase.auth().signOut();
+      await firebase.auth().signInAnonymously();
+      return;
+    }
+    session = {type:"staff", user: match};
+    await logAudit(match.name, match.role, "Login", "");
+    await ensureAllSeeds();
+    toast("Welcome back, "+match.name+".");
+    render();
+  } catch(err){
+    console.error(err);
+    toast(friendlyAuthError(err));
+  }
 }
 
 async function handleBorrowerRegister(){
@@ -7497,27 +7558,44 @@ async function handleBorrowerRegister(){
   const location = document.getElementById("br-location").value.trim();
   if(!name || !mobile || !password){ toast("Please fill in name, mobile, and password."); return; }
   if(!/^\d{10}$/.test(mobile)){ toast("Enter a valid 10-digit mobile number."); return; }
-  const existing = (await db.getAll("borrowers")).find(b=>b.mobile===mobile);
-  if(existing){ toast("An account with this mobile number already exists — please login."); return; }
-  const rec = { id: uid("bor"), name, mobile, password, location, createdAt: nowISO() };
-  await db.put("borrowers", rec);
-  await logAudit(name, "Borrower", "Self-Registered", "Mobile: "+mobile);
-  session = {type:"borrower", user: rec};
-  await logAudit(name, "Borrower", "Login", "");
-  toast("Account created. Welcome, "+name+".");
-  render();
+  if(password.length<6){ toast("Password must be at least 6 characters."); return; }
+  toast("Creating your account…");
+  try{
+    const cred = await firebase.auth().createUserWithEmailAndPassword(borrowerAuthEmail(mobile), password);
+    const rec = { id: cred.user.uid, name, mobile, location, createdAt: nowISO() };
+    await db.put("borrowers", rec);
+    await logAudit(name, "Borrower", "Self-Registered", "Mobile: "+mobile);
+    session = {type:"borrower", user: rec};
+    await logAudit(name, "Borrower", "Login", "");
+    toast("Account created. Welcome, "+name+".");
+    render();
+  } catch(err){
+    console.error(err);
+    toast(friendlyAuthError(err));
+  }
 }
 
 async function handleBorrowerLogin(){
   const mobile = document.getElementById("bl-mobile").value.trim();
   const password = document.getElementById("bl-password").value;
-  const borrowers = await db.getAll("borrowers");
-  const match = borrowers.find(b=>b.mobile===mobile && b.password===password);
-  if(!match){ toast("Invalid mobile number or password."); return; }
-  session = {type:"borrower", user: match};
-  await logAudit(match.name, "Borrower", "Login", "");
-  toast("Welcome back, "+match.name+".");
-  render();
+  if(!mobile || !password){ toast("Enter your mobile number and password."); return; }
+  try{
+    const cred = await firebase.auth().signInWithEmailAndPassword(borrowerAuthEmail(mobile), password);
+    const match = await db.get("borrowers", cred.user.uid);
+    if(!match){
+      toast("Account exists but borrower record wasn't found — contact support.");
+      await firebase.auth().signOut();
+      await firebase.auth().signInAnonymously();
+      return;
+    }
+    session = {type:"borrower", user: match};
+    await logAudit(match.name, "Borrower", "Login", "");
+    toast("Welcome back, "+match.name+".");
+    render();
+  } catch(err){
+    console.error(err);
+    toast(friendlyAuthError(err));
+  }
 }
 
 async function handleAddStaff(){
@@ -7527,13 +7605,30 @@ async function handleAddStaff(){
   const role = document.getElementById("nu-role").value;
   const branch = document.getElementById("nu-branch").value.trim();
   if(!name || !username || !password){ toast("Please fill in name, username, and password."); return; }
+  if(password.length<6){ toast("Password must be at least 6 characters."); return; }
   const existing = (await db.getAll("staff")).find(s=>s.username===username);
   if(existing){ toast("That username is already taken."); return; }
-  const rec = { id: uid("stf"), name, username, password, role, branch, createdAt: nowISO(), createdBy: session.user.name };
-  await db.put("staff", rec);
-  await logAudit(session.user.name, session.user.role, "Staff User Created", `${name} (${role}) — maker: ${session.user.name}`);
-  toast("User created: "+name);
-  render();
+  toast("Creating account…");
+  // Firebase's client SDK signs in as whoever createUserWithEmailAndPassword
+  // just created — on the PRIMARY app that would silently log the current
+  // Super Admin out mid-session. A throwaway secondary app instance keeps
+  // the new account creation isolated from the admin's own session.
+  const secondaryApp = firebase.initializeApp(FIREBASE_CONFIG, "Secondary-"+Date.now());
+  try{
+    const cred = await secondaryApp.auth().createUserWithEmailAndPassword(staffAuthEmail(username), password);
+    const newUid = cred.user.uid;
+    await secondaryApp.auth().signOut();
+    const rec = { id: newUid, name, username, role, branch, createdAt: nowISO(), createdBy: session.user.name };
+    await db.put("staff", rec);
+    await logAudit(session.user.name, session.user.role, "Staff User Created", `${name} (${role}) — maker: ${session.user.name}`);
+    toast("User created: "+name);
+    render();
+  } catch(err){
+    console.error(err);
+    toast(friendlyAuthError(err));
+  } finally {
+    await secondaryApp.delete();
+  }
 }
 
 async function handleLoadDemoData(){
@@ -8149,16 +8244,25 @@ async function handleSendFloatingHelp(){
   renderFloatingHelpPanel();
 }
 
+/** Runs every product/policy/fund/compliance/etc. seed. Safe to call
+ *  repeatedly — each seed function guards itself with its own meta
+ *  flag. Called after a real staff login (or right after Setup Admin
+ *  creates the account) rather than on boot, because these seeds write
+ *  to collections the new Security Rules correctly restrict to
+ *  authenticated staff — an anonymous pre-login session can no longer
+ *  write them, which is the whole point of the rules. */
+async function ensureAllSeeds(){
+  await ensureSeedPhase3();
+  await ensureSeedPhase4();
+  await ensureSeedCompliance();
+  await ensureSeedYearEndClosing();
+  await ensureSeedMicroEnterpriseTemplates();
+  await backfillLoanSchedules();
+}
+
 (async function boot(){
   try{
     await initFirebase();
-    await ensureSeed();
-    await ensureSeedPhase3();
-    await ensureSeedPhase4();
-    await ensureSeedCompliance();
-    await ensureSeedYearEndClosing();
-    await ensureSeedMicroEnterpriseTemplates();
-    await backfillLoanSchedules();
     if("serviceWorker" in navigator){
       navigator.serviceWorker.register("sw.js").catch(()=>{ /* fine if unavailable, e.g. opened via file:// */ });
     }
