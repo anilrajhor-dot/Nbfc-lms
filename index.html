@@ -560,6 +560,85 @@ async function computeAccountingSummary(){
   };
 }
 
+/* =========================================================================
+   Financial Statements — Schedule III, Division III format (the format
+   Ind-AS-compliant NBFCs use under the Companies Act, distinct from a
+   regular company's Division II format: assets/liabilities are split
+   into Financial vs Non-Financial and presented in order of liquidity,
+   not current/non-current). Built from the same figures already tracked
+   elsewhere in the app, mapped onto the prescribed line items — this is
+   a structural template to speed up your actual filing, not a
+   substitute for your statutory auditor's sign-off. Verify every line
+   against your books and current MCA/ICAI guidance before relying on it.
+   ========================================================================= */
+function sumJournalByCategory(journalEntries, categories){
+  return journalEntries.filter(j=> (!j.status || j.status==="Posted") && j.type==="Expense" && categories.includes(j.category)).reduce((s,j)=>s+j.amount,0);
+}
+
+async function computeScheduleIIIFigures(){
+  const acct = await computeAccountingSummary();
+  const fixedAssets = await db.getAll("fixedAssets");
+  const bankBorrowings = await db.getAll("bankBorrowings");
+
+  // --- Balance Sheet ---
+  const cashAndEquivalents = acct.fundAccounts.filter(a=>a.type==="Cash").reduce((s,a)=>s+a.balance,0);
+  const bankBalances = acct.fundAccounts.filter(a=>["Bank Account","UPI"].includes(a.type)).reduce((s,a)=>s+a.balance,0);
+  const investments = acct.fundAccounts.filter(a=>a.type==="Investment").reduce((s,a)=>s+a.balance,0);
+  const grossLoans = acct.portfolioOutstanding;
+  const impairmentAllowance = acct.npaProvision;
+  const netLoans = Math.max(0, grossLoans - impairmentAllowance);
+  const totalFinancialAssets = cashAndEquivalents + bankBalances + investments + netLoans;
+
+  const activeAssets = fixedAssets.filter(a=>a.status==="Active");
+  let ppeBookValue = 0;
+  activeAssets.forEach(a=>{ ppeBookValue += computeAssetBookValue(a).bookValue; });
+  const totalNonFinancialAssets = ppeBookValue;
+
+  const totalAssets = totalFinancialAssets + totalNonFinancialAssets;
+
+  const termLoanBorrowings = acct.fundAccounts.filter(a=>a.type==="Borrowing").reduce((s,a)=>s+a.balance,0);
+  const ccOdUtilized = bankBorrowings.filter(b=>!b.affectsFundBalance && b.status==="Active").reduce((s,b)=>s+(b.utilizedAmount||0),0);
+  const totalBorrowings = termLoanBorrowings + ccOdUtilized;
+  const totalFinancialLiabilities = totalBorrowings;
+  const totalNonFinancialLiabilities = 0;
+
+  const equityShareCapital = acct.fundAccounts.filter(a=>a.type==="Capital").reduce((s,a)=>s+a.balance,0);
+  // Other Equity (retained earnings) is a balancing figure — same
+  // reconciliation approach as the Trial Balance elsewhere in the app.
+  const otherEquity = totalAssets - totalFinancialLiabilities - totalNonFinancialLiabilities - equityShareCapital;
+  const totalEquity = equityShareCapital + otherEquity;
+  const totalLiabilitiesAndEquity = totalFinancialLiabilities + totalNonFinancialLiabilities + totalEquity;
+
+  // --- Statement of Profit & Loss ---
+  const financeCosts = sumJournalByCategory(acct.journalEntries, ["Interest on Borrowings"]);
+  const feesCommissionExpense = sumJournalByCategory(acct.journalEntries, ["DSA Commission"]);
+  const employeeBenefits = sumJournalByCategory(acct.journalEntries, ["Salaries"]);
+  let depreciation = 0;
+  activeAssets.forEach(a=>{ depreciation += computeAssetBookValue(a).accumulatedDepreciation; });
+  const otherExpenseCategories = (await getCategoryConfig()).expenseCategories.filter(c=>!["Interest on Borrowings","DSA Commission","Salaries"].includes(c));
+  const otherExpenses = sumJournalByCategory(acct.journalEntries, otherExpenseCategories);
+
+  const revenueFromOperations = acct.interestIncome + acct.processingFeeIncome;
+  const totalIncome = revenueFromOperations + acct.otherIncome;
+  const totalExpenses = financeCosts + feesCommissionExpense + acct.npaProvision + employeeBenefits + depreciation + otherExpenses;
+  const profitBeforeTax = totalIncome - totalExpenses;
+
+  return {
+    balanceSheet: {
+      cashAndEquivalents, bankBalances, investments, grossLoans, impairmentAllowance, netLoans, totalFinancialAssets,
+      ppeBookValue, totalNonFinancialAssets, totalAssets,
+      termLoanBorrowings, ccOdUtilized, totalBorrowings, totalFinancialLiabilities, totalNonFinancialLiabilities,
+      equityShareCapital, otherEquity, totalEquity, totalLiabilitiesAndEquity
+    },
+    profitLoss: {
+      interestIncome: acct.interestIncome, feesCommissionIncome: acct.processingFeeIncome, revenueFromOperations,
+      otherIncome: acct.otherIncome, totalIncome,
+      financeCosts, feesCommissionExpense, impairment: acct.npaProvision, employeeBenefits, depreciation, otherExpenses, totalExpenses,
+      profitBeforeTax, profitAfterTax: profitBeforeTax
+    }
+  };
+}
+
 /* ---------------------------------------------------------------------
    Bank Reconciliation — upload a CSV of your NBFC's actual bank
    statement and auto-match it against transactions the app itself
@@ -656,7 +735,7 @@ const ALL_COLLECTIONS = [
   "recoveryVisits","apiConfig","aiConfig","nbfcProfile","categoryConfig","journalEntries","complianceItems","rbiReturnFilings",
   "staffSalaries","payrollRuns","dsaAgents","dsaCommissions",
   "shgGroups","shgMembers","shgSavings","shgInternalLoans","microEnterpriseTemplates",
-  "bankStatementLines","bankBorrowings","fixedAssets",
+  "bankStatementLines","bankBorrowings","fixedAssets","projectionAssumptions",
   "auditLog","meta"
 ];
 
@@ -1721,6 +1800,10 @@ async function renderStaffShell(){
     tabContent = await renderFundsTab();
   } else if(tab === "accounting" && canManageFunds){
     tabContent = await renderAccountingTab();
+  } else if(tab === "financialstatements" && canManageFunds){
+    tabContent = await renderFinancialStatementsTab();
+  } else if(tab === "projections" && canManageFunds){
+    tabContent = await renderProjectionsTab();
   } else if(tab === "bankrecon" && canManageFunds){
     tabContent = await renderBankReconTab();
   } else if(tab === "payrolldsa" && canManageFunds){
@@ -1801,6 +1884,8 @@ async function renderStaffShell(){
         <button class="tab ${tab==='reminders'?'active':''}" data-tab="reminders">Reminders</button>
         ${canManageFunds ? `<button class="tab ${tab==='funds'?'active':''}" data-tab="funds">Fund Management</button>`:""}
         ${canManageFunds ? `<button class="tab ${tab==='accounting'?'active':''}" data-tab="accounting">Accounting</button>`:""}
+        ${canManageFunds ? `<button class="tab ${tab==='financialstatements'?'active':''}" data-tab="financialstatements">Financial Statements</button>`:""}
+        ${canManageFunds ? `<button class="tab ${tab==='projections'?'active':''}" data-tab="projections">Projections</button>`:""}
         ${canManageFunds ? `<button class="tab ${tab==='bankrecon'?'active':''}" data-tab="bankrecon">Bank Reconciliation</button>`:""}
         ${canManageFunds ? `<button class="tab ${tab==='payrolldsa'?'active':''}" data-tab="payrolldsa">Payroll &amp; DSA</button>`:""}
         <button class="tab ${tab==='shgrural'?'active':''}" data-tab="shgrural">SHG / Rural Finance</button>
@@ -3484,6 +3569,64 @@ async function renderInterestAccrualCard(){
    Fixed Assets Register — cost, method, rate, live-computed book value.
    Illustrative approximation, not a Schedule II compliant schedule.
    --------------------------------------------------------------------- */
+/* ---------------------------------------------------------------------
+   Cash Flow Statement — indirect method, simplified management view.
+   For an NBFC, lending is the core business, so loan disbursements and
+   collections are treated as Operating activity (not Investing, as they
+   would be for a non-financial company) — consistent with how banks and
+   NBFCs typically present this under Ind AS 7. This is a since-inception
+   reconstruction from current records, not a true period-on-period
+   statement (the app doesn't track opening/closing balances by period) —
+   treat it as "how did we get to today's cash position," not a
+   month/quarter-specific report.
+   --------------------------------------------------------------------- */
+async function renderCashFlowCard(){
+  const acct = await computeAccountingSummary();
+  const bankBorrowings = await db.getAll("bankBorrowings");
+  const fixedAssets = await db.getAll("fixedAssets");
+
+  const netLendingOutflow = acct.principalDisbursed - acct.principalCollected;
+  const operatingCash = acct.interestIncome + acct.processingFeeIncome + acct.otherIncome - acct.operatingExpenses - netLendingOutflow;
+
+  const fixedAssetsPurchased = fixedAssets.reduce((s,a)=>s+a.cost,0);
+  const investingCash = -fixedAssetsPurchased;
+
+  const capitalContributed = acct.fundAccounts.filter(a=>a.type==="Capital").reduce((s,a)=>s+a.balance,0);
+  const borrowingsDrawn = bankBorrowings.filter(b=>b.affectsFundBalance).reduce((s,b)=>s+b.sanctionedAmount,0);
+  const financingCash = capitalContributed + borrowingsDrawn;
+
+  const netChange = operatingCash + investingCash + financingCash;
+
+  const row = (label, value, bold)=>`<tr><td>${bold?`<b>${label}</b>`:label}</td><td style="text-align:right;">${bold?`<b>${fmtINR(Math.round(value))}</b>`:fmtINR(Math.round(value))}</td></tr>`;
+
+  return `
+    <div class="card">
+      <h2 style="font-size:16px;">Cash Flow Statement</h2>
+      <p class="sub">Indirect method. For an NBFC, loan disbursements and collections are treated as Operating activity, not Investing, since lending is the core business. This is reconstructed from current records since inception, not a fixed period like a month or quarter — it explains how the business arrived at today's cash position.</p>
+      <div class="warn-banner" style="background:#FBF1DC;border-color:var(--gold);color:#5C4200;">⚠ Illustrative management view only — not a statutory Cash Flow Statement under Ind AS 7 / AS 3.</div>
+      <table><tbody>
+        <tr><td colspan="2"><b>Cash Flow from Operating Activities</b></td></tr>
+        ${row("Interest Income Collected", acct.interestIncome)}
+        ${row("Processing Fee Income", acct.processingFeeIncome)}
+        ${row("Other Income", acct.otherIncome)}
+        ${row("Operating Expenses", -acct.operatingExpenses)}
+        ${row("Net Increase in Loan Portfolio (Disbursed − Collected)", -netLendingOutflow)}
+        ${row("Net Cash from Operating Activities", operatingCash, true)}
+        <tr><td colspan="2" style="padding-top:14px;"><b>Cash Flow from Investing Activities</b></td></tr>
+        ${row("Fixed Assets Purchased", -fixedAssetsPurchased)}
+        ${row("Net Cash used in Investing Activities", investingCash, true)}
+        <tr><td colspan="2" style="padding-top:14px;"><b>Cash Flow from Financing Activities</b></td></tr>
+        ${row("Capital Contributed", capitalContributed)}
+        ${row("Borrowings Drawn (Term Loans)", borrowingsDrawn)}
+        ${row("Net Cash from Financing Activities", financingCash, true)}
+        <tr style="border-top:2px solid var(--navy-900);"><td style="padding-top:10px;"><b>Net Change in Cash</b></td><td style="text-align:right; padding-top:10px;"><b>${fmtINR(Math.round(netChange))}</b></td></tr>
+        <tr><td>Cash &amp; Bank Balance (per Fund Management, for reference)</td><td style="text-align:right;">${fmtINR(Math.round(acct.cashBankBalance))}</td></tr>
+      </tbody></table>
+      <p class="small muted" style="margin-top:10px;">If Net Change in Cash doesn't closely match the actual Cash &amp; Bank Balance, it usually means a Fund Account balance was manually adjusted (Fund Management → Adjust Balance) outside a recorded transaction — same reconciliation note as the Trial Balance below.</p>
+    </div>
+  `;
+}
+
 async function renderFixedAssetsCard(){
   const assets = await db.getAll("fixedAssets");
   const totalCost = assets.reduce((s,a)=>s+a.cost,0);
@@ -3519,6 +3662,198 @@ async function renderFixedAssetsCard(){
         <div class="field"><label>Depreciation rate (% per year)</label><input id="fa-rate" type="number" step="0.1" placeholder="e.g. 15"></div>
       </div>
       <button class="btn btn-gold btn-sm" id="btn-save-asset">Add Asset</button>
+    </div>
+  `;
+}
+
+/* =========================================================================
+   Projections — 2-year forward P&L and Balance Sheet, built by applying
+   your own growth/rate assumptions to the current Schedule III figures.
+   This is a planning tool, not a forecast guarantee — every assumption
+   is yours to set and revisit, and the numbers are only as good as those
+   inputs. Route through management/board review before using this for
+   anything external (a lender submission, an investor deck, etc.).
+   ========================================================================= */
+function defaultProjectionAssumptions(){
+  return {
+    id:"default",
+    loanBookGrowthPct: 20, yieldOnAdvancesPct: 18, costOfFundsPct: 11,
+    opexGrowthPct: 15, provisioningPct: 2, otherIncomeGrowthPct: 10,
+    capitalInfusionYear1: 0, capitalInfusionYear2: 0,
+    updatedAt: null, updatedBy: null
+  };
+}
+async function getProjectionAssumptions(){
+  return (await db.get("projectionAssumptions","default")) || defaultProjectionAssumptions();
+}
+
+async function computeProjections(){
+  const sch = await computeScheduleIIIFigures();
+  const a = await getProjectionAssumptions();
+  const bs0 = sch.balanceSheet, pl0 = sch.profitLoss;
+
+  const projectYear = (prevLoans, prevOpex, prevOtherIncome, prevCapital, capitalInfusion)=>{
+    const loans = prevLoans * (1 + a.loanBookGrowthPct/100);
+    const interestIncome = loans * (a.yieldOnAdvancesPct/100);
+    const otherIncome = prevOtherIncome * (1 + a.otherIncomeGrowthPct/100);
+    const totalIncome = interestIncome + otherIncome;
+    const provisioning = loans * (a.provisioningPct/100);
+    const opex = prevOpex * (1 + a.opexGrowthPct/100);
+    // Finance costs computed on projected borrowings (below), so wire it
+    // in after borrowings are known — placeholder here, filled below.
+    const capital = prevCapital + capitalInfusion; // retained profit added by caller once PBT is known
+    return { loans, interestIncome, otherIncome, totalIncome, provisioning, opex, capital };
+  };
+
+  const prevOpexY0 = pl0.financeCosts + pl0.feesCommissionExpense + pl0.employeeBenefits + pl0.depreciation + pl0.otherExpenses;
+
+  // Year 1
+  let y1 = projectYear(bs0.grossLoans, prevOpexY0, pl0.otherIncome, bs0.equityShareCapital, a.capitalInfusionYear1);
+  let y1Borrowings = Math.max(0, y1.loans - (y1.capital + bs0.otherEquity)); // funding gap covered by borrowings
+  let y1FinanceCosts = y1Borrowings * (a.costOfFundsPct/100);
+  let y1TotalExpenses = y1.opex + y1.provisioning + y1FinanceCosts;
+  let y1PBT = y1.totalIncome - y1TotalExpenses;
+  let y1RetainedEarnings = bs0.otherEquity + y1PBT;
+
+  // Year 2, chained off Year 1
+  let y2 = projectYear(y1.loans, y1.opex, y1.otherIncome, y1.capital, a.capitalInfusionYear2);
+  let y2Borrowings = Math.max(0, y2.loans - (y2.capital + y1RetainedEarnings));
+  let y2FinanceCosts = y2Borrowings * (a.costOfFundsPct/100);
+  let y2TotalExpenses = y2.opex + y2.provisioning + y2FinanceCosts;
+  let y2PBT = y2.totalIncome - y2TotalExpenses;
+  let y2RetainedEarnings = y1RetainedEarnings + y2PBT;
+
+  return {
+    assumptions: a,
+    current: { loans: bs0.grossLoans, interestIncome: pl0.interestIncome, otherIncome: pl0.otherIncome, totalIncome: pl0.totalIncome, opex: prevOpexY0, pbt: pl0.profitBeforeTax, capital: bs0.equityShareCapital, borrowings: bs0.totalBorrowings, otherEquity: bs0.otherEquity, totalAssets: bs0.totalAssets },
+    year1: { loans: y1.loans, interestIncome: y1.interestIncome, otherIncome: y1.otherIncome, totalIncome: y1.totalIncome, provisioning: y1.provisioning, opex: y1.opex, financeCosts: y1FinanceCosts, totalExpenses: y1TotalExpenses, pbt: y1PBT, capital: y1.capital, otherEquity: y1RetainedEarnings, borrowings: y1Borrowings, totalAssets: y1.loans + (bs0.totalFinancialAssets - bs0.grossLoans) + bs0.totalNonFinancialAssets },
+    year2: { loans: y2.loans, interestIncome: y2.interestIncome, otherIncome: y2.otherIncome, totalIncome: y2.totalIncome, provisioning: y2.provisioning, opex: y2.opex, financeCosts: y2FinanceCosts, totalExpenses: y2TotalExpenses, pbt: y2PBT, capital: y2.capital, otherEquity: y2RetainedEarnings, borrowings: y2Borrowings, totalAssets: y2.loans + (bs0.totalFinancialAssets - bs0.grossLoans) + bs0.totalNonFinancialAssets },
+  };
+}
+
+async function renderProjectionsTab(){
+  const proj = await computeProjections();
+  const a = proj.assumptions;
+  const yearLabel1 = "Year 1", yearLabel2 = "Year 2";
+  const row3 = (label, c, y1, y2, bold)=>`<tr><td>${bold?`<b>${label}</b>`:label}</td><td style="text-align:right;">${bold?`<b>${fmtINR(Math.round(c))}</b>`:fmtINR(Math.round(c))}</td><td style="text-align:right;">${bold?`<b>${fmtINR(Math.round(y1))}</b>`:fmtINR(Math.round(y1))}</td><td style="text-align:right;">${bold?`<b>${fmtINR(Math.round(y2))}</b>`:fmtINR(Math.round(y2))}</td></tr>`;
+  return `
+    <div class="card">
+      <h2>Financial Projections — Next 2 Years</h2>
+      <p class="sub">Applies your own growth and rate assumptions below to today's actual figures. Only as good as the assumptions — this is a planning tool for management/board discussion, not a forecast guarantee, and should never be presented externally (lenders, investors, RBI) without review and sign-off.</p>
+      <h3 class="section-h">Assumptions</h3>
+      <div class="grid grid-3">
+        <div class="field"><label>Loan Book Growth (% p.a.)</label><input id="pj-loan-growth" type="number" step="0.1" value="${a.loanBookGrowthPct}"></div>
+        <div class="field"><label>Yield on Advances (% p.a.)</label><input id="pj-yield" type="number" step="0.1" value="${a.yieldOnAdvancesPct}"></div>
+        <div class="field"><label>Cost of Funds (% p.a.)</label><input id="pj-cof" type="number" step="0.1" value="${a.costOfFundsPct}"></div>
+        <div class="field"><label>Operating Expense Growth (% p.a.)</label><input id="pj-opex-growth" type="number" step="0.1" value="${a.opexGrowthPct}"></div>
+        <div class="field"><label>Provisioning (% of Loan Book)</label><input id="pj-provisioning" type="number" step="0.1" value="${a.provisioningPct}"></div>
+        <div class="field"><label>Other Income Growth (% p.a.)</label><input id="pj-other-income-growth" type="number" step="0.1" value="${a.otherIncomeGrowthPct}"></div>
+        <div class="field"><label>Planned Capital Infusion — Year 1 (₹)</label><input id="pj-capital-y1" type="number" value="${a.capitalInfusionYear1}"></div>
+        <div class="field"><label>Planned Capital Infusion — Year 2 (₹)</label><input id="pj-capital-y2" type="number" value="${a.capitalInfusionYear2}"></div>
+      </div>
+      <button class="btn btn-gold btn-sm" id="btn-save-projection-assumptions">Recalculate</button>
+    </div>
+
+    <div class="card">
+      <h2 style="font-size:16px;">Projected Profit &amp; Loss</h2>
+      <table>
+        <thead><tr><th>Line Item</th><th>Current (Actual)</th><th>${yearLabel1}</th><th>${yearLabel2}</th></tr></thead>
+        <tbody>
+          ${row3("Interest Income", proj.current.interestIncome, proj.year1.interestIncome, proj.year2.interestIncome)}
+          ${row3("Other Income", proj.current.otherIncome, proj.year1.otherIncome, proj.year2.otherIncome)}
+          ${row3("Total Income", proj.current.totalIncome, proj.year1.totalIncome, proj.year2.totalIncome, true)}
+          ${row3("Finance Costs", 0, proj.year1.financeCosts, proj.year2.financeCosts)}
+          ${row3("Provisioning", 0, proj.year1.provisioning, proj.year2.provisioning)}
+          ${row3("Operating Expenses", proj.current.opex, proj.year1.opex, proj.year2.opex)}
+          ${row3("Total Expenses", proj.current.opex, proj.year1.totalExpenses, proj.year2.totalExpenses, true)}
+          ${row3("Profit Before Tax", proj.current.pbt, proj.year1.pbt, proj.year2.pbt, true)}
+        </tbody>
+      </table>
+    </div>
+
+    <div class="card">
+      <h2 style="font-size:16px;">Projected Balance Sheet (Summary)</h2>
+      <table>
+        <thead><tr><th>Line Item</th><th>Current (Actual)</th><th>${yearLabel1}</th><th>${yearLabel2}</th></tr></thead>
+        <tbody>
+          ${row3("Loan Portfolio (Gross)", proj.current.loans, proj.year1.loans, proj.year2.loans)}
+          ${row3("Equity Share Capital", proj.current.capital, proj.year1.capital, proj.year2.capital)}
+          ${row3("Other Equity (Retained Earnings)", proj.current.otherEquity, proj.year1.otherEquity, proj.year2.otherEquity)}
+          ${row3("Borrowings (balancing funding need)", proj.current.borrowings, proj.year1.borrowings, proj.year2.borrowings)}
+          ${row3("Total Assets", proj.current.totalAssets, proj.year1.totalAssets, proj.year2.totalAssets, true)}
+        </tbody>
+      </table>
+      <p class="small muted" style="margin-top:10px;">Borrowings here is a balancing figure — the funding needed (loan book growth minus capital and retained earnings) to keep the balance sheet whole. Non-loan assets (cash, investments, fixed assets) are held flat at current levels since projecting those needs separate assumptions this tool doesn't ask for yet.</p>
+    </div>
+  `;
+}
+
+async function renderFinancialStatementsTab(){
+  const sch = await computeScheduleIIIFigures();
+  const bs = sch.balanceSheet;
+  const pl = sch.profitLoss;
+  const row = (label, value, indent, bold)=>`<tr><td style="padding-left:${indent?indent*16:0}px;">${bold?`<b>${label}</b>`:label}</td><td style="text-align:right;">${bold?`<b>${fmtINR(Math.round(value))}</b>`:fmtINR(Math.round(value))}</td></tr>`;
+  return `
+    <div class="card">
+      <h2>Financial Statements — Schedule III, Division III Format</h2>
+      <p class="sub">The format Ind-AS-compliant NBFCs use under the Companies Act — assets and liabilities split into Financial vs Non-Financial, presented in order of liquidity, distinct from a regular company's current/non-current format. Built from your own recorded data, mapped onto RBI/MCA's prescribed structure.</p>
+      <div class="warn-banner" style="background:#FBE7E8;border-color:var(--danger);color:#7A1F27;">⚠ This is a structural template to speed up preparation — not a substitute for your statutory auditor's review and sign-off. Verify every line against your actual books, confirm current MCA/ICAI guidance, and route this through your auditor before using it for any regulatory filing, lender submission, or investor document.</div>
+    </div>
+
+    <div class="card">
+      <h2 style="font-size:16px;">Statement of Profit &amp; Loss</h2>
+      <table><tbody>
+        <tr><td colspan="2"><b>Revenue from Operations</b></td></tr>
+        ${row("Interest Income", pl.interestIncome, 1)}
+        ${row("Fees and Commission Income", pl.feesCommissionIncome, 1)}
+        ${row("Total Revenue from Operations", pl.revenueFromOperations, 1, true)}
+        ${row("Other Income", pl.otherIncome)}
+        ${row("Total Income", pl.totalIncome, 0, true)}
+        <tr><td colspan="2" style="padding-top:12px;"><b>Expenses</b></td></tr>
+        ${row("Finance Costs", pl.financeCosts, 1)}
+        ${row("Fees and Commission Expense", pl.feesCommissionExpense, 1)}
+        ${row("Impairment on Financial Instruments (NPA Provisioning)", pl.impairment, 1)}
+        ${row("Employee Benefits Expense", pl.employeeBenefits, 1)}
+        ${row("Depreciation, Amortization and Impairment", pl.depreciation, 1)}
+        ${row("Other Expenses", pl.otherExpenses, 1)}
+        ${row("Total Expenses", pl.totalExpenses, 0, true)}
+        <tr style="border-top:2px solid var(--navy-900);"><td style="padding-top:10px;"><b>Profit Before Tax</b></td><td style="text-align:right; padding-top:10px;"><b>${fmtINR(Math.round(pl.profitBeforeTax))}</b></td></tr>
+        ${row("Tax Expense (not computed — route through your auditor)", 0)}
+        <tr><td><b>Profit After Tax</b></td><td style="text-align:right;"><b>${fmtINR(Math.round(pl.profitAfterTax))}</b></td></tr>
+      </tbody></table>
+    </div>
+
+    <div class="card">
+      <h2 style="font-size:16px;">Balance Sheet</h2>
+      <h3 class="section-h">ASSETS</h3>
+      <table><tbody>
+        <tr><td colspan="2"><b>Financial Assets</b></td></tr>
+        ${row("Cash and Cash Equivalents", bs.cashAndEquivalents, 1)}
+        ${row("Bank Balances (other than cash equivalents)", bs.bankBalances, 1)}
+        ${row("Investments", bs.investments, 1)}
+        ${row("Loans — Gross", bs.grossLoans, 1)}
+        ${row("Less: Impairment Loss Allowance", -bs.impairmentAllowance, 1)}
+        ${row("Loans — Net", bs.netLoans, 1, true)}
+        ${row("Total Financial Assets", bs.totalFinancialAssets, 0, true)}
+        <tr><td colspan="2" style="padding-top:12px;"><b>Non-Financial Assets</b></td></tr>
+        ${row("Property, Plant and Equipment", bs.ppeBookValue, 1)}
+        ${row("Total Non-Financial Assets", bs.totalNonFinancialAssets, 0, true)}
+        <tr style="border-top:2px solid var(--navy-900);"><td style="padding-top:10px;"><b>Total Assets</b></td><td style="text-align:right; padding-top:10px;"><b>${fmtINR(Math.round(bs.totalAssets))}</b></td></tr>
+      </tbody></table>
+      <h3 class="section-h">LIABILITIES AND EQUITY</h3>
+      <table><tbody>
+        <tr><td colspan="2"><b>Financial Liabilities</b></td></tr>
+        ${row("Borrowings — Term Loans", bs.termLoanBorrowings, 1)}
+        ${row("Borrowings — Cash Credit/Overdraft Utilized", bs.ccOdUtilized, 1)}
+        ${row("Total Financial Liabilities", bs.totalFinancialLiabilities, 0, true)}
+        ${row("Total Non-Financial Liabilities", bs.totalNonFinancialLiabilities, 0, true)}
+        <tr><td colspan="2" style="padding-top:12px;"><b>Equity</b></td></tr>
+        ${row("Equity Share Capital", bs.equityShareCapital, 1)}
+        ${row("Other Equity (Retained Earnings — balancing figure)", bs.otherEquity, 1)}
+        ${row("Total Equity", bs.totalEquity, 0, true)}
+        <tr style="border-top:2px solid var(--navy-900);"><td style="padding-top:10px;"><b>Total Liabilities and Equity</b></td><td style="text-align:right; padding-top:10px;"><b>${fmtINR(Math.round(bs.totalLiabilitiesAndEquity))}</b></td></tr>
+      </tbody></table>
+      <p class="small muted" style="margin-top:10px;">"Other Equity" is a balancing figure here (Total Assets − Liabilities − Share Capital), same reconciliation approach as the Trial Balance in Accounting. Cross-check it against cumulative Net Surplus; a large unexplained gap usually means a Fund Account was manually adjusted outside a recorded transaction.</p>
     </div>
   `;
 }
@@ -3664,6 +3999,8 @@ async function renderAccountingTab(){
       </div>
       <p class="small muted" style="margin-top:10px;">Illustrative management view only — not a statutory Balance Sheet or Schedule III format.</p>
     </div>
+
+    ${await renderCashFlowCard()}
 
     ${await renderInterestAccrualCard()}
 
@@ -5565,6 +5902,8 @@ function bindEvents(){
   if(runRestoreBtn) runRestoreBtn.onclick = handleRestoreBackup;
   const saveNbfcProfileBtn = document.getElementById("btn-save-nbfc-profile");
   if(saveNbfcProfileBtn) saveNbfcProfileBtn.onclick = handleSaveNbfcProfile;
+  const saveProjectionBtn = document.getElementById("btn-save-projection-assumptions");
+  if(saveProjectionBtn) saveProjectionBtn.onclick = handleSaveProjectionAssumptions;
   const addBankAccountBtn = document.getElementById("btn-add-bank-account");
   if(addBankAccountBtn) addBankAccountBtn.onclick = handleAddBankAccount;
   document.querySelectorAll(".delete-bank-account-btn").forEach(btn=> btn.onclick = ()=> handleDeleteBankAccount(btn.dataset.id));
@@ -7164,6 +7503,25 @@ async function handleOcrDocument(){
 /* ---------------------------------------------------------------------
    Verification API handlers
    --------------------------------------------------------------------- */
+async function handleSaveProjectionAssumptions(){
+  const u = session.user;
+  const a = await getProjectionAssumptions();
+  a.loanBookGrowthPct = Number(document.getElementById("pj-loan-growth").value)||0;
+  a.yieldOnAdvancesPct = Number(document.getElementById("pj-yield").value)||0;
+  a.costOfFundsPct = Number(document.getElementById("pj-cof").value)||0;
+  a.opexGrowthPct = Number(document.getElementById("pj-opex-growth").value)||0;
+  a.provisioningPct = Number(document.getElementById("pj-provisioning").value)||0;
+  a.otherIncomeGrowthPct = Number(document.getElementById("pj-other-income-growth").value)||0;
+  a.capitalInfusionYear1 = Number(document.getElementById("pj-capital-y1").value)||0;
+  a.capitalInfusionYear2 = Number(document.getElementById("pj-capital-y2").value)||0;
+  a.updatedAt = nowISO();
+  a.updatedBy = u.name;
+  await db.put("projectionAssumptions", a);
+  await logAudit(u.name, u.role, "Projection Assumptions Updated", `Loan growth ${a.loanBookGrowthPct}%, Yield ${a.yieldOnAdvancesPct}%, CoF ${a.costOfFundsPct}%`);
+  toast("Recalculated.");
+  render();
+}
+
 async function handleSaveNbfcProfile(){
   const u = session.user;
   const p = await getNbfcProfile();
