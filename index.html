@@ -868,7 +868,7 @@ const ALL_COLLECTIONS = [
   "recoveryVisits","apiConfig","aiConfig","nbfcProfile","categoryConfig","journalEntries","complianceItems","rbiReturnFilings",
   "staffSalaries","payrollRuns","dsaAgents","dsaCommissions",
   "shgGroups","shgMembers","shgSavings","shgInternalLoans","microEnterpriseTemplates",
-  "bankStatementLines","bankBorrowings","fixedAssets","projectionAssumptions","documentRegister","rcmItems","auditObservations","escalationRules","holidayCalendar",
+  "bankStatementLines","bankBorrowings","fixedAssets","projectionAssumptions","documentRegister","rcmItems","auditObservations","escalationRules","holidayCalendar","chartOfAccounts","journalVouchers",
   "auditLog","meta"
 ];
 
@@ -1631,6 +1631,106 @@ function defaultProducts(){
   };
   return LOAN_PRODUCTS.map(name=> ({ id: uid("prd"), name, ...base, ...(overrides[name]||{}), createdAt: nowISO() }));
 }
+/* =========================================================================
+   General Ledger — Chart of Accounts, Journal Vouchers, Ledger Posting,
+   Day Book, Cash Book, Bank Book, Trial Balance-from-GL.
+
+   This is built as a genuine double-entry system: every voucher must
+   balance (total debits = total credits) before it can be saved, and
+   every account's balance is DERIVED by summing its posted lines —
+   never adjusted directly. That's what makes Trial Balance-from-GL
+   mathematically guaranteed to balance, unlike the earlier
+   approximated Trial Balance elsewhere in Accounting, which infers
+   figures from operational records rather than tracking real postings.
+
+   Deliberately built as a self-contained module for now: existing
+   flows (disbursement, EMI collection, the earlier Journal & Expenses
+   feature) still work exactly as before and don't yet post here
+   automatically. Wiring those together is real follow-on work, done
+   once this foundation is proven correct on its own — not rushed into
+   the same pass.
+   ========================================================================= */
+const GL_ACCOUNT_TYPES = ["Asset","Liability","Equity","Income","Expense"];
+const VOUCHER_TYPES = ["Journal Voucher","Payment Voucher","Receipt Voucher","Contra Voucher"];
+
+function normalBalanceFor(accountType){
+  return (accountType==="Asset" || accountType==="Expense") ? "Debit" : "Credit";
+}
+
+function defaultChartOfAccounts(){
+  const defs = [
+    // Assets
+    ["1001","Cash in Hand","Asset","Current Asset"],
+    ["1002","Bank Account — Operating","Asset","Current Asset"],
+    ["1010","Loan Portfolio — Principal Outstanding","Asset","Loan Asset"],
+    ["1020","Interest Receivable","Asset","Current Asset"],
+    ["1030","Fixed Assets","Asset","Fixed Asset"],
+    ["1040","Prepaid Expenses","Asset","Current Asset"],
+    // Liabilities
+    ["2001","Borrowings — Term Loans","Liability","Long-Term Liability"],
+    ["2002","Borrowings — Cash Credit / Overdraft","Liability","Current Liability"],
+    ["2010","Sundry Creditors","Liability","Current Liability"],
+    ["2020","Statutory Dues Payable (TDS/GST/PF)","Liability","Current Liability"],
+    ["2030","Provision for NPA / Impairment Allowance","Liability","Provision"],
+    // Equity
+    ["3001","Equity Share Capital","Equity","Capital"],
+    ["3002","Retained Earnings / Reserves","Equity","Reserves"],
+    // Income
+    ["4001","Interest Income","Income","Operating Income"],
+    ["4002","Processing Fee Income","Income","Operating Income"],
+    ["4003","Other Income","Income","Other Income"],
+    // Expenses
+    ["5001","Interest on Borrowings (Finance Cost)","Expense","Finance Cost"],
+    ["5002","Salaries & Staff Costs","Expense","Operating Expense"],
+    ["5003","Rent","Expense","Operating Expense"],
+    ["5004","DSA Commission","Expense","Operating Expense"],
+    ["5005","NPA Provisioning / Impairment Expense","Expense","Impairment"],
+    ["5006","Depreciation","Expense","Operating Expense"],
+    ["5007","Other Operating Expenses","Expense","Operating Expense"],
+  ];
+  return defs.map(([code,name,type,category])=>({
+    id: uid("gla"), code, name, accountType: type, category,
+    normalBalance: normalBalanceFor(type), isSystemAccount: true, active: true,
+    createdAt: nowISO(), createdBy: "system-seed"
+  }));
+}
+
+async function ensureChartOfAccountsSeeded(){
+  const existing = await db.getAll("chartOfAccounts");
+  if(existing.length>0) return existing;
+  const seeded = defaultChartOfAccounts();
+  for(const acc of seeded){ await db.put("chartOfAccounts", acc); }
+  return seeded;
+}
+
+async function getNextVoucherNumber(voucherType){
+  const vouchers = await db.getAll("journalVouchers");
+  const year = todayStr().slice(0,4);
+  const prefix = voucherType==="Payment Voucher" ? "PV" : voucherType==="Receipt Voucher" ? "RV" : voucherType==="Contra Voucher" ? "CV" : "JV";
+  const thisYearCount = vouchers.filter(v=>v.voucherNumber && v.voucherNumber.startsWith(`${prefix}-${year}`)).length;
+  return `${prefix}-${year}-${String(thisYearCount+1).padStart(4,"0")}`;
+}
+
+/** An account's balance is always DERIVED from its posted voucher
+ *  lines — summed in the direction of its normal balance — never
+ *  stored/adjusted directly. This is what guarantees correctness. */
+function computeLedgerBalance(account, postedVouchers){
+  let debitTotal = 0, creditTotal = 0;
+  postedVouchers.forEach(v=>{
+    (v.lines||[]).forEach(line=>{
+      if(line.ledgerAccountId===account.id){ debitTotal += line.debit||0; creditTotal += line.credit||0; }
+    });
+  });
+  const net = account.normalBalance==="Debit" ? (debitTotal-creditTotal) : (creditTotal-debitTotal);
+  return { debitTotal, creditTotal, balance: net };
+}
+
+async function computeAllLedgerBalances(){
+  const [accounts, vouchers] = await Promise.all([db.getAll("chartOfAccounts"), db.getAll("journalVouchers")]);
+  const posted = vouchers.filter(v=>v.status==="Posted");
+  return accounts.filter(a=>a.active).map(a=>({ account: a, ...computeLedgerBalance(a, posted) }));
+}
+
 function defaultPolicyConfig(){
   return {
     id: "default",
@@ -2075,6 +2175,8 @@ async function renderStaffShell(){
     tabContent = await renderProjectionsTab();
   } else if(tab === "treasury" && canManageFunds){
     tabContent = await renderTreasuryTab();
+  } else if(tab === "generalledger" && canManageFunds){
+    tabContent = await renderGeneralLedgerTab();
   } else if(tab === "bankrecon" && canManageFunds){
     tabContent = await renderBankReconTab();
   } else if(tab === "payrolldsa" && canManageFunds){
@@ -2162,6 +2264,7 @@ async function renderStaffShell(){
         ${canManageFunds ? `<button class="tab ${tab==='financialstatements'?'active':''}" data-tab="financialstatements">Financial Statements</button>`:""}
         ${canManageFunds ? `<button class="tab ${tab==='projections'?'active':''}" data-tab="projections">Projections</button>`:""}
         ${canManageFunds ? `<button class="tab ${tab==='treasury'?'active':''}" data-tab="treasury">Treasury</button>`:""}
+        ${canManageFunds ? `<button class="tab ${tab==='generalledger'?'active':''}" data-tab="generalledger">General Ledger</button>`:""}
         ${canManageFunds ? `<button class="tab ${tab==='bankrecon'?'active':''}" data-tab="bankrecon">Bank Reconciliation</button>`:""}
         ${canManageFunds ? `<button class="tab ${tab==='payrolldsa'?'active':''}" data-tab="payrolldsa">Payroll &amp; DSA</button>`:""}
         <button class="tab ${tab==='shgrural'?'active':''}" data-tab="shgrural">SHG / Rural Finance</button>
@@ -4621,6 +4724,213 @@ async function computeTreasuryMetrics(){
   });
 
   return { assetBuckets, liabilityBuckets, costOfFunds, yieldOnAdvances, interestSpread, byProduct, byBranch, totalBorrowings, totalPortfolio };
+}
+
+async function renderChartOfAccountsSection(){
+  const accounts = (await db.getAll("chartOfAccounts")).sort((a,b)=>a.code.localeCompare(b.code));
+  const balances = await computeAllLedgerBalances();
+  const balanceByAccountId = Object.fromEntries(balances.map(b=>[b.account.id, b.balance]));
+  return `
+    <div class="card">
+      <div class="flex-between">
+        <h2 style="font-size:16px;">Chart of Accounts</h2>
+        <button class="btn btn-gold btn-sm" id="btn-open-coa-form">+ Add Account</button>
+      </div>
+      ${session.showCoaForm ? `
+      <div class="grid grid-4">
+        <div class="field"><label>Code</label><input id="coa-code" placeholder="e.g. 5008"></div>
+        <div class="field"><label>Name</label><input id="coa-name" placeholder="e.g. Travel Expenses"></div>
+        <div class="field"><label>Account type</label><select id="coa-type">${GL_ACCOUNT_TYPES.map(t=>`<option>${t}</option>`).join("")}</select></div>
+        <div class="field"><label>Category</label><input id="coa-category" placeholder="e.g. Operating Expense"></div>
+      </div>
+      <button class="btn btn-gold btn-sm" id="btn-save-coa">Save</button>
+      ` : ""}
+      <table style="margin-top:10px;">
+        <thead><tr><th>Code</th><th>Name</th><th>Type</th><th>Normal Balance</th><th>Current Balance</th><th></th></tr></thead>
+        <tbody>
+        ${accounts.map(a=>`<tr><td class="mono">${esc(a.code)}</td><td>${esc(a.name)}</td><td>${esc(a.accountType)}</td><td>${esc(a.normalBalance)}</td><td>${fmtINR(Math.round(balanceByAccountId[a.id]||0))}</td>
+          <td>${a.isSystemAccount ? `<span class="small muted">System</span>` : `<button class="btn btn-danger btn-sm delete-coa-btn" data-coa="${a.id}">Delete</button>`}</td></tr>`).join("")}
+        </tbody>
+      </table>
+      <p class="small muted" style="margin-top:8px;">System accounts (the default seeded set) can't be deleted, since existing vouchers may reference them — deactivate a custom account instead of deleting once it's been used in a posted voucher.</p>
+    </div>
+  `;
+}
+
+async function renderDayBookSection(){
+  const date = session.dayBookDate || todayStr();
+  const vouchers = (await db.getAll("journalVouchers")).filter(v=>v.status==="Posted" && v.date===date).sort((a,b)=>a.voucherNumber.localeCompare(b.voucherNumber));
+  const totalDr = vouchers.reduce((s,v)=>s+v.totalDebit,0);
+  return `
+    <div class="card">
+      <h2 style="font-size:16px;">Day Book</h2>
+      <div class="field" style="max-width:200px;"><label>Date</label><input id="daybook-date" type="date" value="${date}"></div>
+      <table>
+        <thead><tr><th>Voucher #</th><th>Type</th><th>Narration</th><th>Debit Lines</th><th>Credit Lines</th><th>Amount</th></tr></thead>
+        <tbody>
+        ${vouchers.length===0 ? `<tr class="empty-row"><td colspan="6">No posted vouchers on this date.</td></tr>` :
+          vouchers.map(v=>{
+            const drLines = v.lines.filter(l=>l.debit>0).map(l=>l.ledgerAccountName).join(", ");
+            const crLines = v.lines.filter(l=>l.credit>0).map(l=>l.ledgerAccountName).join(", ");
+            return `<tr><td class="mono">${esc(v.voucherNumber)}</td><td>${esc(v.voucherType)}</td><td>${esc(v.narration)}</td><td>${esc(drLines)}</td><td>${esc(crLines)}</td><td>${fmtINR(v.totalDebit)}</td></tr>`;
+          }).join("")}
+        </tbody>
+        ${vouchers.length>0 ? `<tfoot><tr><td colspan="5"><b>Total</b></td><td><b>${fmtINR(totalDr)}</b></td></tr></tfoot>` : ""}
+      </table>
+    </div>
+  `;
+}
+
+async function renderCashBankBookSection(categoryFilter, nameFilter){
+  const accounts = (await db.getAll("chartOfAccounts")).filter(a=>a.active && a.name.includes(nameFilter));
+  const vouchers = (await db.getAll("journalVouchers")).filter(v=>v.status==="Posted").sort((a,b)=>new Date(a.date)-new Date(b.date));
+  const accountIds = new Set(accounts.map(a=>a.id));
+  const rows = [];
+  let runningBalance = 0;
+  vouchers.forEach(v=>{
+    v.lines.forEach(line=>{
+      if(!accountIds.has(line.ledgerAccountId)) return;
+      runningBalance += (line.debit||0) - (line.credit||0);
+      rows.push({ date: v.date, voucherNumber: v.voucherNumber, narration: v.narration, debit: line.debit||0, credit: line.credit||0, balance: runningBalance });
+    });
+  });
+  return `
+    <div class="card">
+      <h2 style="font-size:16px;">${nameFilter==="Cash in Hand" ? "Cash Book" : "Bank Book"}</h2>
+      <p class="sub">Every posted voucher line touching a ${esc(nameFilter)} account, in date order, with a running balance.</p>
+      <table>
+        <thead><tr><th>Date</th><th>Voucher #</th><th>Narration</th><th>Debit</th><th>Credit</th><th>Balance</th></tr></thead>
+        <tbody>
+        ${rows.length===0 ? `<tr class="empty-row"><td colspan="6">No postings yet.</td></tr>` :
+          rows.map(r=>`<tr><td>${r.date}</td><td class="mono">${esc(r.voucherNumber)}</td><td>${esc(r.narration)}</td><td>${r.debit?fmtINR(r.debit):"—"}</td><td>${r.credit?fmtINR(r.credit):"—"}</td><td>${fmtINR(r.balance)}</td></tr>`).join("")}
+        </tbody>
+      </table>
+    </div>
+  `;
+}
+
+async function renderTrialBalanceFromGlSection(){
+  const balances = await computeAllLedgerBalances();
+  let totalDr = 0, totalCr = 0;
+  const rows = balances.map(b=>{
+    const showAsDr = b.account.normalBalance==="Debit" ? b.balance>=0 : b.balance<0;
+    const drAmt = showAsDr ? Math.abs(b.balance) : 0;
+    const crAmt = !showAsDr ? Math.abs(b.balance) : 0;
+    totalDr += drAmt; totalCr += crAmt;
+    return { account: b.account, drAmt, crAmt };
+  });
+  const balanced = Math.abs(totalDr - totalCr) < 1;
+  return `
+    <div class="card">
+      <h2 style="font-size:16px;">Trial Balance (from General Ledger)</h2>
+      <div class="warn-banner" style="background:${balanced?'#E4F3E8':'#FBE7E8'};border-color:${balanced?'var(--ok)':'var(--danger)'};color:${balanced?'#1D4E33':'#7A1F27'};">
+        ${balanced ? '✓ Balanced — total debits equal total credits, as a real double-entry ledger guarantees.' : '⚠ Not balanced — this should never happen if every voucher was saved through this module; if it does, something bypassed the balance check.'}
+      </div>
+      <table>
+        <thead><tr><th>Code</th><th>Account</th><th>Debit</th><th>Credit</th></tr></thead>
+        <tbody>
+        ${rows.filter(r=>r.drAmt!==0 || r.crAmt!==0).map(r=>`<tr><td class="mono">${esc(r.account.code)}</td><td>${esc(r.account.name)}</td><td>${r.drAmt?fmtINR(r.drAmt):"—"}</td><td>${r.crAmt?fmtINR(r.crAmt):"—"}</td></tr>`).join("")}
+        </tbody>
+        <tfoot><tr><td colspan="2"><b>Total</b></td><td><b>${fmtINR(Math.round(totalDr))}</b></td><td><b>${fmtINR(Math.round(totalCr))}</b></td></tr></tfoot>
+      </table>
+    </div>
+  `;
+}
+
+async function renderJournalVoucherSection(){
+  const u = session.user;
+  const accounts = (await db.getAll("chartOfAccounts")).filter(a=>a.active).sort((a,b)=>a.code.localeCompare(b.code));
+  const vouchers = (await db.getAll("journalVouchers")).sort((a,b)=>new Date(b.createdAt)-new Date(a.createdAt));
+  const policy = (await db.get("policyConfig","default")) || defaultPolicyConfig();
+  const lineCount = session.glVoucherLineCount || 2;
+  const acctOptions = accounts.map(a=>`<option value="${a.id}">${esc(a.code)} — ${esc(a.name)}</option>`).join("");
+
+  const lineRows = Array.from({length: lineCount}, (_,i)=>`
+    <tr>
+      <td><select class="gl-line-account" data-idx="${i}">${acctOptions}</select></td>
+      <td><input class="gl-line-debit" data-idx="${i}" type="number" placeholder="0" style="width:110px;"></td>
+      <td><input class="gl-line-credit" data-idx="${i}" type="number" placeholder="0" style="width:110px;"></td>
+      <td><input class="gl-line-narration" data-idx="${i}" placeholder="Line note (optional)"></td>
+    </tr>`).join("");
+
+  return `
+    <div class="card">
+      <h2 style="font-size:16px;">New Journal Voucher</h2>
+      <div class="grid grid-3">
+        <div class="field"><label>Voucher type</label><select id="gl-voucher-type">${VOUCHER_TYPES.map(t=>`<option>${t}</option>`).join("")}</select></div>
+        <div class="field"><label>Date</label><input id="gl-voucher-date" type="date" value="${todayStr()}"></div>
+        <div class="field"><label>Narration</label><input id="gl-voucher-narration" placeholder="e.g. Office rent for the month"></div>
+      </div>
+      <table>
+        <thead><tr><th>Ledger Account</th><th>Debit (₹)</th><th>Credit (₹)</th><th>Line Note</th></tr></thead>
+        <tbody id="gl-voucher-lines">${lineRows}</tbody>
+      </table>
+      <div class="action-row">
+        <button class="btn btn-outline btn-sm" id="btn-add-gl-line">+ Add Line</button>
+        <span id="gl-balance-indicator" class="small muted">Enter amounts to check balance</span>
+      </div>
+      <button class="btn btn-gold" id="btn-save-gl-voucher" style="margin-top:10px;">Save Voucher</button>
+      <p class="small muted" style="margin-top:8px;">Total debits must equal total credits before this can save — that's what a real double-entry system enforces, not an optional check.</p>
+    </div>
+
+    <div class="card">
+      <h2 style="font-size:16px;">Vouchers</h2>
+      <table>
+        <thead><tr><th>Voucher #</th><th>Type</th><th>Date</th><th>Narration</th><th>Amount</th><th>Status</th><th></th></tr></thead>
+        <tbody>
+        ${vouchers.length===0 ? `<tr class="empty-row"><td colspan="7">No vouchers yet.</td></tr>` :
+          vouchers.map(v=>{
+            let statusBadge = v.status==="Posted" ? `<span class="badge badge-approved">Posted</span>` : v.status==="Rejected" ? `<span class="badge badge-rejected">Rejected</span>` : `<span class="badge badge-progress">Pending Approval</span>`;
+            let actions = "";
+            if(v.status==="Pending Approval"){
+              const canApprove = DELEGATION_ROLES.includes(u.role) || u.role==="Super Admin";
+              const withinLimit = u.role==="Super Admin" || getJournalLimitForRole(policy, u.role) >= v.totalDebit;
+              const differentPerson = u.name !== v.proposedBy;
+              if(canApprove && withinLimit && differentPerson){
+                actions = `<div class="action-row"><button class="btn btn-outline btn-sm approve-gl-voucher-btn" data-voucher="${v.id}">Approve &amp; Post</button><button class="btn btn-danger btn-sm reject-gl-voucher-btn" data-voucher="${v.id}">Reject</button></div>`;
+              } else if(!differentPerson){
+                actions = `<span class="small muted">Awaiting a different officer</span>`;
+              } else if(!withinLimit){
+                actions = `<span class="small muted">Exceeds your limit</span>`;
+              }
+            }
+            return `<tr><td class="mono">${esc(v.voucherNumber)}</td><td>${esc(v.voucherType)}</td><td>${v.date}</td><td>${esc(v.narration)}</td><td>${fmtINR(v.totalDebit)}</td><td>${statusBadge}</td><td>${actions}</td></tr>`;
+          }).join("")}
+        </tbody>
+      </table>
+    </div>
+  `;
+}
+
+async function renderGeneralLedgerTab(){
+  await ensureChartOfAccountsSeeded();
+  const sub = session.glSubTab || "voucher";
+  const subTabs = [
+    {id:"voucher", label:"Journal Voucher"},
+    {id:"coa", label:"Chart of Accounts"},
+    {id:"daybook", label:"Day Book"},
+    {id:"cashbook", label:"Cash Book"},
+    {id:"bankbook", label:"Bank Book"},
+    {id:"trialbalance", label:"Trial Balance"},
+  ];
+  let body = "";
+  if(sub==="voucher") body = await renderJournalVoucherSection();
+  else if(sub==="coa") body = await renderChartOfAccountsSection();
+  else if(sub==="daybook") body = await renderDayBookSection();
+  else if(sub==="cashbook") body = await renderCashBankBookSection("Current Asset","Cash in Hand");
+  else if(sub==="bankbook") body = await renderCashBankBookSection("Current Asset","Bank Account");
+  else if(sub==="trialbalance") body = await renderTrialBalanceFromGlSection();
+
+  return `
+    <div class="card">
+      <h2>General Ledger</h2>
+      <p class="sub">A real double-entry ledger — every voucher must balance (debits = credits) before it saves, and every balance below is derived from posted vouchers, not adjusted directly. This is a separate module from the operational Accounting tab for now: disbursements, EMI collections, and the existing Journal &amp; Expenses tool don't post here automatically yet — that's deliberate follow-on work once this foundation is in daily use and verified correct.</p>
+      <div class="tabs" style="margin-bottom:0; border-bottom:none;">
+        ${subTabs.map(t=>`<button class="tab ${sub===t.id?'active':''}" data-gltab="${t.id}">${t.label}</button>`).join("")}
+      </div>
+    </div>
+    ${body}
+  `;
 }
 
 async function renderTreasuryTab(){
@@ -7406,6 +7716,37 @@ function bindEvents(){
   if(exportReportBtn) exportReportBtn.onclick = handleExportReport;
 
   // AI Insights
+  // General Ledger
+  document.querySelectorAll(".tab[data-gltab]").forEach(el=>{
+    el.onclick = ()=>{ session.glSubTab = el.getAttribute("data-gltab"); render(); };
+  });
+  const addGlLineBtn = document.getElementById("btn-add-gl-line");
+  if(addGlLineBtn) addGlLineBtn.onclick = ()=>{ session.glVoucherLineCount = (session.glVoucherLineCount||2)+1; render(); };
+  const saveGlVoucherBtn = document.getElementById("btn-save-gl-voucher");
+  if(saveGlVoucherBtn) saveGlVoucherBtn.onclick = handleSaveJournalVoucher;
+  document.querySelectorAll(".approve-gl-voucher-btn").forEach(btn=> btn.onclick = ()=> handleApproveJournalVoucher(btn.dataset.voucher));
+  document.querySelectorAll(".reject-gl-voucher-btn").forEach(btn=> btn.onclick = ()=> handleRejectJournalVoucher(btn.dataset.voucher));
+  const checkGlBalance = ()=>{
+    const indicator = document.getElementById("gl-balance-indicator");
+    if(!indicator) return;
+    let dr=0, cr=0;
+    document.querySelectorAll(".gl-line-debit").forEach(el=> dr += Number(el.value)||0);
+    document.querySelectorAll(".gl-line-credit").forEach(el=> cr += Number(el.value)||0);
+    const diff = dr-cr;
+    indicator.textContent = diff===0 && (dr>0||cr>0) ? `Balanced — ${fmtINR(dr)}` : `Debits ${fmtINR(dr)} vs Credits ${fmtINR(cr)} — difference ${fmtINR(Math.abs(diff))}`;
+    indicator.style.color = (diff===0 && (dr>0||cr>0)) ? "var(--ok)" : "var(--danger)";
+  };
+  document.querySelectorAll(".gl-line-debit, .gl-line-credit").forEach(el=> el.oninput = checkGlBalance);
+  checkGlBalance();
+  const openCoaFormBtn = document.getElementById("btn-open-coa-form");
+  if(openCoaFormBtn) openCoaFormBtn.onclick = ()=>{ session.showCoaForm = !session.showCoaForm; render(); };
+  const saveCoaBtn = document.getElementById("btn-save-coa");
+  if(saveCoaBtn) saveCoaBtn.onclick = handleSaveChartOfAccount;
+  document.querySelectorAll(".delete-coa-btn").forEach(btn=> btn.onclick = ()=> handleDeleteChartOfAccount(btn.dataset.coa));
+  const dayBookDateInput = document.getElementById("daybook-date");
+  if(dayBookDateInput) dayBookDateInput.onchange = ()=>{ session.dayBookDate = dayBookDateInput.value; render(); };
+
+  // AI Insights
   document.querySelectorAll(".tab[data-aitab]").forEach(el=>{
     el.onclick = ()=>{ session.aiSubTab = el.getAttribute("data-aitab"); render(); };
   });
@@ -10120,6 +10461,117 @@ async function handleDeleteHoliday(id){
   if(!window.confirm("Delete this holiday?")) return;
   await db.delete("holidayCalendar", id);
   await logAudit(u.name, u.role, "Holiday Removed", id);
+  toast("Removed.");
+  render();
+}
+
+async function handleSaveJournalVoucher(){
+  const u = session.user;
+  const voucherType = document.getElementById("gl-voucher-type").value;
+  const date = document.getElementById("gl-voucher-date").value;
+  const narration = document.getElementById("gl-voucher-narration").value.trim();
+  if(!date || !narration){ toast("Enter a date and narration."); return; }
+
+  const accounts = await db.getAll("chartOfAccounts");
+  const lines = [];
+  document.querySelectorAll(".gl-line-account").forEach(sel=>{
+    const idx = sel.dataset.idx;
+    const accountId = sel.value;
+    const debit = Number(document.querySelector(`.gl-line-debit[data-idx="${idx}"]`).value)||0;
+    const credit = Number(document.querySelector(`.gl-line-credit[data-idx="${idx}"]`).value)||0;
+    const lineNarration = document.querySelector(`.gl-line-narration[data-idx="${idx}"]`).value.trim();
+    if(debit===0 && credit===0) return;
+    if(debit>0 && credit>0){ toast("A single line can't have both a debit and a credit — use two lines instead."); throw new Error("invalid line"); }
+    const account = accounts.find(a=>a.id===accountId);
+    lines.push({ ledgerAccountId: accountId, ledgerAccountName: account?account.name:"Unknown", debit, credit, lineNarration });
+  });
+
+  if(lines.length<2){ toast("A voucher needs at least two lines."); return; }
+  const totalDebit = lines.reduce((s,l)=>s+l.debit,0);
+  const totalCredit = lines.reduce((s,l)=>s+l.credit,0);
+  if(Math.round(totalDebit*100) !== Math.round(totalCredit*100)){
+    toast(`Debits (${fmtINR(totalDebit)}) and credits (${fmtINR(totalCredit)}) must be exactly equal before this can save.`);
+    return;
+  }
+  if(totalDebit===0){ toast("Enter at least one amount."); return; }
+
+  const policy = (await db.get("policyConfig","default")) || defaultPolicyConfig();
+  const ownLimit = getJournalLimitForRole(policy, u.role);
+  const withinOwnLimit = u.role==="Super Admin" || totalDebit <= ownLimit;
+  const voucherNumber = await getNextVoucherNumber(voucherType);
+
+  const voucher = {
+    id: uid("jv"), voucherNumber, voucherType, date, narration, lines,
+    totalDebit: Math.round(totalDebit*100)/100, totalCredit: Math.round(totalCredit*100)/100,
+    status: withinOwnLimit ? "Posted" : "Pending Approval",
+    proposedBy: u.name, proposedByRole: u.role,
+    approvedBy: withinOwnLimit ? u.name : null, approvedAt: withinOwnLimit ? nowISO() : null,
+    createdAt: nowISO(), createdBy: u.name
+  };
+  await db.put("journalVouchers", voucher);
+  await logAudit(u.name, u.role, withinOwnLimit ? "GL Voucher Posted" : "GL Voucher Proposed", `${voucherNumber} — ${narration} — ${fmtINR(totalDebit)}`);
+  toast(withinOwnLimit ? `Voucher ${voucherNumber} posted.` : `Voucher ${voucherNumber} saved — awaiting approval (exceeds your own limit).`);
+  session.glVoucherLineCount = 2;
+  render();
+}
+
+async function handleApproveJournalVoucher(voucherId){
+  const u = session.user;
+  const voucher = await db.get("journalVouchers", voucherId);
+  if(!voucher) return;
+  voucher.status = "Posted";
+  voucher.approvedBy = u.name;
+  voucher.approvedAt = nowISO();
+  await db.put("journalVouchers", voucher);
+  await logAudit(u.name, u.role, "GL Voucher Approved & Posted", `${voucher.voucherNumber} — approver: ${u.name}, maker: ${voucher.proposedBy}`);
+  toast(`Voucher ${voucher.voucherNumber} posted.`);
+  render();
+}
+
+async function handleRejectJournalVoucher(voucherId){
+  const u = session.user;
+  const voucher = await db.get("journalVouchers", voucherId);
+  if(!voucher) return;
+  if(!window.confirm(`Reject voucher ${voucher.voucherNumber}? It will not be posted to the ledger.`)) return;
+  voucher.status = "Rejected";
+  voucher.rejectedBy = u.name;
+  voucher.rejectedAt = nowISO();
+  await db.put("journalVouchers", voucher);
+  await logAudit(u.name, u.role, "GL Voucher Rejected", `${voucher.voucherNumber} — rejector: ${u.name}, maker: ${voucher.proposedBy}`);
+  toast(`Voucher ${voucher.voucherNumber} rejected.`);
+  render();
+}
+
+async function handleSaveChartOfAccount(){
+  const u = session.user;
+  const code = document.getElementById("coa-code").value.trim();
+  const name = document.getElementById("coa-name").value.trim();
+  const accountType = document.getElementById("coa-type").value;
+  const category = document.getElementById("coa-category").value.trim();
+  if(!code || !name){ toast("Enter both a code and a name."); return; }
+  const existing = (await db.getAll("chartOfAccounts")).find(a=>a.code===code);
+  if(existing){ toast("That account code is already in use."); return; }
+  await db.put("chartOfAccounts", {
+    id: uid("gla"), code, name, accountType, category: category||accountType,
+    normalBalance: normalBalanceFor(accountType), isSystemAccount: false, active: true,
+    createdAt: nowISO(), createdBy: u.name
+  });
+  await logAudit(u.name, u.role, "GL Account Added", `${code} — ${name}`);
+  toast("Saved.");
+  session.showCoaForm = false;
+  render();
+}
+
+async function handleDeleteChartOfAccount(accountId){
+  const u = session.user;
+  const account = await db.get("chartOfAccounts", accountId);
+  if(!account) return;
+  const vouchers = await db.getAll("journalVouchers");
+  const inUse = vouchers.some(v=>(v.lines||[]).some(l=>l.ledgerAccountId===accountId));
+  if(inUse){ toast("This account has been used in a voucher and can't be deleted — deactivate it instead if it's no longer needed."); return; }
+  if(!window.confirm(`Delete account "${account.name}"?`)) return;
+  await db.delete("chartOfAccounts", accountId);
+  await logAudit(u.name, u.role, "GL Account Removed", `${account.code} — ${account.name}`);
   toast("Removed.");
   render();
 }
