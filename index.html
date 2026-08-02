@@ -868,7 +868,7 @@ const ALL_COLLECTIONS = [
   "recoveryVisits","apiConfig","aiConfig","nbfcProfile","categoryConfig","journalEntries","complianceItems","rbiReturnFilings",
   "staffSalaries","payrollRuns","dsaAgents","dsaCommissions",
   "shgGroups","shgMembers","shgSavings","shgInternalLoans","microEnterpriseTemplates",
-  "bankStatementLines","bankBorrowings","fixedAssets","projectionAssumptions","documentRegister","rcmItems","auditObservations","escalationRules","holidayCalendar","chartOfAccounts","journalVouchers","rbiInspections","strCtrRegister","loanDocuments",
+  "bankStatementLines","bankBorrowings","fixedAssets","projectionAssumptions","documentRegister","rcmItems","auditObservations","escalationRules","holidayCalendar","chartOfAccounts","journalVouchers","rbiInspections","strCtrRegister","loanDocuments","dpdSnapshots","recoveryAgencies",
   "auditLog","meta"
 ];
 
@@ -2241,6 +2241,8 @@ async function renderStaffShell(){
     tabContent = await renderOnboardingTab();
   } else if(tab === "dashboard"){
     tabContent = await renderManagementDashboard(leads, borrowers, customers, staffCount, appraisals, sanctions, loanAccounts, payments);
+  } else if(tab === "myqueue"){
+    tabContent = await renderMyQueueTab();
   } else if(tab === "leads"){
     tabContent = renderLeadsQueue(leads, products, await db.getAll("dsaAgents"));
   } else if(tab === "customers"){
@@ -2343,6 +2345,7 @@ async function renderStaffShell(){
     <main>
       <div class="tabs">
         ${canSeeDashboard ? `<button class="tab ${tab==='dashboard'?'active':''}" data-tab="dashboard">Dashboard</button>`:""}
+        <button class="tab ${tab==='myqueue'?'active':''}" data-tab="myqueue">My Queue</button>
         <button class="tab ${tab==='leads'?'active':''}" data-tab="leads">Leads &amp; Applications</button>
         <button class="tab ${tab==='customers'?'active':''}" data-tab="customers">Customers</button>
         <button class="tab ${tab==='appraisal'?'active':''}" data-tab="appraisal">Credit Appraisal</button>
@@ -2467,6 +2470,155 @@ function svgPieChart(data, opts={}){
     </svg>
     <div>${legend}</div>
   </div>`;
+}
+
+function daysSince(dateStr){
+  return Math.max(0, Math.round((new Date() - new Date(dateStr)) / (1000*60*60*24)));
+}
+/** Colour-coded ageing badge — green under 2 days, amber 3-5, red
+ *  beyond that. These thresholds are a reasonable starting TAT
+ *  expectation, not a regulatory standard; adjust to your own SLA. */
+function ageingBadge(days){
+  const cls = days<=2 ? "badge-approved" : days<=5 ? "badge-progress" : "badge-rejected";
+  return `<span class="badge ${cls}">${days}d</span>`;
+}
+
+/** Loosely matches a pending item's type label against the free-text
+ *  Escalation Matrix rules (e.g. "Sanction Approval" matching a queue
+ *  item labeled "Sanction") — a simple substring match rather than a
+ *  rigid dropdown, so the matrix stays easy to configure in plain
+ *  language while still actually doing something with it. */
+function findEscalationRule(itemTypeLabel, rules){
+  const label = itemTypeLabel.toLowerCase();
+  return rules.find(r=> label.includes(r.itemType.toLowerCase()) || r.itemType.toLowerCase().includes(label));
+}
+
+async function renderMyQueueTab(){
+  const u = session.user;
+  const [leads, appraisals, sanctions, journalEntries, glVouchers, policy, escalationRules, loanAccounts] = await Promise.all([
+    db.getAll("leads"), db.getAll("appraisals"), db.getAll("sanctions"),
+    db.getAll("journalEntries"), db.getAll("journalVouchers"), db.get("policyConfig","default"),
+    db.getAll("escalationRules"), db.getAll("loanAccounts")
+  ]);
+  const pol = policy || defaultPolicyConfig();
+  const openLeadStatuses = ["New","Contacted","Documents Pending","KYC Pending","Under Verification","Eligible"];
+  const openLeads = leads.filter(l=>openLeadStatuses.includes(l.status))
+    .map(l=>({...l, ageDays: daysSince(l.createdAt)})).sort((a,b)=>b.ageDays-a.ageDays);
+
+  const appraisedLeadIds = new Set(appraisals.map(a=>a.leadId));
+  const pendingAppraisal = leads.filter(l=>l.status==="Converted into Loan Application" && !appraisedLeadIds.has(l.id))
+    .map(l=>({...l, ageDays: daysSince(l.createdAt)})).sort((a,b)=>b.ageDays-a.ageDays);
+
+  const canApproveRole = (role)=> DELEGATION_ROLES.includes(role) || role==="Super Admin";
+  const myPendingSanctions = sanctions.filter(s=>s.status==="Pending Approval" && s.proposedBy!==u.name && canApproveRole(u.role))
+    .map(s=>({...s, ageDays: daysSince(s.createdAt)})).sort((a,b)=>b.ageDays-a.ageDays);
+  const myPendingJournalEntries = journalEntries.filter(j=>j.status==="Pending Approval" && j.proposedBy!==u.name &&
+    (u.role==="Super Admin" || getJournalLimitForRole(pol, u.role)>=j.amount))
+    .map(j=>({...j, ageDays: daysSince(j.createdAt)})).sort((a,b)=>b.ageDays-a.ageDays);
+  const myPendingVouchers = glVouchers.filter(v=>v.status==="Pending Approval" && v.proposedBy!==u.name &&
+    (u.role==="Super Admin" || getJournalLimitForRole(pol, u.role)>=v.totalDebit))
+    .map(v=>({...v, ageDays: daysSince(v.createdAt)})).sort((a,b)=>b.ageDays-a.ageDays);
+
+  const totalPending = openLeads.length + pendingAppraisal.length + myPendingSanctions.length + myPendingJournalEntries.length + myPendingVouchers.length;
+
+  // SLA-breach escalation: check EVERY pending item (regardless of who'd
+  // normally approve it) against the Escalation Matrix, and surface
+  // anything that's breached its threshold AND escalates to YOUR role
+  // specifically — this is what makes the matrix an actual working
+  // feature rather than just a reference table.
+  const allPendingForEscalation = [
+    ...leads.filter(l=>openLeadStatuses.includes(l.status)).map(l=>({label:"Lead", detail:l.applicantName, ageDays: daysSince(l.createdAt), tab:"leads"})),
+    ...sanctions.filter(s=>s.status==="Pending Approval").map(s=>({label:"Sanction Approval", detail:`${s.product} — ${fmtINR(s.sanctionedAmount)}`, ageDays: daysSince(s.createdAt), tab:"sanction"})),
+    ...journalEntries.filter(j=>j.status==="Pending Approval").map(j=>({label:"Journal Entry Approval", detail:`${j.category} — ${fmtINR(j.amount)}`, ageDays: daysSince(j.createdAt), tab:"accounting"})),
+    ...glVouchers.filter(v=>v.status==="Pending Approval").map(v=>({label:"GL Voucher Approval", detail:v.narration, ageDays: daysSince(v.createdAt), tab:"generalledger"})),
+  ];
+  const escalatedToMe = allPendingForEscalation.map(item=>{
+    const rule = findEscalationRule(item.label, escalationRules);
+    return rule && item.ageDays > rule.days && rule.toRole===u.role ? {...item, rule} : null;
+  }).filter(Boolean).sort((a,b)=>b.ageDays-a.ageDays);
+
+  // TAT — average turnaround, stage to stage, across loans that made it
+  // all the way to disbursement (a clean start-to-finish measure).
+  const tatSamples = [];
+  loanAccounts.forEach(acc=>{
+    const sanction = sanctions.find(s=>s.loanAccountId===acc.id);
+    if(!sanction) return;
+    const appraisal = appraisals.find(a=>a.id===sanction.appraisalId);
+    const lead = leads.find(l=>l.id===sanction.leadId);
+    if(!lead || !appraisal) return;
+    tatSamples.push({
+      leadToAppraisal: (new Date(appraisal.createdAt)-new Date(lead.createdAt))/(1000*60*60*24),
+      appraisalToSanction: (new Date(sanction.createdAt)-new Date(appraisal.createdAt))/(1000*60*60*24),
+      sanctionToDisbursement: (new Date(acc.createdAt)-new Date(sanction.createdAt))/(1000*60*60*24),
+      leadToDisbursement: (new Date(acc.createdAt)-new Date(lead.createdAt))/(1000*60*60*24),
+    });
+  });
+  const avg = (key)=> tatSamples.length>0 ? (tatSamples.reduce((s,t)=>s+Math.max(0,t[key]),0)/tatSamples.length) : null;
+
+  return `
+    <div class="card">
+      <h2>My Queue</h2>
+      <p class="sub">Everything currently needing action, aggregated in one place, oldest first. Ageing is calculated from when each item was created — not from when it entered its current specific status — so treat it as a reasonable proxy, not an exact SLA clock. ${totalPending} item(s) total right now.</p>
+    </div>
+
+    ${escalatedToMe.length>0 ? `
+    <div class="card" style="border:1px solid var(--danger); background:#FBE7E8;">
+      <h2 style="font-size:16px;">Escalated To You <span class="badge badge-rejected">${escalatedToMe.length}</span></h2>
+      <p class="sub">These have breached the SLA in your Escalation Matrix and now need your attention specifically, regardless of who'd normally handle them.</p>
+      <table>
+        <thead><tr><th>Item</th><th>Detail</th><th>Age</th><th>SLA</th><th></th></tr></thead>
+        <tbody>
+        ${escalatedToMe.map(e=>`<tr><td>${esc(e.label)}</td><td>${esc(e.detail)}</td><td>${ageingBadge(e.ageDays)}</td><td>${e.rule.days}d → ${esc(e.rule.toRole)}</td><td><button class="btn btn-outline btn-sm queue-goto-btn" data-tab="${e.tab}">Go</button></td></tr>`).join("")}
+        </tbody>
+      </table>
+    </div>` : ""}
+
+    <div class="card">
+      <h2 style="font-size:16px;">Turnaround Time (Average, Days)</h2>
+      <p class="sub">Across loans that reached disbursement — ${tatSamples.length} sample(s).</p>
+      <div class="grid grid-4">
+        <div class="kpi"><div class="lbl">Lead → Appraisal</div><div class="val" style="font-size:18px;">${avg('leadToAppraisal')!==null?avg('leadToAppraisal').toFixed(1):'—'}</div></div>
+        <div class="kpi"><div class="lbl">Appraisal → Sanction</div><div class="val" style="font-size:18px;">${avg('appraisalToSanction')!==null?avg('appraisalToSanction').toFixed(1):'—'}</div></div>
+        <div class="kpi"><div class="lbl">Sanction → Disbursement</div><div class="val" style="font-size:18px;">${avg('sanctionToDisbursement')!==null?avg('sanctionToDisbursement').toFixed(1):'—'}</div></div>
+        <div class="kpi"><div class="lbl">End-to-End (Lead → Disbursement)</div><div class="val" style="font-size:18px;">${avg('leadToDisbursement')!==null?avg('leadToDisbursement').toFixed(1):'—'}</div></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2 style="font-size:16px;">Open Leads Needing Action <span class="badge badge-progress">${openLeads.length}</span></h2>
+      <table>
+        <thead><tr><th>Applicant</th><th>Product</th><th>Status</th><th>Age</th><th></th></tr></thead>
+        <tbody>
+        ${openLeads.length===0 ? `<tr class="empty-row"><td colspan="5">Nothing open right now.</td></tr>` :
+          openLeads.map(l=>`<tr><td>${esc(l.applicantName)}</td><td>${esc(l.product)}</td><td>${esc(l.status)}</td><td>${ageingBadge(l.ageDays)}</td><td><button class="btn btn-outline btn-sm queue-goto-btn" data-tab="leads">Go to Leads</button></td></tr>`).join("")}
+        </tbody>
+      </table>
+    </div>
+
+    <div class="card">
+      <h2 style="font-size:16px;">Converted Leads Awaiting Appraisal <span class="badge badge-progress">${pendingAppraisal.length}</span></h2>
+      <table>
+        <thead><tr><th>Applicant</th><th>Product</th><th>Age</th><th></th></tr></thead>
+        <tbody>
+        ${pendingAppraisal.length===0 ? `<tr class="empty-row"><td colspan="4">Nothing waiting right now.</td></tr>` :
+          pendingAppraisal.map(l=>`<tr><td>${esc(l.applicantName)}</td><td>${esc(l.product)}</td><td>${ageingBadge(l.ageDays)}</td><td><button class="btn btn-outline btn-sm queue-goto-btn" data-tab="appraisal">Go to Appraisal</button></td></tr>`).join("")}
+        </tbody>
+      </table>
+    </div>
+
+    <div class="card">
+      <h2 style="font-size:16px;">Awaiting My Approval <span class="badge badge-rejected">${myPendingSanctions.length+myPendingJournalEntries.length+myPendingVouchers.length}</span></h2>
+      <table>
+        <thead><tr><th>Type</th><th>Detail</th><th>Amount</th><th>Proposed By</th><th>Age</th><th></th></tr></thead>
+        <tbody>
+        ${(myPendingSanctions.length+myPendingJournalEntries.length+myPendingVouchers.length)===0 ? `<tr class="empty-row"><td colspan="6">Nothing awaiting your approval right now.</td></tr>` : ""}
+        ${myPendingSanctions.map(s=>`<tr><td>Sanction</td><td>${esc(s.product)}</td><td>${fmtINR(s.sanctionedAmount)}</td><td>${esc(s.proposedBy)}</td><td>${ageingBadge(s.ageDays)}</td><td><button class="btn btn-outline btn-sm queue-goto-btn" data-tab="sanction">Go to Sanctions</button></td></tr>`).join("")}
+        ${myPendingJournalEntries.map(j=>`<tr><td>Journal Entry</td><td>${esc(j.category)}</td><td>${fmtINR(j.amount)}</td><td>${esc(j.proposedBy)}</td><td>${ageingBadge(j.ageDays)}</td><td><button class="btn btn-outline btn-sm queue-goto-btn" data-tab="accounting">Go to Accounting</button></td></tr>`).join("")}
+        ${myPendingVouchers.map(v=>`<tr><td>GL Voucher</td><td>${esc(v.narration)}</td><td>${fmtINR(v.totalDebit)}</td><td>${esc(v.proposedBy)}</td><td>${ageingBadge(v.ageDays)}</td><td><button class="btn btn-outline btn-sm queue-goto-btn" data-tab="generalledger">Go to General Ledger</button></td></tr>`).join("")}
+        </tbody>
+      </table>
+    </div>
+  `;
 }
 
 async function renderManagementDashboard(leads, borrowers, customers, staffCount, appraisals, sanctions, loanAccounts, payments){
@@ -4543,7 +4695,41 @@ async function renderOverdueTab(loanAccounts, customers){
   const subview = session.recoverySubview || "list";
   if(subview === "detail") return await renderRecoveryDetail(loanAccounts.find(a=>a.id===session.recoveryLoanId), customers);
   if(subview === "visit") return await renderRecoveryVisitForm(loanAccounts.find(a=>a.id===session.recoveryLoanId), customers);
+  if(subview === "agencies") return await renderRecoveryAgenciesSection();
   return await renderOverdueList(loanAccounts, customers);
+}
+
+async function renderRecoveryAgenciesSection(){
+  const agencies = await db.getAll("recoveryAgencies");
+  return `
+    <div class="card">
+      <div class="flex-between">
+        <h2>Recovery Agencies</h2>
+        <div class="action-row">
+          <button class="btn btn-outline btn-sm" id="btn-back-to-overdue-from-agencies">← Back to Overdue List</button>
+          <button class="btn btn-gold btn-sm" id="btn-open-agency-form">+ Add Agency</button>
+        </div>
+      </div>
+      <p class="sub">External recovery agencies you outsource collection to — assignable per account from that account's Recovery Status screen.</p>
+      ${session.showAgencyForm ? `
+      <div class="grid grid-3">
+        <div class="field"><label>Agency name</label><input id="agency-name" placeholder="e.g. Sharma Recovery Services"></div>
+        <div class="field"><label>Contact person</label><input id="agency-contact" placeholder="Name"></div>
+        <div class="field"><label>Mobile</label><input id="agency-mobile" maxlength="10"></div>
+      </div>
+      <button class="btn btn-gold btn-sm" id="btn-save-agency">Save</button>
+      ` : ""}
+      <table style="margin-top:10px;">
+        <thead><tr><th>Agency</th><th>Contact</th><th>Mobile</th><th>Status</th><th></th></tr></thead>
+        <tbody>
+        ${agencies.length===0 ? `<tr class="empty-row"><td colspan="5">No recovery agencies added yet.</td></tr>` :
+          agencies.map(a=>`<tr><td>${esc(a.name)}</td><td>${esc(a.contact)||"—"}</td><td class="mono">${esc(a.mobile)||"—"}</td>
+            <td>${a.active?`<span class="badge badge-approved">Active</span>`:`<span class="badge badge-new">Inactive</span>`}</td>
+            <td><button class="btn btn-outline btn-sm toggle-agency-btn" data-agency="${a.id}">${a.active?'Deactivate':'Activate'}</button></td></tr>`).join("")}
+        </tbody>
+      </table>
+    </div>
+  `;
 }
 
 async function renderOverdueList(loanAccounts, customers){
@@ -4561,8 +4747,10 @@ async function renderOverdueList(loanAccounts, customers){
 
   return `
     <div class="card">
-      <h2>Overdue &amp; NPA Management</h2>
-      <p class="sub">Classification is derived automatically from days-past-due against your Credit Policy's provisioning bands.</p>
+      <div class="flex-between">
+        <div><h2>Overdue &amp; NPA Management</h2><p class="sub" style="margin-bottom:0;">Classification is derived automatically from days-past-due against your Credit Policy's provisioning bands.</p></div>
+        <button class="btn btn-outline btn-sm" id="btn-open-recovery-agencies">Recovery Agencies</button>
+      </div>
       <div class="warn-banner" style="background:#FBF1DC;border-color:var(--gold);color:#5C4200;">⚠ DPD-to-classification bands and penal interest here are an illustrative approximation for this prototype — confirm exact bands, provisioning basis, and penal interest methodology against your Board-approved policy and current RBI norms before relying on these figures.</div>
       <table>
         <thead><tr><th>Customer</th><th>DPD</th><th>Classification</th><th>Overdue Amt</th><th>Interest Due</th><th>Penal Interest</th><th>Provisioning</th><th>Recovery Officer</th><th>Status</th><th></th></tr></thead>
@@ -4600,6 +4788,7 @@ async function renderRecoveryDetail(acc, customers){
   const analysis = analyzeLoanAccount(acc, productMap, policy);
   const cust = customers.find(c=>c.id===acc.customerId);
   const visits = (await db.getAll("recoveryVisits")).filter(v=>v.loanAccountId===acc.id).sort((a,b)=>new Date(b.createdAt)-new Date(a.createdAt));
+  const recoveryAgencies = (await db.getAll("recoveryAgencies")).filter(ra=>ra.active);
 
   return `
     <div class="card">
@@ -4622,6 +4811,11 @@ async function renderRecoveryDetail(acc, customers){
         <div class="field"><label>Settlement / OTS amount (₹)</label><input id="rd-settlement-amount" type="number" value="${acc.settlementAmount||''}"></div>
         <div class="field"><label>Settlement status</label><select id="rd-settlement-status">
           ${["None","Proposed","Approved","Rejected","Paid"].map(s=>`<option ${s===(acc.settlementStatus||'None')?'selected':''}>${s}</option>`).join("")}
+        </select></div>
+        <div class="field"><label>Telecaller assigned</label><input id="rd-telecaller" placeholder="Name of staff doing phone follow-up" value="${esc(acc.telecallerAssigned||'')}"></div>
+        <div class="field"><label>Recovery agency (if outsourced)</label><select id="rd-agency">
+          <option value="">— None (handled in-house) —</option>
+          ${recoveryAgencies.map(ra=>`<option value="${ra.id}" ${acc.recoveryAgencyId===ra.id?'selected':''}>${esc(ra.name)}</option>`).join("")}
         </select></div>
       </div>
       <button class="btn btn-gold btn-sm" id="btn-save-recovery-status" data-loan="${acc.id}">Save Recovery Status</button>
@@ -6067,6 +6261,8 @@ const REPORT_DEFS = [
   {id:"monthly-mis", label:"Monthly MIS"},
   {id:"income-report", label:"Income Report"},
   {id:"fund-liquidity", label:"Fund Position / Liquidity Report"},
+  {id:"vintage-analysis", label:"Vintage Analysis (by Disbursement Month)"},
+  {id:"dpd-migration", label:"DPD Migration (Month-on-Month)"},
 ];
 
 async function buildReport(reportId){
@@ -6208,6 +6404,41 @@ async function buildReport(reportId){
     const fundPos = await computeFundPosition();
     return { headers:["Fund Source","Type","Balance"], rows: fundPos.accounts.map(a=>[a.name, a.type, fmtINR(a.balance)]).concat([["Available Funds","—",fmtINR(fundPos.available)],["Committed Funds","—",fmtINR(fundPos.committed)]]) };
   }
+  if(reportId==="vintage-analysis"){
+    const byMonth = {};
+    loanAccounts.forEach(a=>{
+      const month = (a.disbursedDate||"").slice(0,7);
+      if(!month) return;
+      byMonth[month] = byMonth[month] || {count:0, disbursed:0, outstanding:0, npaAmount:0};
+      byMonth[month].count++;
+      byMonth[month].disbursed += a.principal;
+      byMonth[month].outstanding += a.principalOutstanding;
+      if(a.status==="Active" && NPA_CLASSES.includes(classifyDPD(computeDPD(a)))) byMonth[month].npaAmount += a.principalOutstanding;
+    });
+    return { headers:["Vintage (Disbursement Month)","Loans","Disbursed","Outstanding Today","NPA Amount","NPA % of Cohort"],
+      rows: Object.entries(byMonth).sort((a,b)=>a[0].localeCompare(b[0])).map(([month,d])=>[
+        month, d.count, fmtINR(d.disbursed), fmtINR(Math.round(d.outstanding)), fmtINR(Math.round(d.npaAmount)),
+        d.disbursed>0 ? (d.npaAmount/d.disbursed*100).toFixed(1)+"%" : "0%"
+      ]) };
+  }
+  if(reportId==="dpd-migration"){
+    const snapshots = await db.getAll("dpdSnapshots");
+    const months = [...new Set(snapshots.map(s=>s.snapshotMonth))].sort();
+    if(months.length<2){
+      return { headers:["Status"], rows: [[`Only ${months.length} snapshot(s) captured so far — need at least 2 different months to show migration. Use "Capture This Month's Snapshot" above, then check back next month.`]] };
+    }
+    const prevMonth = months[months.length-2], currMonth = months[months.length-1];
+    const prevByAccount = Object.fromEntries(snapshots.filter(s=>s.snapshotMonth===prevMonth).map(s=>[s.loanAccountId, s.classification]));
+    const currByAccount = Object.fromEntries(snapshots.filter(s=>s.snapshotMonth===currMonth).map(s=>[s.loanAccountId, s.classification]));
+    const matrix = {};
+    Object.keys(prevByAccount).forEach(accId=>{
+      const from = prevByAccount[accId], to = currByAccount[accId];
+      if(!to) return; // account closed/no longer active
+      const key = `${from} → ${to}`;
+      matrix[key] = (matrix[key]||0) + 1;
+    });
+    return { headers:[`${prevMonth} → ${currMonth}`,"Accounts"], rows: Object.entries(matrix).sort((a,b)=>b[1]-a[1]) };
+  }
   return { headers:[], rows:[] };
 }
 
@@ -6225,6 +6456,7 @@ async function renderReportsTab(){
         ${selected==="daily-mis" ? `<div class="field" style="max-width:200px;"><label>Date</label><input id="report-date" type="date" value="${session.reportDate||todayStr()}"></div>` : ""}
         ${selected==="monthly-mis" ? `<div class="field" style="max-width:200px;"><label>Month</label><input id="report-month" type="month" value="${session.reportMonth||todayStr().slice(0,7)}"></div>` : ""}
       </div>
+      ${selected==="dpd-migration" ? `<button class="btn btn-gold btn-sm" id="btn-capture-dpd-snapshot" style="margin-top:8px;">Capture This Month's Snapshot</button><p class="small muted" style="margin-top:6px;">Freezes every active account's current DPD classification for this month, so next month's capture can show what actually moved. Safe to run again this month — it just updates this month's snapshot rather than duplicating it. Needs at least 2 different months captured before migration shows anything.</p>` : ""}
     </div>
     <div class="card">
       <div class="flex-between">
@@ -7563,6 +7795,9 @@ function bindEvents(){
 
   const staySignedInBtn = document.getElementById("btn-stay-signed-in");
   if(staySignedInBtn) staySignedInBtn.onclick = ()=>{ recordActivity(); session.timeoutWarningShown = false; render(); };
+  document.querySelectorAll(".queue-goto-btn").forEach(btn=>{
+    btn.onclick = ()=>{ session.staffTab = btn.dataset.tab; render(); };
+  });
   const openGlobalSearchBtn = document.getElementById("btn-open-global-search");
   if(openGlobalSearchBtn) openGlobalSearchBtn.onclick = ()=>{ session.showGlobalSearch = true; render(); };
   const closeGlobalSearchBtn = document.getElementById("btn-close-global-search");
@@ -7923,6 +8158,15 @@ function bindEvents(){
   document.querySelectorAll(".view-recovery-btn").forEach(btn=> btn.onclick = ()=>{ session.recoverySubview="detail"; session.recoveryLoanId=btn.dataset.loan; render(); });
   const backToOverdue = document.getElementById("btn-back-to-overdue");
   if(backToOverdue) backToOverdue.onclick = ()=>{ session.recoverySubview="list"; render(); };
+  const openRecoveryAgenciesBtn = document.getElementById("btn-open-recovery-agencies");
+  if(openRecoveryAgenciesBtn) openRecoveryAgenciesBtn.onclick = ()=>{ session.recoverySubview="agencies"; render(); };
+  const backToOverdueFromAgencies = document.getElementById("btn-back-to-overdue-from-agencies");
+  if(backToOverdueFromAgencies) backToOverdueFromAgencies.onclick = ()=>{ session.recoverySubview="list"; render(); };
+  const openAgencyFormBtn = document.getElementById("btn-open-agency-form");
+  if(openAgencyFormBtn) openAgencyFormBtn.onclick = ()=>{ session.showAgencyForm = !session.showAgencyForm; render(); };
+  const saveAgencyBtn = document.getElementById("btn-save-agency");
+  if(saveAgencyBtn) saveAgencyBtn.onclick = handleSaveRecoveryAgency;
+  document.querySelectorAll(".toggle-agency-btn").forEach(btn=> btn.onclick = ()=> handleToggleRecoveryAgency(btn.dataset.agency));
   const saveRecoveryStatusBtn = document.getElementById("btn-save-recovery-status");
   if(saveRecoveryStatusBtn) saveRecoveryStatusBtn.onclick = ()=> handleSaveRecoveryStatus(saveRecoveryStatusBtn.dataset.loan);
   const logVisitBtn = document.getElementById("btn-log-visit");
@@ -8093,6 +8337,8 @@ function bindEvents(){
   if(reportMonthInput) reportMonthInput.onchange = ()=>{ session.reportMonth = reportMonthInput.value; render(); };
   const exportReportBtn = document.getElementById("btn-export-report");
   if(exportReportBtn) exportReportBtn.onclick = handleExportReport;
+  const captureDpdSnapshotBtn = document.getElementById("btn-capture-dpd-snapshot");
+  if(captureDpdSnapshotBtn) captureDpdSnapshotBtn.onclick = handleCaptureDpdSnapshot;
 
   // AI Insights
   // General Ledger
@@ -9322,6 +9568,30 @@ async function handleAssignRecoveryOfficer(loanId, officerName){
   render();
 }
 
+async function handleSaveRecoveryAgency(){
+  const u = session.user;
+  const name = document.getElementById("agency-name").value.trim();
+  if(!name){ toast("Enter an agency name."); return; }
+  await db.put("recoveryAgencies", {
+    id: uid("rag"), name, contact: document.getElementById("agency-contact").value.trim(),
+    mobile: document.getElementById("agency-mobile").value.trim(), active: true,
+    createdAt: nowISO(), createdBy: u.name
+  });
+  await logAudit(u.name, u.role, "Recovery Agency Added", name);
+  toast("Saved.");
+  session.showAgencyForm = false;
+  render();
+}
+async function handleToggleRecoveryAgency(id){
+  const u = session.user;
+  const agency = await db.get("recoveryAgencies", id);
+  if(!agency) return;
+  agency.active = !agency.active;
+  await db.put("recoveryAgencies", agency);
+  await logAudit(u.name, u.role, "Recovery Agency Status Changed", `${agency.name} — ${agency.active?'Activated':'Deactivated'}`);
+  render();
+}
+
 async function handleSaveRecoveryStatus(loanId){
   const u = session.user;
   const acc = await db.get("loanAccounts", loanId);
@@ -9331,6 +9601,8 @@ async function handleSaveRecoveryStatus(loanId){
   acc.legalActionDate = document.getElementById("rd-legal-date").value || null;
   acc.settlementAmount = Number(document.getElementById("rd-settlement-amount").value) || null;
   acc.settlementStatus = document.getElementById("rd-settlement-status").value;
+  acc.telecallerAssigned = document.getElementById("rd-telecaller").value.trim() || null;
+  acc.recoveryAgencyId = document.getElementById("rd-agency").value || null;
   await db.put("loanAccounts", acc);
   const cust = await db.get("customers", acc.customerId);
   await logAudit(u.name, u.role, "Recovery Status Updated", `${cust?cust.personal.name:acc.customerId} — ${acc.recoveryStatus}${acc.legalActionInitiated?' — Legal action initiated':''}${acc.settlementStatus!=='None'?' — Settlement: '+acc.settlementStatus:''}`);
@@ -10276,6 +10548,26 @@ async function computeOverdueRbiReturns(){
 }
 
 
+
+async function handleCaptureDpdSnapshot(){
+  const u = session.user;
+  const loanAccounts = await db.getAll("loanAccounts");
+  const currentMonth = todayStr().slice(0,7);
+  const existing = (await db.getAll("dpdSnapshots")).filter(s=>s.snapshotMonth===currentMonth);
+  for(const s of existing){ await db.delete("dpdSnapshots", s.id); } // re-running this month replaces, doesn't duplicate
+
+  const activeAccounts = loanAccounts.filter(a=>a.status==="Active");
+  for(const acc of activeAccounts){
+    await db.put("dpdSnapshots", {
+      id: uid("dsnap"), snapshotMonth: currentMonth, loanAccountId: acc.id,
+      classification: classifyDPD(computeDPD(acc)), principalOutstanding: acc.principalOutstanding,
+      capturedAt: nowISO(), capturedBy: u.name
+    });
+  }
+  await logAudit(u.name, u.role, "DPD Snapshot Captured", `${currentMonth} — ${activeAccounts.length} account(s)`);
+  toast(`Captured ${activeAccounts.length} account(s) for ${currentMonth}.`);
+  render();
+}
 
 async function handleExportReport(){
   const selected = session.selectedReport || REPORT_DEFS[0].id;
