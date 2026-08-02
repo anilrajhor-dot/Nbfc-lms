@@ -868,7 +868,7 @@ const ALL_COLLECTIONS = [
   "recoveryVisits","apiConfig","aiConfig","nbfcProfile","categoryConfig","journalEntries","complianceItems","rbiReturnFilings",
   "staffSalaries","payrollRuns","dsaAgents","dsaCommissions",
   "shgGroups","shgMembers","shgSavings","shgInternalLoans","microEnterpriseTemplates",
-  "bankStatementLines","bankBorrowings","fixedAssets","projectionAssumptions","documentRegister","rcmItems","auditObservations","escalationRules","holidayCalendar","chartOfAccounts","journalVouchers",
+  "bankStatementLines","bankBorrowings","fixedAssets","projectionAssumptions","documentRegister","rcmItems","auditObservations","escalationRules","holidayCalendar","chartOfAccounts","journalVouchers","rbiInspections","strCtrRegister",
   "auditLog","meta"
 ];
 
@@ -1398,6 +1398,33 @@ const REMINDER_RULES = [
 
 function periodsPerYear(freq){
   return {Monthly:12, Weekly:52, Fortnightly:26, Quarterly:4}[freq] || 12;
+}
+
+/** APR (Annual Percentage Rate) — the all-in cost of borrowing RBI's
+ *  Key Fact Statement mandate requires, factoring in every fee
+ *  alongside the interest rate, not just the nominal rate. Found via
+ *  bisection: the rate at which the present value of net proceeds
+ *  actually received (principal minus upfront fees) equals the present
+ *  value of all future EMI outflows. Uses the SAME nominal-rate-per-
+ *  period discounting convention as generateEmiSchedule() itself —
+ *  that match matters: get it wrong and even the zero-fee case won't
+ *  correctly reduce to the nominal interest rate, which is the
+ *  simplest possible check that this is actually correct. */
+function computeAPR(netProceeds, schedule, periodsPerYear){
+  if(netProceeds<=0 || schedule.length===0) return 0;
+  const npv = (annualRate)=>{
+    const periodRate = annualRate/periodsPerYear;
+    let total = -netProceeds;
+    schedule.forEach((inst,i)=>{ total += inst.emiAmount / Math.pow(1+periodRate, i+1); });
+    return total;
+  };
+  let lo = 0.0001, hi = 3.0;
+  for(let iter=0; iter<100; iter++){
+    const mid = (lo+hi)/2;
+    if(Math.abs(npv(mid)) < 0.01) return mid*100;
+    if(npv(mid) > 0) lo = mid; else hi = mid;
+  }
+  return ((lo+hi)/2)*100;
 }
 
 function generateEmiSchedule(loanAccount){
@@ -3587,6 +3614,7 @@ async function renderSanctionLetter(sanction, customers, products){
       <div class="flex-between"><h2>Sanction Letter</h2>
         <div class="action-row">
           <button class="btn btn-outline btn-sm" id="btn-close-letter">Close</button>
+          <button class="btn btn-outline btn-sm" id="btn-generate-kfs" data-sanction="${sanction.id}">Key Fact Statement (KFS)</button>
           <button class="btn btn-outline btn-sm send-letter-btn" data-sanction="${sanction.id}" data-channel="whatsapp">Send WhatsApp</button>
           <button class="btn btn-outline btn-sm send-letter-btn" data-sanction="${sanction.id}" data-channel="email">Send Email</button>
           <button class="btn btn-gold btn-sm" id="btn-print-letter">Print</button>
@@ -3906,6 +3934,84 @@ function renderLoanAccountsList(loanAccounts, customers){
         </tbody>
       </table>
     </div>
+  `;
+}
+
+/** Key Fact Statement — RBI's Master Direction (April 15, 2024) requires
+ *  this be given to the borrower before the loan agreement is executed,
+ *  for every new retail/MSME term loan sanctioned on or after 1 Oct 2024.
+ *  Covers the elements that mandate requires: sanctioned amount, tenure,
+ *  EMI, interest rate, itemized fees/charges, APR (all-in cost), penal
+ *  and foreclosure charges, and the cooling-off period. Built in good
+ *  faith from the publicly available requirements — cross-check the
+ *  exact field-by-field template (Annex A of that circular) with your
+ *  compliance team before relying on this as your compliance document;
+ *  I don't have that literal annex to verify against character-for-character.
+ */
+async function generateKfsHtml(sanction, cust, product){
+  const nbfc = await getNbfcProfile();
+  const gen = generateEmiSchedule({
+    principal: sanction.sanctionedAmount, interestRate: sanction.interestRate,
+    tenureMonths: sanction.tenureMonths, disbursedDate: todayStr(),
+    emiFrequency: product ? product.emiFrequency : "Monthly"
+  });
+  const processingFee = sanction.processingFee || 0;
+  const insuranceFee = product ? Math.round(sanction.sanctionedAmount * (product.insurancePct||0)/100) : 0;
+  const gstOnFees = product ? Math.round((processingFee+insuranceFee) * (product.gstPct||0)/100) : 0;
+  const totalUpfrontFees = processingFee + insuranceFee + gstOnFees;
+  const netProceeds = sanction.sanctionedAmount - totalUpfrontFees;
+  const periodsPerYear_ = periodsPerYear(product ? product.emiFrequency : "Monthly");
+  const apr = computeAPR(netProceeds, gen.schedule, periodsPerYear_);
+  const penalRate = product ? product.penaltyRatePct : 2;
+
+  return `
+    <div class="letterhead">
+      <div class="name">${esc(nbfc.name||"[NBFC Name Not Set]")}</div>
+      <div class="meta">${esc(nbfc.address||"")} ${nbfc.registrationNumber?" · RBI Reg. "+esc(nbfc.registrationNumber):""}</div>
+    </div>
+    <h1>Key Fact Statement (KFS)</h1>
+    <p class="small">As per RBI's Key Fact Statement guidelines — provided before execution of your loan agreement, summarizing the true cost and terms of this loan in plain language.</p>
+    <table>
+      <tr><td><b>Borrower</b></td><td>${esc(cust.personal.name)}</td><td><b>Reference No.</b></td><td class="mono">${esc(sanction.id)}</td></tr>
+      <tr><td><b>Type of Loan</b></td><td>${esc(sanction.product)}</td><td><b>Date</b></td><td>${fmtDate(nowISO())}</td></tr>
+    </table>
+
+    <h2>Loan Terms</h2>
+    <table>
+      <tr><td style="width:35%;"><b>Sanctioned Loan Amount</b></td><td>${fmtINR(sanction.sanctionedAmount)}</td></tr>
+      <tr><td><b>Loan Term</b></td><td>${sanction.tenureMonths} months</td></tr>
+      <tr><td><b>Interest Rate (Fixed)</b></td><td>${sanction.interestRate}% per annum</td></tr>
+      <tr><td><b>Instalment Amount (EMI)</b></td><td>${fmtINR(gen.emiAmount)} — ${gen.totalInstallments} instalments, ${esc(product?product.emiFrequency:"Monthly")}</td></tr>
+    </table>
+
+    <h2>Fees and Charges</h2>
+    <table>
+      <thead><tr><th>Charge</th><th>Amount</th><th>When Payable</th></tr></thead>
+      <tbody>
+        <tr><td>Processing Fee</td><td>${fmtINR(processingFee)}</td><td>One-time, at disbursement</td></tr>
+        ${insuranceFee>0 ? `<tr><td>Insurance Charges</td><td>${fmtINR(insuranceFee)}</td><td>One-time, at disbursement</td></tr>` : ""}
+        <tr><td>GST on above charges</td><td>${fmtINR(gstOnFees)}</td><td>One-time, at disbursement</td></tr>
+        <tr><td><b>Net Amount Disbursed (Sanctioned Amount less upfront charges)</b></td><td><b>${fmtINR(netProceeds)}</b></td><td>—</td></tr>
+      </tbody>
+    </table>
+
+    <h2>Annual Percentage Rate (APR)</h2>
+    <table><tr><td style="width:35%;"><b>APR — Effective Annual Cost of This Loan</b></td><td style="font-size:16px;"><b>${apr.toFixed(2)}%</b></td></tr></table>
+    <p class="small">APR factors in the interest rate together with all upfront fees and charges shown above — this is the true annual cost of borrowing, not just the interest rate, and is what RBI requires be disclosed for comparison across lenders.</p>
+
+    <h2>Contingent Charges</h2>
+    <table>
+      <tr><td style="width:35%;"><b>Penal Charges (on overdue amount)</b></td><td>${penalRate}% per annum on the overdue amount, for the period of delay</td></tr>
+      <tr><td><b>Foreclosure / Prepayment Charges</b></td><td>Principal outstanding plus interest accrued to date of foreclosure — no charge on future scheduled interest</td></tr>
+    </table>
+
+    <h2>Cooling-Off / Look-Up Period</h2>
+    <p>You have <b>3 days</b> from the date of this Key Fact Statement to exit this loan, by repaying the principal and proportionate interest for the period, without any foreclosure charge.</p>
+
+    <h2>Grievance Redressal</h2>
+    <p>${esc(nbfc.contactEmail||"")}${nbfc.contactPhone?" · "+esc(nbfc.contactPhone):""}${!nbfc.contactEmail && !nbfc.contactPhone ? "Contact your branch directly." : ""}</p>
+
+    <p style="font-size:10.5px; color:#888; margin-top:20px;">Generated from NBFC LMS on ${fmtDate(nowISO())}. This summarizes the terms above — please read your full loan agreement, which governs in case of any difference.</p>
   `;
 }
 
@@ -5491,6 +5597,81 @@ async function renderRatiosComplianceTab(){
     ${await renderRcmSection()}
 
     ${await renderAuditObservationsSection()}
+
+    ${await renderRbiInspectionSection()}
+
+    ${await renderStrCtrSection()}
+  `;
+}
+
+const INSPECTION_TYPES = ["On-Site (RBI Officers Visit)","Off-Site Surveillance / Desk Review","Statutory Auditor Concurrent Review"];
+const INSPECTION_STATUSES = ["Ongoing","Report Received","ATR Submitted","Closed"];
+
+async function renderRbiInspectionSection(){
+  const items = (await db.getAll("rbiInspections")).sort((a,b)=>new Date(b.startDate)-new Date(a.startDate));
+  return `
+    <div class="card">
+      <div class="flex-between">
+        <div><h2 style="font-size:16px;">RBI Inspection Register</h2><p class="sub" style="margin-bottom:0;">Track RBI's periodic on-site/off-site supervisory inspections, key observations, and your Action Taken Report (ATR) status — a record-keeping tool, not a channel to RBI itself.</p></div>
+        <button class="btn btn-gold btn-sm" id="btn-open-inspection-form">+ Log Inspection</button>
+      </div>
+      ${session.showInspectionForm ? `
+      <div class="grid grid-3">
+        <div class="field"><label>Type</label><select id="insp-type">${INSPECTION_TYPES.map(t=>`<option>${t}</option>`).join("")}</select></div>
+        <div class="field"><label>Period covered</label><input id="insp-period" placeholder="e.g. FY 2024-25"></div>
+        <div class="field"><label>Start date</label><input id="insp-start-date" type="date"></div>
+        <div class="field"><label>End date</label><input id="insp-end-date" type="date"></div>
+        <div class="field"><label>ATR due date</label><input id="insp-atr-due" type="date"></div>
+        <div class="field"><label>Status</label><select id="insp-status">${INSPECTION_STATUSES.map(s=>`<option>${s}</option>`).join("")}</select></div>
+      </div>
+      <div class="field"><label>Key observations</label><textarea id="insp-observations" placeholder="Summary of what was observed/flagged"></textarea></div>
+      <button class="btn btn-gold btn-sm" id="btn-save-inspection">Save</button>
+      ` : ""}
+      <table style="margin-top:10px;">
+        <thead><tr><th>Type</th><th>Period</th><th>Dates</th><th>ATR Due</th><th>Status</th><th></th></tr></thead>
+        <tbody>
+        ${items.length===0 ? `<tr class="empty-row"><td colspan="6">No inspections logged yet.</td></tr>` :
+          items.map(i=>`<tr><td>${esc(i.type)}</td><td>${esc(i.period)}</td><td>${i.startDate} → ${i.endDate||"—"}</td><td>${i.atrDue||"—"}</td>
+            <td><select class="inspection-status-select" data-insp="${i.id}">${INSPECTION_STATUSES.map(s=>`<option ${i.status===s?'selected':''}>${s}</option>`).join("")}</select></td>
+            <td><button class="btn btn-danger btn-sm delete-inspection-btn" data-insp="${i.id}">Delete</button></td></tr>`).join("")}
+        </tbody>
+      </table>
+    </div>
+  `;
+}
+
+const STR_CTR_TYPES = ["STR (Suspicious Transaction Report)","CTR (Cash Transaction Report)"];
+
+async function renderStrCtrSection(){
+  const items = (await db.getAll("strCtrRegister")).sort((a,b)=>new Date(b.transactionDate)-new Date(a.transactionDate));
+  return `
+    <div class="card">
+      <div class="flex-between">
+        <div><h2 style="font-size:16px;">STR / CTR Register</h2><p class="sub" style="margin-bottom:0;">Internal record of Suspicious/Cash Transaction Reports under PMLA — logs what you've identified and whether it's been filed with FIU-IND. This does NOT submit anything to FIU-IND itself; that requires FIU-IND's own registered reporting portal, which needs separate registration as a Reporting Entity — this is purely your internal register.</p></div>
+        <button class="btn btn-gold btn-sm" id="btn-open-strctr-form">+ Log Entry</button>
+      </div>
+      ${session.showStrCtrForm ? `
+      <div class="grid grid-3">
+        <div class="field"><label>Type</label><select id="strctr-type">${STR_CTR_TYPES.map(t=>`<option>${t}</option>`).join("")}</select></div>
+        <div class="field"><label>Customer/Account</label><input id="strctr-reference" placeholder="Name or account number"></div>
+        <div class="field"><label>Transaction date</label><input id="strctr-txn-date" type="date"></div>
+        <div class="field"><label>Amount</label><input id="strctr-amount" type="number"></div>
+        <div class="field"><label>Reported to FIU-IND?</label><select id="strctr-reported"><option>No</option><option>Yes</option></select></div>
+        <div class="field"><label>Filing date (if reported)</label><input id="strctr-filed-date" type="date"></div>
+      </div>
+      <div class="field"><label>Reason / basis</label><textarea id="strctr-reason" placeholder="Why this transaction was flagged, or which threshold triggered a CTR"></textarea></div>
+      <button class="btn btn-gold btn-sm" id="btn-save-strctr">Save</button>
+      ` : ""}
+      <table style="margin-top:10px;">
+        <thead><tr><th>Type</th><th>Customer/Account</th><th>Date</th><th>Amount</th><th>Reported?</th><th></th></tr></thead>
+        <tbody>
+        ${items.length===0 ? `<tr class="empty-row"><td colspan="6">No entries logged yet.</td></tr>` :
+          items.map(i=>`<tr><td>${esc(i.type)}</td><td>${esc(i.reference)}</td><td>${i.transactionDate}</td><td>${fmtINR(i.amount)}</td>
+            <td>${i.reported==='Yes'?`<span class="badge badge-approved">Yes — ${i.filedDate||''}</span>`:`<span class="badge badge-rejected">No</span>`}</td>
+            <td><button class="btn btn-danger btn-sm delete-strctr-btn" data-strctr="${i.id}">Delete</button></td></tr>`).join("")}
+        </tbody>
+      </table>
+    </div>
   `;
 }
 
@@ -7564,6 +7745,8 @@ function bindEvents(){
   if(closeLetterBtn) closeLetterBtn.onclick = ()=>{ session.sanctionSubview="list"; render(); };
   const printLetterBtn = document.getElementById("btn-print-letter");
   if(printLetterBtn) printLetterBtn.onclick = ()=> window.print();
+  const generateKfsBtn = document.getElementById("btn-generate-kfs");
+  if(generateKfsBtn) generateKfsBtn.onclick = ()=> handleGenerateKFS(generateKfsBtn.dataset.sanction);
   document.querySelectorAll(".send-letter-btn").forEach(btn=>{
     btn.onclick = ()=> handleSendSanctionLetter(btn.dataset.sanction, btn.dataset.channel);
   });
@@ -7801,6 +7984,17 @@ function bindEvents(){
   if(saveAuditObsBtn) saveAuditObsBtn.onclick = handleSaveAuditObservation;
   document.querySelectorAll(".delete-audit-obs-btn").forEach(btn=> btn.onclick = ()=> handleDeleteAuditObservation(btn.dataset.obs));
   document.querySelectorAll(".audit-obs-status-select").forEach(sel=> sel.onchange = ()=> handleUpdateAuditObsStatus(sel.dataset.obs, sel.value));
+  const openInspectionFormBtn = document.getElementById("btn-open-inspection-form");
+  if(openInspectionFormBtn) openInspectionFormBtn.onclick = ()=>{ session.showInspectionForm = !session.showInspectionForm; render(); };
+  const saveInspectionBtn = document.getElementById("btn-save-inspection");
+  if(saveInspectionBtn) saveInspectionBtn.onclick = handleSaveInspection;
+  document.querySelectorAll(".delete-inspection-btn").forEach(btn=> btn.onclick = ()=> handleDeleteInspection(btn.dataset.insp));
+  document.querySelectorAll(".inspection-status-select").forEach(sel=> sel.onchange = ()=> handleUpdateInspectionStatus(sel.dataset.insp, sel.value));
+  const openStrCtrFormBtn = document.getElementById("btn-open-strctr-form");
+  if(openStrCtrFormBtn) openStrCtrFormBtn.onclick = ()=>{ session.showStrCtrForm = !session.showStrCtrForm; render(); };
+  const saveStrCtrBtn = document.getElementById("btn-save-strctr");
+  if(saveStrCtrBtn) saveStrCtrBtn.onclick = handleSaveStrCtr;
+  document.querySelectorAll(".delete-strctr-btn").forEach(btn=> btn.onclick = ()=> handleDeleteStrCtr(btn.dataset.strctr));
   document.querySelectorAll(".delete-document-btn").forEach(btn=> btn.onclick = ()=> handleDeleteDocument(btn.dataset.doc));
   if(addRbiFilingBtn) addRbiFilingBtn.onclick = handleAddRbiFiling;
   document.querySelectorAll(".mark-rbi-submitted-btn").forEach(btn=>{
@@ -8173,6 +8367,18 @@ async function updatePricingHint(){
   const policy = (await db.get("policyConfig","default")) || defaultPolicyConfig();
   const band = policy.pricing.find(p=>p.riskCategory===riskEl.value);
   el.textContent = band ? `Indicative pricing per Credit Policy for ${riskEl.value} risk: ${band.minRate}% – ${band.maxRate}% p.a.` : "";
+}
+
+async function handleGenerateKFS(sanctionId){
+  const sanction = await db.get("sanctions", sanctionId);
+  if(!sanction) return;
+  const cust = await db.get("customers", sanction.customerId);
+  if(!cust){ toast("Customer record not found."); return; }
+  const products = await db.getAll("products");
+  const product = products.find(p=>p.name===sanction.product);
+  const html = await generateKfsHtml(sanction, cust, product);
+  printDocument(html);
+  await logAudit(session.user.name, session.user.role, "Key Fact Statement Generated", `${cust.personal.name} — ${sanction.product} — ${fmtINR(sanction.sanctionedAmount)}`);
 }
 
 async function handleGenerateLoanStatement(loanId){
@@ -9788,6 +9994,65 @@ async function handleUpdateRcmResult(id, result){
   item.lastResult = result; item.lastTestedAt = nowISO(); item.lastTestedBy = u.name;
   await db.put("rcmItems", item);
   await logAudit(u.name, u.role, "RCM Test Result Updated", `${item.risk} — ${result}`);
+  render();
+}
+
+async function handleSaveInspection(){
+  const u = session.user;
+  const startDate = document.getElementById("insp-start-date").value;
+  if(!startDate){ toast("Enter a start date."); return; }
+  await db.put("rbiInspections", {
+    id: uid("insp"), type: document.getElementById("insp-type").value, period: document.getElementById("insp-period").value.trim(),
+    startDate, endDate: document.getElementById("insp-end-date").value, atrDue: document.getElementById("insp-atr-due").value,
+    status: document.getElementById("insp-status").value, observations: document.getElementById("insp-observations").value.trim(),
+    createdAt: nowISO(), createdBy: u.name
+  });
+  await logAudit(u.name, u.role, "RBI Inspection Logged", document.getElementById("insp-period").value);
+  toast("Saved.");
+  session.showInspectionForm = false;
+  render();
+}
+async function handleDeleteInspection(id){
+  const u = session.user;
+  if(!window.confirm("Delete this inspection record?")) return;
+  await db.delete("rbiInspections", id);
+  await logAudit(u.name, u.role, "RBI Inspection Removed", id);
+  toast("Removed.");
+  render();
+}
+async function handleUpdateInspectionStatus(id, status){
+  const u = session.user;
+  const item = await db.get("rbiInspections", id);
+  if(!item) return;
+  item.status = status;
+  await db.put("rbiInspections", item);
+  await logAudit(u.name, u.role, "RBI Inspection Status Updated", `${item.period} — ${status}`);
+  render();
+}
+
+async function handleSaveStrCtr(){
+  const u = session.user;
+  const reference = document.getElementById("strctr-reference").value.trim();
+  const amount = Number(document.getElementById("strctr-amount").value);
+  if(!reference || !amount){ toast("Enter a customer/account reference and amount."); return; }
+  await db.put("strCtrRegister", {
+    id: uid("stc"), type: document.getElementById("strctr-type").value, reference,
+    transactionDate: document.getElementById("strctr-txn-date").value, amount,
+    reported: document.getElementById("strctr-reported").value, filedDate: document.getElementById("strctr-filed-date").value,
+    reason: document.getElementById("strctr-reason").value.trim(),
+    createdAt: nowISO(), createdBy: u.name
+  });
+  await logAudit(u.name, u.role, "STR/CTR Entry Logged", `${reference} — ${fmtINR(amount)}`);
+  toast("Saved.");
+  session.showStrCtrForm = false;
+  render();
+}
+async function handleDeleteStrCtr(id){
+  const u = session.user;
+  if(!window.confirm("Delete this STR/CTR entry?")) return;
+  await db.delete("strCtrRegister", id);
+  await logAudit(u.name, u.role, "STR/CTR Entry Removed", id);
+  toast("Removed.");
   render();
 }
 
