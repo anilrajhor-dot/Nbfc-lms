@@ -474,9 +474,19 @@ function maskPAN(p){ if(!p) return "—"; return p.length>=4 ? p.slice(0,2)+"XXX
 
 
 async function logAudit(actor, actorRole, action, details){
-  await db.put("auditLog", {
-    id: uid("aud"), ts: nowISO(), actor, actorRole, action, details: details||""
-  });
+  // Audit logging is a secondary, best-effort concern — it must never
+  // be able to break the primary action that called it. Concretely:
+  // borrowers aren't staff, so a borrower-triggered audit write (e.g.
+  // during self-registration) is correctly rejected by the security
+  // rules — but that rejection shouldn't cascade into failing the
+  // registration itself, which is what was happening before this guard.
+  try{
+    await db.put("auditLog", {
+      id: uid("aud"), ts: nowISO(), actor, actorRole, action, details: details||""
+    });
+  } catch(err){
+    console.error("Audit log write failed (non-fatal):", err);
+  }
 }
 
 async function computeFundPosition(){
