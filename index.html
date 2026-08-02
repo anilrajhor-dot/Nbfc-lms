@@ -167,7 +167,9 @@
   .badge-risk-Medium{background:#FBF1DC; color:var(--warn);}
   .badge-risk-High{background:#FBE7E8; color:var(--danger);}
 
-  .tabs{display:flex; gap:6px; margin-bottom:18px; border-bottom:1px solid var(--line); flex-wrap:wrap;}
+  .tabs{display:flex; gap:6px; margin-bottom:18px; border-bottom:1px solid var(--line); flex-wrap:wrap; align-items:center;}
+  .tab-group-label{font-size:10.5px; font-weight:700; text-transform:uppercase; letter-spacing:.5px; color:var(--gold); padding:0 4px 0 10px; white-space:nowrap;}
+  .tab-group-label:first-child{padding-left:2px;}
   .tab{padding:9px 16px; font-size:13.5px; font-weight:600; color:var(--slate); border-bottom:2px solid transparent; background:none; border-top:none;border-left:none;border-right:none;}
   .tab.active{color:var(--navy-900); border-bottom-color:var(--gold);}
 
@@ -349,6 +351,25 @@ const db = {
     const result = snap.docs.map(d => ({ ...d.data(), id: d.id }));
     renderCache[collectionName] = result;
     staleCache[collectionName] = { data: result, at: Date.now() };
+    return result;
+  },
+  /** For borrower-side reads where the security rule only allows
+   *  seeing your OWN documents (e.g. leads filtered by borrowerId).
+   *  This matters beyond just efficiency: Firestore validates a plain
+   *  collection.get() against the worst case of what the rule allows,
+   *  not per returned document — an unconstrained query against a rule
+   *  like "resource.data.borrowerId == request.auth.uid" gets rejected
+   *  outright with "Missing or insufficient permissions", even though
+   *  every document that WOULD be returned satisfies the rule. Adding
+   *  a matching .where() clause is what lets Firestore verify the
+   *  query itself can't return anything outside what the rule allows. */
+  async getWhere(collectionName, field, value){
+    await initFirebase();
+    const cacheKey = `${collectionName}:${field}:${value}`;
+    if(renderCache[cacheKey]) return renderCache[cacheKey];
+    const snap = await firestoreDb.collection(collectionName).where(field, "==", value).get();
+    const result = snap.docs.map(d => ({ ...d.data(), id: d.id }));
+    renderCache[cacheKey] = result;
     return result;
   },
   async get(collectionName, id){
@@ -1886,28 +1907,41 @@ function printDocument(htmlContent){
 }
 
 async function getSessionTimeoutMinutes(){
-  const cfg = await db.get("apiConfig","security");
-  return (cfg && cfg.sessionTimeoutMinutes) || DEFAULT_SESSION_TIMEOUT_MINUTES;
+  // apiConfig is staff-only by design (it also holds AI provider keys) —
+  // a borrower session can never read it, so this must fail quietly to
+  // the default rather than throwing on every 15-second check.
+  try{
+    const cfg = await db.get("apiConfig","security");
+    return (cfg && cfg.sessionTimeoutMinutes) || DEFAULT_SESSION_TIMEOUT_MINUTES;
+  } catch(err){
+    return DEFAULT_SESSION_TIMEOUT_MINUTES;
+  }
 }
 
 async function checkSessionTimeout(){
   if(session.type!=="staff" && session.type!=="borrower") return;
   if(session.showChangePasswordModal) return; // don't time out mid-password-change
-  const timeoutMs = (await getSessionTimeoutMinutes()) * 60 * 1000;
-  const idleMs = Date.now() - lastActivityTime;
-  const remainingMs = timeoutMs - idleMs;
+  try{
+    const timeoutMs = (await getSessionTimeoutMinutes()) * 60 * 1000;
+    const idleMs = Date.now() - lastActivityTime;
+    const remainingMs = timeoutMs - idleMs;
 
-  if(remainingMs <= 0){
-    const wasType = session.type;
-    session = {type:null, user:null};
-    try{ await firebase.auth().signOut(); await firebase.auth().signInAnonymously(); } catch(e){ console.error(e); }
-    toast("Signed out due to inactivity.");
-    setRoute("landing");
-    return;
-  }
-  if(remainingMs <= TIMEOUT_WARNING_SECONDS*1000 && !session.timeoutWarningShown){
-    session.timeoutWarningShown = true;
-    render();
+    if(remainingMs <= 0){
+      const wasType = session.type;
+      session = {type:null, user:null};
+      try{ await firebase.auth().signOut(); await firebase.auth().signInAnonymously(); } catch(e){ console.error(e); }
+      toast("Signed out due to inactivity.");
+      setRoute("landing");
+      return;
+    }
+    if(remainingMs <= TIMEOUT_WARNING_SECONDS*1000 && !session.timeoutWarningShown){
+      session.timeoutWarningShown = true;
+      render();
+    }
+  } catch(err){
+    // This runs unattended every 15 seconds — it must never surface an
+    // uncaught error, since there's no user action to attach it to.
+    console.error("Session timeout check failed (non-fatal):", err);
   }
 }
 
@@ -2360,8 +2394,7 @@ async function renderStaffShell(){
     </div>
     <main>
       <div class="tabs">
-        ${canSeeDashboard ? `<button class="tab ${tab==='dashboard'?'active':''}" data-tab="dashboard">Dashboard</button>`:""}
-        <button class="tab ${tab==='myqueue'?'active':''}" data-tab="myqueue">My Queue</button>
+        <span class="tab-group-label">Lending Journey</span>
         <button class="tab ${tab==='leads'?'active':''}" data-tab="leads">Leads &amp; Applications</button>
         <button class="tab ${tab==='customers'?'active':''}" data-tab="customers">Customers</button>
         <button class="tab ${tab==='appraisal'?'active':''}" data-tab="appraisal">Credit Appraisal</button>
@@ -2369,28 +2402,46 @@ async function renderStaffShell(){
         <button class="tab ${tab==='loanaccounts'?'active':''}" data-tab="loanaccounts">Loan Accounts</button>
         <button class="tab ${tab==='overdue'?'active':''}" data-tab="overdue">Overdue &amp; NPA / Recovery</button>
         <button class="tab ${tab==='ews'?'active':''}" data-tab="ews">Early Warning Signals</button>
+
+        <span class="tab-group-label">Daily Tools</span>
+        ${canSeeDashboard ? `<button class="tab ${tab==='dashboard'?'active':''}" data-tab="dashboard">Dashboard</button>`:""}
+        <button class="tab ${tab==='myqueue'?'active':''}" data-tab="myqueue">My Queue</button>
         <button class="tab ${tab==='reminders'?'active':''}" data-tab="reminders">Reminders</button>
-        ${canManageFunds ? `<button class="tab ${tab==='funds'?'active':''}" data-tab="funds">Fund Management</button>`:""}
-        ${canManageFunds ? `<button class="tab ${tab==='accounting'?'active':''}" data-tab="accounting">Accounting</button>`:""}
-        ${canManageFunds ? `<button class="tab ${tab==='financialstatements'?'active':''}" data-tab="financialstatements">Financial Statements</button>`:""}
-        ${canManageFunds ? `<button class="tab ${tab==='projections'?'active':''}" data-tab="projections">Projections</button>`:""}
-        ${canManageFunds ? `<button class="tab ${tab==='treasury'?'active':''}" data-tab="treasury">Treasury</button>`:""}
-        ${canManageFunds ? `<button class="tab ${tab==='generalledger'?'active':''}" data-tab="generalledger">General Ledger</button>`:""}
-        ${canManageFunds ? `<button class="tab ${tab==='bankrecon'?'active':''}" data-tab="bankrecon">Bank Reconciliation</button>`:""}
-        ${canManageFunds ? `<button class="tab ${tab==='payrolldsa'?'active':''}" data-tab="payrolldsa">Payroll &amp; DSA</button>`:""}
-        <button class="tab ${tab==='shgrural'?'active':''}" data-tab="shgrural">SHG / Rural Finance</button>
+        <button class="tab ${tab==='ai'?'active':''}" data-tab="ai">AI Insights</button>
         <button class="tab ${tab==='emicalc'?'active':''}" data-tab="emicalc">EMI Calculator</button>
+        <button class="tab ${tab==='help'?'active':''}" data-tab="help">Help</button>
+
+        ${canManageFunds ? `
+        <span class="tab-group-label">Finance</span>
+        <button class="tab ${tab==='funds'?'active':''}" data-tab="funds">Fund Management</button>
+        <button class="tab ${tab==='accounting'?'active':''}" data-tab="accounting">Accounting</button>
+        <button class="tab ${tab==='generalledger'?'active':''}" data-tab="generalledger">General Ledger</button>
+        <button class="tab ${tab==='treasury'?'active':''}" data-tab="treasury">Treasury</button>
+        <button class="tab ${tab==='financialstatements'?'active':''}" data-tab="financialstatements">Financial Statements</button>
+        <button class="tab ${tab==='projections'?'active':''}" data-tab="projections">Projections</button>
+        <button class="tab ${tab==='bankrecon'?'active':''}" data-tab="bankrecon">Bank Reconciliation</button>
+        <button class="tab ${tab==='payrolldsa'?'active':''}" data-tab="payrolldsa">Payroll &amp; DSA</button>
+        ` : ""}
+
+        ${(canManagePolicy || canSeeReports) ? `
+        <span class="tab-group-label">Compliance &amp; Reports</span>
+        ${canManagePolicy ? `<button class="tab ${tab==='products'?'active':''}" data-tab="products">Loan Products</button>`:""}
+        ${canManagePolicy ? `<button class="tab ${tab==='policy'?'active':''}" data-tab="policy">Credit Policy</button>`:""}
         ${canSeeReports ? `<button class="tab ${tab==='ratios'?'active':''}" data-tab="ratios">Ratios &amp; Compliance</button>`:""}
         ${canSeeReports ? `<button class="tab ${tab==='reports'?'active':''}" data-tab="reports">Reports &amp; MIS</button>`:""}
-        <button class="tab ${tab==='ai'?'active':''}" data-tab="ai">AI Insights</button>
+        ` : ""}
+
+        <span class="tab-group-label">Rural Finance</span>
+        <button class="tab ${tab==='shgrural'?'active':''}" data-tab="shgrural">SHG / Rural Finance</button>
+
+        ${(u.role==="Super Admin"||u.role==="Auditor") ? `
+        <span class="tab-group-label">Administration</span>
+        ${u.role==="Super Admin" ? `<button class="tab ${tab==='users'?'active':''}" data-tab="users">User Management</button>`:""}
         ${u.role==="Super Admin" ? `<button class="tab ${tab==='apiconfig'?'active':''}" data-tab="apiconfig">Integrations</button>`:""}
         ${u.role==="Super Admin" ? `<button class="tab ${tab==='nbfcprofile'?'active':''}" data-tab="nbfcprofile">NBFC Profile</button>`:""}
         ${u.role==="Super Admin" ? `<button class="tab ${tab==='datamgmt'?'active':''}" data-tab="datamgmt">Data Management</button>`:""}
-        <button class="tab ${tab==='help'?'active':''}" data-tab="help">Help</button>
-        ${canManagePolicy ? `<button class="tab ${tab==='products'?'active':''}" data-tab="products">Loan Products</button>`:""}
-        ${canManagePolicy ? `<button class="tab ${tab==='policy'?'active':''}" data-tab="policy">Credit Policy</button>`:""}
-        ${u.role==="Super Admin" ? `<button class="tab ${tab==='users'?'active':''}" data-tab="users">User Management</button>`:""}
-        ${(u.role==="Super Admin"||u.role==="Auditor") ? `<button class="tab ${tab==='audit'?'active':''}" data-tab="audit">Audit Trail</button>`:""}
+        <button class="tab ${tab==='audit'?'active':''}" data-tab="audit">Audit Trail</button>
+        ` : ""}
       </div>
       ${tabContent}
     </main>
@@ -7559,9 +7610,8 @@ async function renderAuditTrail(){
    --------------------------------------------------------------------- */
 async function renderBorrowerShell(){
   const u = session.user;
-  const allLeads = await db.getAll("leads");
+  const myLeads = (await db.getWhere("leads", "borrowerId", u.id)).sort((a,b)=>new Date(b.createdAt)-new Date(a.createdAt));
   const products = await db.getAll("products");
-  const myLeads = allLeads.filter(l=>l.borrowerId===u.id).sort((a,b)=>new Date(b.createdAt)-new Date(a.createdAt));
   const tab = session.borrowerTab || "apply";
 
   let body;
