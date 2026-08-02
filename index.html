@@ -1731,6 +1731,65 @@ async function computeAllLedgerBalances(){
   return accounts.filter(a=>a.active).map(a=>({ account: a, ...computeLedgerBalance(a, posted) }));
 }
 
+/** Auto-posts a system-generated voucher to the General Ledger from an
+ *  already-approved operational action (disbursement, collection, an
+ *  existing Journal & Expenses entry). Deliberately posts immediately
+ *  (no separate Maker-Checker here) since the action it mirrors was
+ *  already authorized through its own approval path — this is just
+ *  recording it in double-entry form, not a new financial decision.
+ *
+ *  Resilience is built in here, not left to each caller to remember:
+ *  if anything about this fails (a system account renamed/deleted, a
+ *  lookup miss, whatever), it logs to console and returns quietly —
+ *  it must never be able to break the operational action that
+ *  triggered it. That operational action already fully happened
+ *  (money moved, a loan account exists) whether or not its GL mirror
+ *  succeeds; treating a GL posting failure as a reason to undo a real
+ *  disbursement or collection would be the wrong trade-off.
+ */
+async function postToGeneralLedger({date, voucherType, narration, lineDefs, actor, actorRole}){
+  try{
+    const accounts = await db.getAll("chartOfAccounts");
+    const findAccount = (name)=> accounts.find(a=>a.active && a.name===name);
+    const lines = [];
+    for(const def of lineDefs){
+      if(!def.amount || def.amount<=0) continue;
+      const account = findAccount(def.accountName);
+      if(!account){ console.error(`GL auto-post: account "${def.accountName}" not found — skipping this posting.`); return; }
+      lines.push({
+        ledgerAccountId: account.id, ledgerAccountName: account.name,
+        debit: def.side==="debit" ? def.amount : 0, credit: def.side==="credit" ? def.amount : 0,
+        lineNarration: def.note || ""
+      });
+    }
+    if(lines.length<2) return;
+    const totalDebit = lines.reduce((s,l)=>s+l.debit,0);
+    const totalCredit = lines.reduce((s,l)=>s+l.credit,0);
+    if(Math.round(totalDebit*100) !== Math.round(totalCredit*100)){
+      console.error("GL auto-post: lines didn't balance, skipping.", lineDefs);
+      return;
+    }
+    const voucherNumber = await getNextVoucherNumber(voucherType);
+    await db.put("journalVouchers", {
+      id: uid("jv"), voucherNumber, voucherType, date, narration, lines,
+      totalDebit: Math.round(totalDebit*100)/100, totalCredit: Math.round(totalCredit*100)/100,
+      status: "Posted", proposedBy: actor, proposedByRole: actorRole,
+      approvedBy: actor, approvedAt: nowISO(), autoPosted: true,
+      createdAt: nowISO(), createdBy: actor
+    });
+  } catch(err){
+    console.error("GL auto-post failed (non-fatal):", err);
+  }
+}
+
+/** Cash/Bank/UPI payment modes used throughout the app map onto just
+ *  two GL accounts — Cash in Hand for cash, Bank Account for both
+ *  Bank and UPI movements (UPI is treated as a bank-account movement,
+ *  a reasonable simplification since it settles to a bank account). */
+function glAccountForMode(mode){
+  return mode==="Cash" ? "Cash in Hand" : "Bank Account — Operating";
+}
+
 function defaultPolicyConfig(){
   return {
     id: "default",
@@ -8427,6 +8486,15 @@ async function handleConfirmDisbursement(sanctionId){
   await logAudit(u.name, u.role, "Loan Account Created", `${loanAccount.id} for sanction ${sanction.id}`);
   await accrueDsaCommission(sanction.leadId, sanction, amount, u.name);
 
+  await postToGeneralLedger({
+    date, voucherType: "Payment Voucher", narration: `Disbursement — ${sanction.product} — ${loanAccount.accountNumber}`,
+    lineDefs: [
+      { accountName: "Loan Portfolio — Principal Outstanding", side: "debit", amount },
+      { accountName: glAccountForMode(mode), side: "credit", amount },
+    ],
+    actor: u.name, actorRole: u.role
+  });
+
   toast("Disbursed. Loan account created.");
   session.sanctionSubview = "list";
   render();
@@ -8664,6 +8732,19 @@ async function handleConfirmCollection(loanId){
   const cust = await db.get("customers", acc.customerId);
   await logAudit(u.name, u.role, "EMI Collected", `${cust?cust.personal.name:acc.customerId} — Installment #${instIndex} — ${fmtINR(amount)} via ${mode}`);
   if(allPaid) await logAudit(u.name, u.role, "Loan Closed", `${acc.id} fully repaid`);
+
+  // Split this specific payment into principal/interest proportional to
+  // the installment's own split — matters for partial payments, where
+  // the amount collected isn't necessarily the full EMI.
+  const principalPortion = inst.emiAmount>0 ? Math.round(amount * (inst.principalComponent/inst.emiAmount)) : amount;
+  const interestPortion = amount - principalPortion;
+  const glLines = [{ accountName: glAccountForMode(mode), side:"debit", amount }];
+  if(principalPortion>0) glLines.push({ accountName:"Loan Portfolio — Principal Outstanding", side:"credit", amount:principalPortion });
+  if(interestPortion>0) glLines.push({ accountName:"Interest Income", side:"credit", amount:interestPortion });
+  await postToGeneralLedger({
+    date, voucherType: "Receipt Voucher", narration: `EMI Collection — ${cust?cust.personal.name:acc.customerId} — ${acc.accountNumber} #${instIndex}`,
+    lineDefs: glLines, actor: u.name, actorRole: u.role
+  });
 
   session.viewingReceipt = {
     id: payment.id, customerName: cust?cust.personal.name:"—", amount, product: acc.product,
@@ -9185,6 +9266,14 @@ async function handlePayDsaCommissions(dsaId){
     });
     fundAccount.balance -= total;
     await db.put("fundAccounts", fundAccount);
+    await postToGeneralLedger({
+      date: todayStr(), voucherType: "Payment Voucher", narration: `DSA Commission — ${dsa.name} — ${commissions.length} commission(s)`,
+      lineDefs: [
+        { accountName: "DSA Commission", side: "debit", amount: total },
+        { accountName: "Bank Account — Operating", side: "credit", amount: total },
+      ],
+      actor: u.name, actorRole: u.role
+    });
   }
   await logAudit(u.name, u.role, "DSA Commissions Paid", `${dsa.name} — ${fmtINR(total)} — ${payoutResult.status}`);
   toast(payoutResult.ok ? `Paid via bank transfer: ${fmtINR(total)}` : `Recorded as expense — ${payoutResult.status}. Complete the bank transfer manually.`);
@@ -9337,6 +9426,20 @@ async function handleExportTally(){
 /* ---------------------------------------------------------------------
    Handlers: Journal & Expenses
    --------------------------------------------------------------------- */
+/** Maps this app's free-text expense/income categories onto the
+ *  Chart of Accounts — anything not explicitly listed falls onto the
+ *  catch-all "Other Operating Expenses" / "Other Income" account
+ *  rather than failing to post. */
+function glAccountForCategory(category, type){
+  const expenseMap = {
+    "Rent": "Rent", "Salaries": "Salaries & Staff Costs", "Interest on Borrowings": "Interest on Borrowings (Finance Cost)",
+    "DSA Commission": "DSA Commission"
+  };
+  const incomeMap = { "Interest Income": "Interest Income", "Processing Fee Income": "Processing Fee Income" };
+  if(type==="Expense") return expenseMap[category] || "Other Operating Expenses";
+  return incomeMap[category] || "Other Income";
+}
+
 async function handleSaveJournalEntry(){
   const u = session.user;
   const type = document.getElementById("jf-type").value;
@@ -9368,6 +9471,15 @@ async function handleSaveJournalEntry(){
     fundAccount.balance += (type==="Income" ? amount : -amount);
     await db.put("fundAccounts", fundAccount);
     await logAudit(u.name, u.role, "Journal Entry Posted", `${type}: ${category} — ${fmtINR(amount)}${description?" — "+description:""}`);
+    const glAccountName = glAccountForCategory(category, type);
+    await postToGeneralLedger({
+      date, voucherType: type==="Expense" ? "Payment Voucher" : "Receipt Voucher",
+      narration: `${category}${description?" — "+description:""}`,
+      lineDefs: type==="Expense"
+        ? [{accountName: glAccountName, side:"debit", amount}, {accountName: glAccountForMode(mode), side:"credit", amount}]
+        : [{accountName: glAccountForMode(mode), side:"debit", amount}, {accountName: glAccountName, side:"credit", amount}],
+      actor: u.name, actorRole: u.role
+    });
     toast("Entry recorded.");
   } else {
     await logAudit(u.name, u.role, "Journal Entry Proposed (Pending Approval)", `${type}: ${category} — ${fmtINR(amount)} exceeds your self-authorized limit of ${fmtINR(ownLimit)} — needs a different officer's approval`);
@@ -9395,6 +9507,15 @@ async function handleApproveJournalEntry(entryId){
   fundAccount.balance += (entry.type==="Income" ? entry.amount : -entry.amount);
   await db.put("fundAccounts", fundAccount);
   await logAudit(u.name, u.role, "Journal Entry Approved", `${entry.type}: ${entry.category} — ${fmtINR(entry.amount)} (Maker: ${entry.proposedBy})`);
+  const glAccountName = glAccountForCategory(entry.category, entry.type);
+  await postToGeneralLedger({
+    date: entry.date, voucherType: entry.type==="Expense" ? "Payment Voucher" : "Receipt Voucher",
+    narration: `${entry.category}${entry.description?" — "+entry.description:""}`,
+    lineDefs: entry.type==="Expense"
+      ? [{accountName: glAccountName, side:"debit", amount:entry.amount}, {accountName: glAccountForMode(entry.mode), side:"credit", amount:entry.amount}]
+      : [{accountName: glAccountForMode(entry.mode), side:"debit", amount:entry.amount}, {accountName: glAccountName, side:"credit", amount:entry.amount}],
+    actor: u.name, actorRole: u.role
+  });
   toast("Entry approved and posted.");
   render();
 }
