@@ -385,7 +385,10 @@ async function getOrCreateEncryptionKey(){
     const rawKey = await crypto.subtle.generateKey({name:"AES-GCM", length:256}, true, ["encrypt","decrypt"]);
     const exported = await crypto.subtle.exportKey("raw", rawKey);
     const keyB64 = btoa(String.fromCharCode(...new Uint8Array(exported)));
-    cfg = { id:"security", encryptionKeyB64: keyB64, createdAt: nowISO() };
+    // Merge into whatever's already there (e.g. sessionTimeoutMinutes)
+    // rather than replacing the whole document — this config doc is
+    // shared by more than one setting.
+    cfg = { ...(cfg||{}), id:"security", encryptionKeyB64: keyB64, createdAt: nowISO() };
     await db.put("apiConfig", cfg);
   }
   const keyBytes = Uint8Array.from(atob(cfg.encryptionKeyB64), c=>c.charCodeAt(0));
@@ -820,7 +823,7 @@ const ALL_COLLECTIONS = [
   "recoveryVisits","apiConfig","aiConfig","nbfcProfile","categoryConfig","journalEntries","complianceItems","rbiReturnFilings",
   "staffSalaries","payrollRuns","dsaAgents","dsaCommissions",
   "shgGroups","shgMembers","shgSavings","shgInternalLoans","microEnterpriseTemplates",
-  "bankStatementLines","bankBorrowings","fixedAssets","projectionAssumptions",
+  "bankStatementLines","bankBorrowings","fixedAssets","projectionAssumptions","documentRegister",
   "auditLog","meta"
 ];
 
@@ -1204,6 +1207,16 @@ async function computeNotifications(){
   if(overdueReturns.length>0) items.push({label:`${overdueReturns.length} RBI return(s) overdue: ${overdueReturns.map(f=>f.code).join(", ")}`, tab:"ratios"});
   const journalPending = journalEntries.filter(j=>j.status==="Pending Approval").length;
   if(journalPending>0) items.push({label:`${journalPending} journal/expense entr${journalPending===1?'y':'ies'} awaiting approval`, tab:"accounting"});
+
+  const in60Days = new Date(Date.now()+60*24*60*60*1000).toISOString().slice(0,10);
+  const today = todayStr();
+  const documents = await db.getAll("documentRegister");
+  const docExpiring = documents.filter(d=>d.expiryDate && d.expiryDate<=in60Days).length;
+  if(docExpiring>0) items.push({label:`${docExpiring} tracked document(s) expired or expiring within 60 days`, tab:"ratios"});
+  const insuranceExpiring = loanAccounts.filter(a=>a.status==="Active" && a.insurance?.expiryDate && a.insurance.expiryDate<=in60Days).length;
+  if(insuranceExpiring>0) items.push({label:`${insuranceExpiring} loan account(s) with insurance expiring within 60 days`, tab:"ews"});
+  const collateralDue = loanAccounts.filter(a=>a.status==="Active" && a.collateral?.nextValuationDue && a.collateral.nextValuationDue<=in60Days).length;
+  if(collateralDue>0) items.push({label:`${collateralDue} collateral revaluation(s) due within 60 days`, tab:"ews"});
 
   return items;
 }
@@ -1612,6 +1625,58 @@ let session = { type:null, user:null };
 let route = "landing";
 let customerDraft = { photoBase64:null, docImageBase64:null, signatureBase64:null, gpsLat:null, gpsLng:null };
 
+/* ---------------------------------------------------------------------
+   Session timeout — auto-logout after inactivity, a genuine security
+   improvement for a device that might get left unattended while
+   logged in. Shows a warning with time to react before actually
+   signing out, since an abrupt logout on a slow mobile connection
+   would just be frustrating rather than secure.
+   --------------------------------------------------------------------- */
+let lastActivityTime = Date.now();
+const DEFAULT_SESSION_TIMEOUT_MINUTES = 15;
+const TIMEOUT_WARNING_SECONDS = 60;
+
+function recordActivity(){ lastActivityTime = Date.now(); }
+
+async function getSessionTimeoutMinutes(){
+  const cfg = await db.get("apiConfig","security");
+  return (cfg && cfg.sessionTimeoutMinutes) || DEFAULT_SESSION_TIMEOUT_MINUTES;
+}
+
+async function checkSessionTimeout(){
+  if(session.type!=="staff" && session.type!=="borrower") return;
+  if(session.showChangePasswordModal) return; // don't time out mid-password-change
+  const timeoutMs = (await getSessionTimeoutMinutes()) * 60 * 1000;
+  const idleMs = Date.now() - lastActivityTime;
+  const remainingMs = timeoutMs - idleMs;
+
+  if(remainingMs <= 0){
+    const wasType = session.type;
+    session = {type:null, user:null};
+    try{ await firebase.auth().signOut(); await firebase.auth().signInAnonymously(); } catch(e){ console.error(e); }
+    toast("Signed out due to inactivity.");
+    setRoute("landing");
+    return;
+  }
+  if(remainingMs <= TIMEOUT_WARNING_SECONDS*1000 && !session.timeoutWarningShown){
+    session.timeoutWarningShown = true;
+    render();
+  }
+}
+
+function renderSessionTimeoutWarningModal(){
+  if(!session.timeoutWarningShown) return "";
+  return `
+    <div style="position:fixed; inset:0; background:rgba(14,26,48,.55); z-index:300; display:flex; align-items:center; justify-content:center; padding:20px;">
+      <div class="card" style="max-width:380px; width:100%; margin:0; text-align:center;">
+        <h2 style="font-size:17px;">Still there?</h2>
+        <p class="sub">You'll be signed out in about a minute due to inactivity, to keep this device secure if it's left unattended.</p>
+        <button class="btn btn-gold btn-block" id="btn-stay-signed-in">Stay Signed In</button>
+      </div>
+    </div>
+  `;
+}
+
 function resetCustomerDraft(){ customerDraft = { photoBase64:null, docImageBase64:null, signatureBase64:null, gpsLat:null, gpsLng:null }; }
 
 function setRoute(r){ route = r; render(); }
@@ -1768,7 +1833,7 @@ function renderLanding(firstRun){
     </main>
     <div class="footer-note">NBFC LMS — Developed by Anil Sharma, Former General Manager, Central Bank of India</div>
   </div>
-  ${renderChangePasswordModal()}`;
+  ${renderChangePasswordModal()}${renderSessionTimeoutWarningModal()}`;
 }
 
 function renderStaffLogin(firstRun){
@@ -4599,8 +4664,59 @@ async function renderRatiosComplianceTab(){
     </div>
 
     ${await renderRbiReturnsSection()}
+
+    ${await renderDocumentRegisterSection()}
   `;
 }
+
+const DOCUMENT_CATEGORIES = ["NBFC Registration / License","Insurance (Office/Staff)","Statutory Auditor Appointment","DSA / Vendor Agreement","Lease / Rental Agreement","Staff Certification","Other"];
+
+async function renderDocumentRegisterSection(){
+  const docs = await db.getAll("documentRegister");
+  const today = todayStr();
+  const in60Days = new Date(Date.now()+60*24*60*60*1000).toISOString().slice(0,10);
+  const withStatus = docs.map(d=>{
+    let status = "Current";
+    if(d.expiryDate){
+      if(d.expiryDate < today) status = "Expired";
+      else if(d.expiryDate <= in60Days) status = "Expiring Soon";
+    }
+    return {...d, computedStatus: status};
+  }).sort((a,b)=> (a.expiryDate||"9999").localeCompare(b.expiryDate||"9999"));
+  const expiredCount = withStatus.filter(d=>d.computedStatus==="Expired").length;
+  const expiringCount = withStatus.filter(d=>d.computedStatus==="Expiring Soon").length;
+
+  return `
+    <div class="card">
+      <div class="flex-between">
+        <div><h2 style="font-size:16px;">Document Expiry Register</h2><p class="sub" style="margin-bottom:0;">Track any document with a renewal date — NBFC registrations/licenses, office/staff insurance, statutory auditor appointment, DSA or vendor agreements, lease agreements, staff certifications. Flags 60 days ahead of expiry, and shows up in Notifications once it does.</p></div>
+        ${(expiredCount+expiringCount)>0 ? `<span class="badge badge-rejected">${expiredCount} Expired, ${expiringCount} Expiring</span>` : `<span class="badge badge-approved">All Current</span>`}
+      </div>
+      <div class="grid grid-4">
+        <div class="field"><label>Document name</label><input id="dr-name" placeholder="e.g. Fire Insurance — Head Office"></div>
+        <div class="field"><label>Category</label><select id="dr-category">${DOCUMENT_CATEGORIES.map(c=>`<option>${c}</option>`).join("")}</select></div>
+        <div class="field"><label>Document / policy number</label><input id="dr-number"></div>
+        <div class="field"><label>Expiry date</label><input id="dr-expiry" type="date"></div>
+      </div>
+      <div class="field"><label>Notes (optional)</label><input id="dr-notes" placeholder="e.g. Renewed via ICICI Lombard, contact: Ramesh"></div>
+      <button class="btn btn-gold btn-block" id="btn-add-document" style="margin-top:8px;">+ Track This Document</button>
+      <table style="margin-top:10px;">
+        <thead><tr><th>Document</th><th>Category</th><th>Number</th><th>Expiry</th><th>Status</th><th></th></tr></thead>
+        <tbody>
+        ${withStatus.length===0 ? `<tr class="empty-row"><td colspan="6">No documents tracked yet.</td></tr>` :
+          withStatus.map(d=>`
+          <tr>
+            <td>${esc(d.name)}</td><td>${esc(d.category)}</td><td class="mono">${esc(d.documentNumber)||"—"}</td>
+            <td>${d.expiryDate||"—"}</td>
+            <td>${d.computedStatus==="Expired"?`<span class="badge badge-rejected">Expired</span>`:d.computedStatus==="Expiring Soon"?`<span class="badge badge-progress">Expiring Soon</span>`:`<span class="badge badge-approved">Current</span>`}</td>
+            <td><button class="btn btn-danger btn-sm delete-document-btn" data-doc="${d.id}">Delete</button></td>
+          </tr>`).join("")}
+        </tbody>
+      </table>
+    </div>
+  `;
+}
+
 
 async function renderRbiReturnsSection(){
   const filings = await db.getAll("rbiReturnFilings");
@@ -5709,7 +5825,17 @@ async function renderUserManagement(){
   const borrowers = await db.getAll("borrowers");
   const isSuperAdmin = session.user.role==="Super Admin";
   const superAdminCount = staff.filter(s=>s.role==="Super Admin").length;
+  const sessionTimeoutMinutes = await getSessionTimeoutMinutes();
   return `
+    ${isSuperAdmin ? `
+    <div class="card">
+      <h2>Security Settings</h2>
+      <div class="grid grid-3">
+        <div class="field"><label>Auto sign-out after inactivity (minutes)</label><input id="sec-session-timeout" type="number" min="2" value="${sessionTimeoutMinutes}"></div>
+      </div>
+      <button class="btn btn-gold btn-sm" id="btn-save-security-settings">Save</button>
+      <p class="small muted" style="margin-top:8px;">Applies to both staff and borrower sessions. A 60-second warning appears before actually signing out, so a moment of inactivity mid-task doesn't lose work.</p>
+    </div>` : ""}
     <div class="card">
       <h2>Add Staff User</h2>
       <p class="sub">Creates a role-based login. Every creation is written to the audit trail.</p>
@@ -5822,7 +5948,7 @@ async function renderBorrowerShell(){
     </main>
     <div class="footer-note">NBFC LMS — Borrower Portal · Developed by Anil Sharma, Former General Manager, Central Bank of India</div>
   </div>
-  ${renderChangePasswordModal()}`;
+  ${renderChangePasswordModal()}${renderSessionTimeoutWarningModal()}`;
 }
 
 function renderBorrowerHelp(){
@@ -6035,6 +6161,8 @@ function bindEvents(){
   const showForgotPasswordBtn = document.getElementById("btn-show-forgot-password");
   if(showForgotPasswordBtn) showForgotPasswordBtn.onclick = ()=>{ session.showForgotPasswordNote = true; render(); };
 
+  const staySignedInBtn = document.getElementById("btn-stay-signed-in");
+  if(staySignedInBtn) staySignedInBtn.onclick = ()=>{ recordActivity(); session.timeoutWarningShown = false; render(); };
   const openChangePasswordBtn = document.getElementById("btn-open-change-password");
   if(openChangePasswordBtn) openChangePasswordBtn.onclick = ()=>{ session.showChangePasswordModal = true; render(); };
   const closeChangePasswordBtn = document.getElementById("btn-close-change-password");
@@ -6090,6 +6218,8 @@ function bindEvents(){
   if(sendBorrowerChatBtn) sendBorrowerChatBtn.onclick = handleSendBorrowerChat;
   if(borrowerChatInput) borrowerChatInput.onkeydown = (e)=>{ if(e.key==="Enter") handleSendBorrowerChat(); };
 
+  const saveSecuritySettingsBtn = document.getElementById("btn-save-security-settings");
+  if(saveSecuritySettingsBtn) saveSecuritySettingsBtn.onclick = handleSaveSecuritySettings;
   const addStaffBtn = document.getElementById("btn-add-staff");
   if(addStaffBtn) addStaffBtn.onclick = handleAddStaff;
   document.querySelectorAll(".remove-staff-btn").forEach(btn=> btn.onclick = ()=> handleRemoveStaff(btn.dataset.staff));
@@ -6442,6 +6572,9 @@ function bindEvents(){
   const dedupeComplianceBtn = document.getElementById("btn-dedupe-compliance");
   if(dedupeComplianceBtn) dedupeComplianceBtn.onclick = handleDedupeCompliance;
   const addRbiFilingBtn = document.getElementById("btn-add-rbi-filing");
+  const addDocumentBtn = document.getElementById("btn-add-document");
+  if(addDocumentBtn) addDocumentBtn.onclick = handleAddDocument;
+  document.querySelectorAll(".delete-document-btn").forEach(btn=> btn.onclick = ()=> handleDeleteDocument(btn.dataset.doc));
   if(addRbiFilingBtn) addRbiFilingBtn.onclick = handleAddRbiFiling;
   document.querySelectorAll(".mark-rbi-submitted-btn").forEach(btn=>{
     btn.onclick = ()=> handleMarkRbiSubmitted(btn.dataset.filing);
@@ -8131,6 +8264,34 @@ async function handleDedupeCompliance(){
 /* ---------------------------------------------------------------------
    RBI Returns Tracker
    --------------------------------------------------------------------- */
+async function handleAddDocument(){
+  const u = session.user;
+  const name = document.getElementById("dr-name").value.trim();
+  const category = document.getElementById("dr-category").value;
+  const documentNumber = document.getElementById("dr-number").value.trim();
+  const expiryDate = document.getElementById("dr-expiry").value;
+  const notes = document.getElementById("dr-notes").value.trim();
+  if(!name){ toast("Enter a document name."); return; }
+  await db.put("documentRegister", {
+    id: uid("doc"), name, category, documentNumber, expiryDate, notes,
+    createdAt: nowISO(), createdBy: u.name
+  });
+  await logAudit(u.name, u.role, "Document Tracked", `${name} (${category})${expiryDate?' — expires '+expiryDate:''}`);
+  toast("Document tracked.");
+  render();
+}
+
+async function handleDeleteDocument(docId){
+  const u = session.user;
+  const doc = await db.get("documentRegister", docId);
+  if(!doc) return;
+  if(!window.confirm(`Remove "${doc.name}" from the document register?`)) return;
+  await db.delete("documentRegister", docId);
+  await logAudit(u.name, u.role, "Document Removed", doc.name);
+  toast("Removed.");
+  render();
+}
+
 async function handleAddRbiFiling(){
   const u = session.user;
   const code = document.getElementById("rf-code").value;
@@ -8926,6 +9087,18 @@ async function handleBorrowerLogin(){
     console.error(err);
     toast(friendlyAuthError(err));
   }
+}
+
+async function handleSaveSecuritySettings(){
+  const u = session.user;
+  const minutes = Number(document.getElementById("sec-session-timeout").value);
+  if(!minutes || minutes<2){ toast("Enter at least 2 minutes."); return; }
+  const cfg = (await db.get("apiConfig","security")) || {id:"security"};
+  cfg.sessionTimeoutMinutes = minutes;
+  await db.put("apiConfig", cfg);
+  await logAudit(u.name, u.role, "Security Settings Updated", `Session timeout set to ${minutes} minutes`);
+  toast("Saved.");
+  render();
 }
 
 async function handleAddStaff(){
@@ -9730,6 +9903,10 @@ async function ensureAllSeeds(){
     }
     render();
     initFloatingHelp();
+    ["mousemove","mousedown","keydown","touchstart","scroll"].forEach(evt=>{
+      document.addEventListener(evt, recordActivity, {passive:true});
+    });
+    setInterval(checkSessionTimeout, 15000);
   } catch(err){
     console.error("NBFC LMS failed to start:", err);
     // initFirebase() already rendered a setup message if config is missing.
