@@ -9924,6 +9924,7 @@ async function handleSetupAdmin(){
   let cred = null;
   try{
     cred = await firebase.auth().createUserWithEmailAndPassword(staffAuthEmail(username), password);
+    await cred.user.getIdToken(true);
   } catch(err){
     console.error(err);
     toast(friendlyAuthError(err));
@@ -9992,6 +9993,13 @@ async function handleBorrowerRegister(){
   let cred = null;
   try{
     cred = await firebase.auth().createUserWithEmailAndPassword(borrowerAuthEmail(mobile), password);
+    // Force the ID token to refresh before writing to Firestore — right
+    // after account creation there's a brief window where the SDK's
+    // internal auth state hasn't fully settled, which can make the very
+    // next Firestore write get evaluated as if it were still the old
+    // (anonymous) session, failing the security rule that requires
+    // writing your own record.
+    await cred.user.getIdToken(true);
   } catch(err){
     console.error(err);
     toast(friendlyAuthError(err));
