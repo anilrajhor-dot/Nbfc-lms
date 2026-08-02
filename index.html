@@ -2017,26 +2017,42 @@ async function render(){
   const app = document.getElementById("app");
   app.innerHTML = `<div style="padding:60px;text-align:center;color:#5C6579;">Loading…</div>`;
 
-  // Only meta/setupStatus is readable pre-login (see Security Rules) —
-  // the real staff collection is locked down and can't be enumerated
-  // by anyone who hasn't actually authenticated as staff.
-  const setupStatus = await db.get("meta","setupStatus");
-  const firstRun = !setupStatus || !setupStatus.initialized;
+  try{
+    // Only meta/setupStatus is readable pre-login (see Security Rules) —
+    // the real staff collection is locked down and can't be enumerated
+    // by anyone who hasn't actually authenticated as staff.
+    const setupStatus = await db.get("meta","setupStatus");
+    const firstRun = !setupStatus || !setupStatus.initialized;
 
-  let body = "";
-  if(session.type === "staff"){
-    body = await renderStaffShell();
-  } else if(session.type === "borrower"){
-    body = await renderBorrowerShell();
-  } else if(route === "staff-login"){
-    body = renderStaffLogin(firstRun);
-  } else if(route === "borrower-auth"){
-    body = renderBorrowerAuth();
-  } else {
-    body = renderLanding(firstRun);
+    let body = "";
+    if(session.type === "staff"){
+      body = await renderStaffShell();
+    } else if(session.type === "borrower"){
+      body = await renderBorrowerShell();
+    } else if(route === "staff-login"){
+      body = renderStaffLogin(firstRun);
+    } else if(route === "borrower-auth"){
+      body = renderBorrowerAuth();
+    } else {
+      body = renderLanding(firstRun);
+    }
+    app.innerHTML = body;
+    bindEvents();
+  } catch(err){
+    // Never leave the screen stuck on "Loading…" — if anything in the
+    // render chain throws, show it plainly with a way back, rather
+    // than silently hanging with no way to recover except reloading
+    // the page and hoping.
+    console.error("Render failed:", err);
+    app.innerHTML = `
+      <div style="padding:40px 24px; text-align:center; max-width:480px; margin:0 auto;">
+        <h2 style="font-family:'Fraunces',serif;">Something went wrong showing this screen</h2>
+        <p style="color:#5C6579; font-size:13px; word-break:break-word;">${esc(err.message||String(err))}</p>
+        <button class="btn btn-gold" id="btn-render-error-reload" style="margin-top:16px;">Reload</button>
+      </div>`;
+    const reloadBtn = document.getElementById("btn-render-error-reload");
+    if(reloadBtn) reloadBtn.onclick = ()=> window.location.reload();
   }
-  app.innerHTML = body;
-  bindEvents();
 }
 
 function renderLanding(firstRun){
