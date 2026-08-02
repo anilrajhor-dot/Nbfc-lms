@@ -868,7 +868,7 @@ const ALL_COLLECTIONS = [
   "recoveryVisits","apiConfig","aiConfig","nbfcProfile","categoryConfig","journalEntries","complianceItems","rbiReturnFilings",
   "staffSalaries","payrollRuns","dsaAgents","dsaCommissions",
   "shgGroups","shgMembers","shgSavings","shgInternalLoans","microEnterpriseTemplates",
-  "bankStatementLines","bankBorrowings","fixedAssets","projectionAssumptions","documentRegister","rcmItems","auditObservations","escalationRules","holidayCalendar","chartOfAccounts","journalVouchers","rbiInspections","strCtrRegister",
+  "bankStatementLines","bankBorrowings","fixedAssets","projectionAssumptions","documentRegister","rcmItems","auditObservations","escalationRules","holidayCalendar","chartOfAccounts","journalVouchers","rbiInspections","strCtrRegister","loanDocuments",
   "auditLog","meta"
 ];
 
@@ -4116,6 +4116,67 @@ async function generateLegalNoticeHtml(acc, cust, dpd, noticeType){
   `;
 }
 
+const LOAN_DOCUMENT_TYPES = ["Sanction Letter","Loan Agreement","Demand Promissory Note","Hypothecation Agreement","Guarantee Deed","Mortgage Papers","KYC Documents","Income Proof","Inspection Report","Other"];
+// Firestore caps a single document at 1MB, and base64 encoding inflates
+// a file's size by roughly a third — this threshold leaves real margin
+// rather than letting someone hit that ceiling with no warning.
+const DOCUMENT_VAULT_MAX_FILE_KB = 650;
+
+async function renderDocumentVaultSection(loanAccountId){
+  const isOpen = session.showDocumentVaultFor === loanAccountId;
+  if(!isOpen){
+    return `
+      <h3 class="section-h">Document Vault</h3>
+      <button class="btn btn-outline btn-sm" id="btn-toggle-document-vault" data-loan="${loanAccountId}">Show Document Vault</button>
+    `;
+  }
+
+  const allDocs = (await db.getAll("loanDocuments")).filter(d=>d.loanAccountId===loanAccountId);
+  const usedTypes = [...new Set(allDocs.map(d=>d.documentType))];
+  const byType = {};
+  usedTypes.forEach(t=> byType[t] = allDocs.filter(d=>d.documentType===t).sort((a,b)=>b.versionNumber-a.versionNumber));
+  const availableToAdd = LOAN_DOCUMENT_TYPES.filter(t=>!usedTypes.includes(t));
+
+  return `
+    <div class="flex-between">
+      <h3 class="section-h" style="margin:0;">Document Vault</h3>
+      <button class="btn btn-outline btn-sm" id="btn-toggle-document-vault" data-loan="${loanAccountId}">Hide</button>
+    </div>
+    <p class="small muted">Entirely optional and opt-in — add only the documents that actually apply to this loan (an unsecured Personal Loan has no reason to carry Mortgage Papers or a Hypothecation Agreement). Version history is kept per document. ⚠ Files are stored as part of the database record here (same as KYC photos elsewhere in the app), which has a real ceiling: keep individual files under ~${DOCUMENT_VAULT_MAX_FILE_KB}KB. For a higher-volume vault with larger scanned documents, the correct next step is Firebase Storage (a separate, purpose-built file store) — a genuine but bigger setup step, worth doing once this is in regular use.</p>
+    ${usedTypes.length===0 ? `<p class="small muted">No documents added yet for this loan.</p>` : `
+    <table>
+      <thead><tr><th>Document Type</th><th>Current Version</th><th>Uploaded</th><th></th></tr></thead>
+      <tbody>
+      ${usedTypes.map(type=>{
+        const versions = byType[type];
+        const current = versions[0];
+        return `<tr>
+          <td>${esc(type)}</td>
+          <td>v${current.versionNumber} — ${esc(current.fileName)}</td>
+          <td>${fmtDate(current.uploadedAt)+" by "+esc(current.uploadedBy)}</td>
+          <td class="action-row">
+            <a href="${current.fileBase64}" download="${esc(current.fileName)}" class="btn btn-outline btn-sm">Download</a>
+            ${versions.length>1 ? `<button class="btn btn-outline btn-sm toggle-doc-history-btn" data-type="${esc(type)}" data-loan="${loanAccountId}">History (${versions.length})</button>` : ""}
+            <label class="btn btn-gold btn-sm" style="cursor:pointer;">New Version<input type="file" class="doc-vault-upload-input" data-type="${esc(type)}" data-loan="${loanAccountId}" style="display:none;"></label>
+          </td>
+        </tr>
+        ${session.showDocHistoryFor===type ? `<tr><td colspan="4" style="background:var(--paper-2);">
+          ${versions.map(v=>`<div class="small" style="padding:4px 0;">v${v.versionNumber} — ${esc(v.fileName)} — ${fmtDate(v.uploadedAt)} by ${esc(v.uploadedBy)} — <a href="${v.fileBase64}" download="${esc(v.fileName)}">Download</a></div>`).join("")}
+        </td></tr>` : ""}`;
+      }).join("")}
+      </tbody>
+    </table>
+    `}
+    ${availableToAdd.length>0 ? `
+    <div class="action-row" style="margin-top:8px;">
+      <select id="doc-vault-add-type-select" data-loan="${loanAccountId}" style="padding:6px 8px; border-radius:6px; border:1px solid var(--line); font-size:13px;">
+        ${availableToAdd.map(t=>`<option>${esc(t)}</option>`).join("")}
+      </select>
+      <label class="btn btn-gold btn-sm" style="cursor:pointer;">+ Add Document<input type="file" id="doc-vault-add-file-input" data-loan="${loanAccountId}" style="display:none;"></label>
+    </div>` : ""}
+  `;
+}
+
 async function renderLoanAccountDetail(acc, customers){
   if(!acc) return `<div class="card">Loan account not found.</div>`;
   const cust = customers.find(c=>c.id===acc.customerId);
@@ -4190,6 +4251,8 @@ async function renderLoanAccountDetail(acc, customers){
       </div>
       <button class="btn btn-outline btn-sm" id="btn-edit-insurance-collateral" data-loan="${acc.id}" style="margin-top:8px;">Edit</button>
       `}
+
+      ${await renderDocumentVaultSection(acc.id)}
 
       <h3 class="section-h">EMI Schedule</h3>
       <table>
@@ -7793,6 +7856,23 @@ function bindEvents(){
   const saveCorrectLoanBtn = document.getElementById("btn-save-correct-loan");
   if(saveCorrectLoanBtn) saveCorrectLoanBtn.onclick = ()=> handleCorrectLoanTerms(saveCorrectLoanBtn.dataset.loan);
   const editInsCollBtn = document.getElementById("btn-edit-insurance-collateral");
+  const toggleDocVaultBtn = document.getElementById("btn-toggle-document-vault");
+  if(toggleDocVaultBtn) toggleDocVaultBtn.onclick = ()=>{
+    session.showDocumentVaultFor = session.showDocumentVaultFor===toggleDocVaultBtn.dataset.loan ? null : toggleDocVaultBtn.dataset.loan;
+    render();
+  };
+  document.querySelectorAll(".doc-vault-upload-input").forEach(input=>{
+    input.onchange = ()=> handleUploadLoanDocument(input);
+  });
+  document.querySelectorAll(".toggle-doc-history-btn").forEach(btn=>{
+    btn.onclick = ()=>{ session.showDocHistoryFor = session.showDocHistoryFor===btn.dataset.type ? null : btn.dataset.type; render(); };
+  });
+  const addDocFileInput = document.getElementById("doc-vault-add-file-input");
+  if(addDocFileInput) addDocFileInput.onchange = ()=>{
+    const typeSelect = document.getElementById("doc-vault-add-type-select");
+    addDocFileInput.dataset.type = typeSelect.value;
+    handleUploadLoanDocument(addDocFileInput);
+  };
   if(editInsCollBtn) editInsCollBtn.onclick = ()=>{ session.showInsuranceCollateralForm = editInsCollBtn.dataset.loan; render(); };
   const cancelInsCollBtn = document.getElementById("btn-cancel-insurance-collateral");
   if(cancelInsCollBtn) cancelInsCollBtn.onclick = ()=>{ session.showInsuranceCollateralForm = null; render(); };
@@ -9021,6 +9101,34 @@ function handleViewReceipt(paymentId){
     session.loanSubview = "receipt";
     render();
   });
+}
+
+async function handleUploadLoanDocument(inputEl){
+  const u = session.user;
+  const file = inputEl.files[0];
+  if(!file) return;
+  const loanAccountId = inputEl.dataset.loan;
+  const documentType = inputEl.dataset.type;
+  const sizeKB = file.size/1024;
+  if(sizeKB > DOCUMENT_VAULT_MAX_FILE_KB){
+    toast(`That file is ${Math.round(sizeKB)}KB — over the ${DOCUMENT_VAULT_MAX_FILE_KB}KB limit for this vault. Compress it (or scan at lower resolution) and try again.`);
+    inputEl.value = "";
+    return;
+  }
+  const reader = new FileReader();
+  reader.onload = async ()=>{
+    const existingVersions = (await db.getAll("loanDocuments")).filter(d=>d.loanAccountId===loanAccountId && d.documentType===documentType);
+    const nextVersion = existingVersions.length>0 ? Math.max(...existingVersions.map(v=>v.versionNumber))+1 : 1;
+    await db.put("loanDocuments", {
+      id: uid("ldoc"), loanAccountId, documentType, versionNumber: nextVersion,
+      fileBase64: reader.result, fileName: file.name, fileSizeKB: Math.round(sizeKB),
+      uploadedAt: nowISO(), uploadedBy: u.name
+    });
+    await logAudit(u.name, u.role, "Loan Document Uploaded", `${documentType} v${nextVersion} — ${file.name} — loan ${loanAccountId}`);
+    toast(`Uploaded ${documentType} (version ${nextVersion}).`);
+    render();
+  };
+  reader.readAsDataURL(file);
 }
 
 async function handleSaveInsuranceCollateral(loanId){
