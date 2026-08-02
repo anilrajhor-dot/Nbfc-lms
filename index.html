@@ -3622,7 +3622,7 @@ async function renderLoanAccountsTab(loanAccounts, customers){
   const subview = session.loanSubview || "list";
   if(subview === "view") return await renderLoanAccountDetail(loanAccounts.find(a=>a.id===session.viewingLoanId), customers);
   if(subview === "collect") return await renderCollectionForm(loanAccounts.find(a=>a.id===session.collectingLoanId), customers);
-  if(subview === "receipt") return renderReceipt(session.viewingReceipt);
+  if(subview === "receipt") return await renderReceipt(session.viewingReceipt);
   return renderLoanAccountsList(loanAccounts, customers);
 }
 
@@ -3657,6 +3657,76 @@ function renderLoanAccountsList(loanAccounts, customers){
           }).join("")}
         </tbody>
       </table>
+    </div>
+  `;
+}
+
+async function generateLoanStatementHtml(acc, cust, payments){
+  const nbfc = await getNbfcProfile();
+  return `
+    <div class="letterhead">
+      <div class="name">${esc(nbfc.name||"[NBFC Name Not Set]")}</div>
+      <div class="meta">${esc(nbfc.address||"")} ${nbfc.registrationNumber?" · RBI Reg. "+esc(nbfc.registrationNumber):""}</div>
+    </div>
+    <h1>Loan Account Statement</h1>
+    <table>
+      <tr><td><b>Customer</b></td><td>${esc(cust.personal.name)}</td><td><b>Account No.</b></td><td>${esc(acc.accountNumber)}</td></tr>
+      <tr><td><b>Product</b></td><td>${esc(acc.product)}</td><td><b>Status</b></td><td>${esc(acc.status)}</td></tr>
+      <tr><td><b>Principal</b></td><td>${fmtINR(acc.principal)}</td><td><b>Interest Rate</b></td><td>${acc.interestRate}% p.a.</td></tr>
+      <tr><td><b>Disbursed</b></td><td>${esc(acc.disbursedDate)}</td><td><b>Outstanding</b></td><td>${fmtINR(acc.principalOutstanding)}</td></tr>
+    </table>
+
+    <h2>EMI Schedule</h2>
+    <table>
+      <thead><tr><th>#</th><th>Due Date</th><th>EMI</th><th>Principal</th><th>Interest</th><th>Status</th></tr></thead>
+      <tbody>
+      ${acc.schedule.map(i=>`<tr><td>${i.index}</td><td>${i.dueDate}</td><td>${fmtINR(i.emiAmount)}</td><td>${fmtINR(i.principalComponent)}</td><td>${fmtINR(i.interestComponent)}</td><td>${esc(i.status)}</td></tr>`).join("")}
+      </tbody>
+    </table>
+
+    <h2>Payment History</h2>
+    <table>
+      <thead><tr><th>Date</th><th>Amount</th><th>Mode</th><th>Reference</th></tr></thead>
+      <tbody>
+      ${payments.length===0 ? `<tr><td colspan="4">No payments recorded yet.</td></tr>` :
+        payments.map(p=>`<tr><td>${p.date}</td><td>${fmtINR(p.amount)}</td><td>${esc(p.mode)}</td><td>${esc(p.referenceNumber)||"—"}</td></tr>`).join("")}
+      </tbody>
+    </table>
+    <p style="font-size:10.5px; color:#888; margin-top:20px;">Generated from NBFC LMS on ${fmtDate(nowISO())}.</p>
+  `;
+}
+
+function currentIndianFY(){
+  const now = new Date();
+  const y = now.getMonth()>=3 ? now.getFullYear() : now.getFullYear()-1; // FY starts April (month index 3)
+  return `${y}-${(y+1).toString().slice(-2)}`;
+}
+function fyDateRange(fyLabel){
+  const startYear = Number(fyLabel.split("-")[0]);
+  return { start: `${startYear}-04-01`, end: `${startYear+1}-03-31` };
+}
+
+async function generateInterestCertificateHtml(acc, cust, payments, fyLabel){
+  const nbfc = await getNbfcProfile();
+  const { start, end } = fyDateRange(fyLabel);
+  const paidInFY = acc.schedule.filter(i=>i.status==="Paid" && i.paidDate>=start && i.paidDate<=end);
+  const principalPaid = paidInFY.reduce((s,i)=>s+i.principalComponent,0);
+  const interestPaid = paidInFY.reduce((s,i)=>s+i.interestComponent,0);
+  return `
+    <div class="letterhead">
+      <div class="name">${esc(nbfc.name||"[NBFC Name Not Set]")}</div>
+      <div class="meta">${esc(nbfc.address||"")} ${nbfc.registrationNumber?" · RBI Reg. "+esc(nbfc.registrationNumber):""}</div>
+    </div>
+    <h1>Interest Certificate — FY ${esc(fyLabel)}</h1>
+    <p>This is to certify that <b>${esc(cust.personal.name)}</b>, holder of Loan Account No. <b>${esc(acc.accountNumber)}</b> (${esc(acc.product)}), has paid the following amounts towards the said loan during the Financial Year ${esc(fyLabel)} (${start} to ${end}):</p>
+    <table>
+      <tr><td><b>Principal Repaid</b></td><td>${fmtINR(Math.round(principalPaid))}</td></tr>
+      <tr><td><b>Interest Paid</b></td><td>${fmtINR(Math.round(interestPaid))}</td></tr>
+      <tr><td><b>Total Repaid</b></td><td>${fmtINR(Math.round(principalPaid+interestPaid))}</td></tr>
+    </table>
+    <p class="small" style="color:#888;">This certificate is issued based on records maintained in our system as of ${fmtDate(nowISO())}, for the borrower's tax filing reference. Please have your tax advisor confirm applicability and treatment for your specific case.</p>
+    <div class="sig-block">
+      <div class="sig-line">For ${esc(nbfc.name||"the Company")}<br>Authorized Signatory</div>
     </div>
   `;
 }
@@ -3706,6 +3776,8 @@ async function renderLoanAccountDetail(acc, customers){
       <div class="flex-between">
         <h2>Loan Account — ${esc(cust?cust.personal.name:'')} <span class="small mono muted">(${esc(acc.accountNumber)||acc.id})</span></h2>
         <div class="action-row">
+          <button class="btn btn-outline btn-sm" id="btn-generate-loan-statement" data-loan="${acc.id}">Statement</button>
+          <button class="btn btn-outline btn-sm" id="btn-generate-interest-certificate" data-loan="${acc.id}">Interest Certificate</button>
           ${dpd>0 ? `<button class="btn btn-outline btn-sm generate-legal-notice-btn" data-loan="${acc.id}" data-type="demand">Demand Notice</button>` : ""}
           ${dpd>60 ? `<button class="btn btn-danger btn-sm generate-legal-notice-btn" data-loan="${acc.id}" data-type="final">Final Notice</button>` : ""}
           ${canCorrect ? `<button class="btn btn-outline btn-sm" id="btn-open-correct-loan">Correct Terms</button>` : ""}
@@ -3813,8 +3885,9 @@ async function renderCollectionForm(acc, customers){
   `;
 }
 
-function renderReceipt(r){
+async function renderReceipt(r){
   if(!r) return `<div class="card">Receipt not found.</div>`;
+  const nbfc = await getNbfcProfile();
   return `
     <div class="card no-print" style="margin-bottom:0;">
       <div class="flex-between"><h2>Payment Receipt</h2>
@@ -3822,7 +3895,11 @@ function renderReceipt(r){
       </div>
     </div>
     <div class="card" style="border-top:4px solid var(--gold); max-width:480px;">
-      <h2 style="font-size:19px;">NBFC LMS — Payment Receipt</h2>
+      <div style="text-align:center; margin-bottom:10px;">
+        <div style="font-family:'Fraunces',serif; font-size:18px; font-weight:700;">${esc(nbfc.name||"NBFC LMS")}</div>
+        <div class="small muted">${esc(nbfc.address||"")}${nbfc.registrationNumber?" · RBI Reg. "+esc(nbfc.registrationNumber):""}</div>
+      </div>
+      <h2 style="font-size:16px;">Payment Receipt</h2>
       <p class="small muted">Receipt No: ${esc(r.id)} · ${fmtDate(r.createdAt)}</p>
       <div class="divider"></div>
       <p><b>Received from:</b> ${esc(r.customerName)}</p>
@@ -3830,8 +3907,9 @@ function renderReceipt(r){
       <p><b>Towards:</b> ${esc(r.product)} — Installment #${r.installmentIndex}</p>
       <p><b>Mode:</b> ${esc(r.mode)} ${r.referenceNumber ? `(Ref: ${esc(r.referenceNumber)})` : ""}</p>
       <p><b>Date:</b> ${esc(r.date)}</p>
+      ${r.outstandingAfter!==undefined ? `<p><b>Principal Outstanding After This Payment:</b> ${fmtINR(r.outstandingAfter)}</p>` : ""}
       <p><b>Collected by:</b> ${esc(r.collectedBy)}</p>
-      <p class="small muted" style="margin-top:16px;">System-generated receipt — NBFC LMS prototype.</p>
+      <p class="small muted" style="margin-top:16px;">System-generated receipt — NBFC LMS.</p>
     </div>
   `;
 }
@@ -5372,6 +5450,9 @@ async function renderAiInsightsTab(customers, appraisals, loanAccounts, products
     {id:"watchlist", label:"Delinquency Watchlist"},
     {id:"fraud", label:"Fraud Signals"},
     {id:"recommend", label:"Loan Recommender"},
+    {id:"summary", label:"AI Credit Summary"},
+    {id:"stress", label:"Stress Testing"},
+    {id:"crosssell", label:"Cross-sell"},
     {id:"assistant", label:"AI Assistant"},
   ];
   let body = "";
@@ -5380,12 +5461,15 @@ async function renderAiInsightsTab(customers, appraisals, loanAccounts, products
   else if(sub==="watchlist") body = await renderAiWatchlist(loanAccounts, customers, payments);
   else if(sub==="fraud") body = await renderAiFraud(customers, appraisals);
   else if(sub==="recommend") body = renderAiRecommend(customers, products, policy);
+  else if(sub==="summary") body = await renderAiCreditSummary(customers, appraisals);
+  else if(sub==="stress") body = await renderStressTesting(loanAccounts, payments);
+  else if(sub==="crosssell") body = await renderCrossSell(customers, loanAccounts, products);
   else if(sub==="assistant") body = renderAiAssistant();
 
   return `
     <div class="card">
       <h2>AI Insights</h2>
-      <p class="sub">Scoring, watchlists and fraud signals here are rule-based and fully explainable from data already in the system — not a trained ML model. That's a deliberate choice: an auditable, attributable score is more defensible for a regulated lender than a black box. The AI Assistant tab is the one place that calls a real language model.</p>
+      <p class="sub">Scoring, watchlists, fraud signals, stress testing and cross-sell here are rule-based and fully explainable from data already in the system — not a trained ML model. That's a deliberate choice: an auditable, attributable result is more defensible for a regulated lender than a black box. AI Credit Summary and the AI Assistant tab are the two places that call a real language model, since narrative text is a reasonable use for it — the underlying figures they describe are still pulled from the same rule-based data.</p>
       <div class="tabs" style="margin-bottom:0; border-bottom:none;">
         ${subTabs.map(t=>`<button class="tab ${sub===t.id?'active':''}" data-aitab="${t.id}">${t.label}</button>`).join("")}
       </div>
@@ -5496,6 +5580,101 @@ function renderAiRecommend(customers, products, policy){
     <div class="card">
       <div class="field" style="max-width:360px;"><label>Customer</label><select id="ai-recommend-customer">${custOptions}</select></div>
       ${block}
+    </div>
+  `;
+}
+
+async function renderAiCreditSummary(customers, appraisals){
+  const selectedId = session.aiSummaryCustomer || (customers[0] && customers[0].id);
+  const custOptions = customers.map(c=>`<option value="${c.id}" ${c.id===selectedId?'selected':''}>${esc(c.personal.name)}</option>`).join("");
+  const cust = customers.find(c=>c.id===selectedId);
+  const summaryText = session.aiSummaryResult;
+  return `
+    <div class="card">
+      <h2 style="font-size:16px;">AI Credit Summary</h2>
+      <p class="sub">Generates a plain-language narrative from this customer's own recorded data — a starting point for a credit note, not a substitute for the officer's own judgment. Calls a real language model (Integrations → AI Provider), unlike the rule-based sections elsewhere on this tab.</p>
+      <div class="field" style="max-width:360px;"><label>Customer</label><select id="ai-summary-customer">${custOptions}</select></div>
+      <button class="btn btn-gold btn-sm" id="btn-generate-ai-summary" ${cust?'':'disabled'}>Generate Summary</button>
+      ${summaryText ? `<div class="warn-banner" style="background:#F5F3EE;border-color:var(--line);color:#333; white-space:pre-wrap; margin-top:12px;">${esc(summaryText)}</div>` : ""}
+    </div>
+  `;
+}
+
+async function renderStressTesting(loanAccounts, payments){
+  const s = session.stressAssumptions || { slippagePct:10, rateShockPct:2, topExposureDefaultPct:0 };
+  const active = loanAccounts.filter(a=>a.status==="Active");
+  const totalOutstanding = active.reduce((sum,a)=>sum+a.principalOutstanding,0);
+  const currentNpa = active.filter(a=>NPA_CLASSES.includes(classifyDPD(computeDPD(a)))).reduce((sum,a)=>sum+a.principalOutstanding,0);
+
+  // Scenario: a share of currently-Standard/SMA accounts slip further,
+  // becoming NPA — a simple, transparent stress on asset quality.
+  const nonNpaAccounts = active.filter(a=>!NPA_CLASSES.includes(classifyDPD(computeDPD(a))));
+  const nonNpaOutstanding = nonNpaAccounts.reduce((sum,a)=>sum+a.principalOutstanding,0);
+  const stressedSlippage = nonNpaOutstanding * (s.slippagePct/100);
+  const stressedNpa = currentNpa + stressedSlippage;
+  const stressedNpaRatio = totalOutstanding>0 ? (stressedNpa/totalOutstanding)*100 : 0;
+  const currentNpaRatio = totalOutstanding>0 ? (currentNpa/totalOutstanding)*100 : 0;
+
+  const acct = await computeAccountingSummary();
+  const stressedFinanceCosts = acct.fundAccounts.filter(a=>a.type==="Borrowing").reduce((sum,a)=>sum+a.balance,0) * (s.rateShockPct/100);
+
+  const sortedByExposure = active.slice().sort((a,b)=>b.principalOutstanding-a.principalOutstanding);
+  const topExposureCount = Math.ceil(sortedByExposure.length * (s.topExposureDefaultPct/100));
+  const topExposureAmount = sortedByExposure.slice(0,topExposureCount).reduce((sum,a)=>sum+a.principalOutstanding,0);
+
+  return `
+    <div class="card">
+      <h2 style="font-size:16px;">Portfolio Stress Testing</h2>
+      <p class="sub">Simple, transparent scenario modeling — not a statistical model, just "what if X% of accounts slipped further" applied directly to your real current portfolio. Adjust the assumptions and recalculate.</p>
+      <div class="grid grid-3">
+        <div class="field"><label>% of non-NPA accounts slipping to NPA</label><input id="st-slippage" type="number" value="${s.slippagePct}"></div>
+        <div class="field"><label>Interest rate shock on borrowings (+pp)</label><input id="st-rate-shock" type="number" value="${s.rateShockPct}"></div>
+        <div class="field"><label>% of top exposures assumed to default</label><input id="st-top-default" type="number" value="${s.topExposureDefaultPct}"></div>
+      </div>
+      <button class="btn btn-gold btn-sm" id="btn-run-stress-test">Recalculate</button>
+
+      <div class="grid grid-3" style="margin-top:14px;">
+        <div class="kpi"><div class="lbl">Current NPA Ratio</div><div class="val" style="font-size:18px;">${currentNpaRatio.toFixed(2)}%</div></div>
+        <div class="kpi"><div class="lbl">Stressed NPA Ratio</div><div class="val" style="font-size:18px; color:var(--danger);">${stressedNpaRatio.toFixed(2)}%</div></div>
+        <div class="kpi"><div class="lbl">Additional NPA (₹)</div><div class="val" style="font-size:18px;">${fmtINR(Math.round(stressedSlippage))}</div></div>
+        <div class="kpi"><div class="lbl">Added Finance Cost from Rate Shock</div><div class="val" style="font-size:18px;">${fmtINR(Math.round(stressedFinanceCosts))}/yr</div></div>
+        <div class="kpi"><div class="lbl">Top-Exposure Default Scenario</div><div class="val" style="font-size:18px;">${fmtINR(Math.round(topExposureAmount))}</div></div>
+        <div class="kpi"><div class="lbl">Accounts in Top-Exposure Scenario</div><div class="val" style="font-size:18px;">${topExposureCount}</div></div>
+      </div>
+    </div>
+  `;
+}
+
+async function renderCrossSell(customers, loanAccounts, products){
+  // Rule-based: a customer with at least one fully Closed loan and no
+  // history of ever being NPA is a reasonable, explainable candidate
+  // for a follow-up/top-up loan.
+  const byCustomer = {};
+  loanAccounts.forEach(a=>{
+    byCustomer[a.customerId] = byCustomer[a.customerId] || [];
+    byCustomer[a.customerId].push(a);
+  });
+  const candidates = [];
+  Object.entries(byCustomer).forEach(([custId, accs])=>{
+    const hasClosedClean = accs.some(a=>a.status==="Closed" && (a.schedule||[]).every(i=>i.status==="Paid"));
+    const everNpa = accs.some(a=> NPA_CLASSES.includes(classifyDPD(computeDPD(a))));
+    const hasActive = accs.some(a=>a.status==="Active");
+    if(hasClosedClean && !everNpa && !hasActive){
+      const cust = customers.find(c=>c.id===custId);
+      if(cust) candidates.push({ cust, pastLoans: accs.length });
+    }
+  });
+  return `
+    <div class="card">
+      <h2 style="font-size:16px;">Cross-sell Candidates</h2>
+      <p class="sub">Customers who've fully repaid at least one loan with a clean history (never NPA) and currently have no active loan — a reasonable, explainable starting list for a follow-up or top-up offer.</p>
+      <table>
+        <thead><tr><th>Customer</th><th>Mobile</th><th>Past Loans With Us</th><th></th></tr></thead>
+        <tbody>
+        ${candidates.length===0 ? `<tr class="empty-row"><td colspan="4">No candidates right now.</td></tr>` :
+          candidates.map(c=>`<tr><td>${esc(c.cust.personal.name)}</td><td class="mono">${esc(c.cust.personal.mobile)}</td><td>${c.pastLoans}</td><td><button class="btn btn-outline btn-sm view-customer-btn" data-customer="${c.cust.id}">View</button></td></tr>`).join("")}
+        </tbody>
+      </table>
     </div>
   `;
 }
@@ -6757,6 +6936,10 @@ function bindEvents(){
   const backToLoans = document.getElementById("btn-back-to-loans");
   if(backToLoans) backToLoans.onclick = ()=>{ session.loanSubview="list"; render(); };
   document.querySelectorAll(".generate-legal-notice-btn").forEach(btn=> btn.onclick = ()=> handleGenerateLegalNotice(btn.dataset.loan, btn.dataset.type));
+  const genStatementBtn = document.getElementById("btn-generate-loan-statement");
+  if(genStatementBtn) genStatementBtn.onclick = ()=> handleGenerateLoanStatement(genStatementBtn.dataset.loan);
+  const genCertBtn = document.getElementById("btn-generate-interest-certificate");
+  if(genCertBtn) genCertBtn.onclick = ()=> handleGenerateInterestCertificate(genCertBtn.dataset.loan);
   const openCorrectLoan = document.getElementById("btn-open-correct-loan");
   if(openCorrectLoan) openCorrectLoan.onclick = ()=>{ session.showCorrectLoanForm=true; render(); };
   const cancelCorrectLoan = document.getElementById("btn-cancel-correct-loan");
@@ -6968,6 +7151,19 @@ function bindEvents(){
   if(aiScoreCustomer) aiScoreCustomer.onchange = ()=>{ session.aiScoringCustomer = aiScoreCustomer.value; render(); };
   const aiRecommendCustomer = document.getElementById("ai-recommend-customer");
   if(aiRecommendCustomer) aiRecommendCustomer.onchange = ()=>{ session.aiRecommendCustomer = aiRecommendCustomer.value; render(); };
+  const aiSummaryCustomer = document.getElementById("ai-summary-customer");
+  if(aiSummaryCustomer) aiSummaryCustomer.onchange = ()=>{ session.aiSummaryCustomer = aiSummaryCustomer.value; session.aiSummaryResult=null; render(); };
+  const generateAiSummaryBtn = document.getElementById("btn-generate-ai-summary");
+  if(generateAiSummaryBtn) generateAiSummaryBtn.onclick = handleGenerateAiSummary;
+  const runStressTestBtn = document.getElementById("btn-run-stress-test");
+  if(runStressTestBtn) runStressTestBtn.onclick = ()=>{
+    session.stressAssumptions = {
+      slippagePct: Number(document.getElementById("st-slippage").value)||0,
+      rateShockPct: Number(document.getElementById("st-rate-shock").value)||0,
+      topExposureDefaultPct: Number(document.getElementById("st-top-default").value)||0,
+    };
+    render();
+  };
   const sendChatBtn = document.getElementById("btn-send-chat");
   const chatInput = document.getElementById("chat-input");
   if(sendChatBtn) sendChatBtn.onclick = handleSendChat;
@@ -7269,6 +7465,30 @@ async function updatePricingHint(){
   const policy = (await db.get("policyConfig","default")) || defaultPolicyConfig();
   const band = policy.pricing.find(p=>p.riskCategory===riskEl.value);
   el.textContent = band ? `Indicative pricing per Credit Policy for ${riskEl.value} risk: ${band.minRate}% – ${band.maxRate}% p.a.` : "";
+}
+
+async function handleGenerateLoanStatement(loanId){
+  const acc = await db.get("loanAccounts", loanId);
+  if(!acc) return;
+  const cust = await db.get("customers", acc.customerId);
+  if(!cust){ toast("Customer record not found."); return; }
+  const payments = (await db.getAll("payments")).filter(p=>p.loanAccountId===loanId).sort((a,b)=>new Date(a.date)-new Date(b.date));
+  const html = await generateLoanStatementHtml(acc, cust, payments);
+  printDocument(html);
+  await logAudit(session.user.name, session.user.role, "Loan Statement Generated", `${cust.personal.name} — ${acc.accountNumber}`);
+}
+
+async function handleGenerateInterestCertificate(loanId){
+  const acc = await db.get("loanAccounts", loanId);
+  if(!acc) return;
+  const cust = await db.get("customers", acc.customerId);
+  if(!cust){ toast("Customer record not found."); return; }
+  const fy = window.prompt("Financial Year (e.g. 2025-26):", currentIndianFY());
+  if(!fy) return;
+  const payments = (await db.getAll("payments")).filter(p=>p.loanAccountId===loanId);
+  const html = await generateInterestCertificateHtml(acc, cust, payments, fy);
+  printDocument(html);
+  await logAudit(session.user.name, session.user.role, "Interest Certificate Generated", `${cust.personal.name} — ${acc.accountNumber} — FY ${fy}`);
 }
 
 async function handleGenerateLegalNotice(loanId, noticeType){
@@ -7844,7 +8064,8 @@ async function handleConfirmCollection(loanId){
 
   session.viewingReceipt = {
     id: payment.id, customerName: cust?cust.personal.name:"—", amount, product: acc.product,
-    installmentIndex: instIndex, mode, referenceNumber: ref, date, collectedBy: u.name, createdAt: payment.createdAt
+    installmentIndex: instIndex, mode, referenceNumber: ref, date, collectedBy: u.name, createdAt: payment.createdAt,
+    outstandingAfter: acc.principalOutstanding
   };
   toast("Payment recorded. Receipt ready.");
   session.loanSubview = "receipt";
@@ -8835,6 +9056,27 @@ async function handleExportReport(){
    Phase 8 handler: AI Assistant (calls Claude directly — only works
    inside Claude.ai's artifact runtime, see in-app warning)
    --------------------------------------------------------------------- */
+async function handleGenerateAiSummary(){
+  const custId = document.getElementById("ai-summary-customer").value;
+  const cust = await db.get("customers", custId);
+  if(!cust) return;
+  const appraisals = (await db.getAll("appraisals")).filter(a=>a.customerId===custId);
+  const loanAccounts = (await db.getAll("loanAccounts")).filter(a=>a.customerId===custId);
+  toast("Generating summary…");
+  const facts = {
+    name: cust.personal.name, riskCategory: cust.riskCategory, creditScore: cust.creditScore,
+    monthlyIncome: cust.income.monthly, business: cust.business.type,
+    existingLoans: cust.existingLoans, previousLoans: cust.previousLoans,
+    duplicateFlag: cust.duplicateFlag,
+    pastAppraisals: appraisals.map(a=>({date:a.appraisalDate, riskRating:a.riskRating, recommendation:a.recommendation})),
+    loanHistory: loanAccounts.map(a=>({product:a.product, status:a.status, principal:a.principal, outstanding:a.principalOutstanding}))
+  };
+  const prompt = `You are helping a credit officer at a small Indian NBFC. Write a concise (120-180 word) plain-language credit summary of this customer, based ONLY on the facts given below — do not invent anything not present. Mention income, risk category, loan history, and anything noteworthy (duplicate flags, past risk ratings). End with one sentence flagging anything the officer should double-check manually.\n\nFacts: ${JSON.stringify(facts)}`;
+  const result = await callAiChat([{role:"user", content:prompt}], 400);
+  session.aiSummaryResult = result.ok ? result.text : ("Could not generate summary: "+result.error);
+  render();
+}
+
 async function handleSendChat(){
   const input = document.getElementById("chat-input");
   const text = input.value.trim();
