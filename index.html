@@ -12350,6 +12350,7 @@ function renderFloatingHelpPanel(){
     <div style="background:#FBF1DC; color:#5C4200; font-size:11px; padding:6px 12px;">Works while this runs inside Claude.ai — needs your own key once hosted standalone.</div>
     <div style="display:flex; gap:6px; padding:10px; border-top:1px solid #DCD7CA;">
       <input id="floating-chat-input" placeholder="Ask a question…" style="flex:1; padding:8px 10px; border:1px solid #DCD7CA; border-radius:6px; font-size:13px;">
+      <button id="btn-voice-floating-help" style="background:#fff; color:#0E1A30; border:1px solid #DCD7CA; border-radius:7px; padding:8px 10px; font-size:14px; cursor:pointer;" title="Tap to speak">🎤</button>
       <button id="btn-floating-send" style="background:#C6992F; color:#0E1A30; border:none; border-radius:7px; padding:8px 14px; font-weight:600; font-size:13px; cursor:pointer;">Send</button>
     </div>
   `;
@@ -12359,6 +12360,7 @@ function renderFloatingHelpPanel(){
   if(sendBtn) sendBtn.onclick = handleSendFloatingHelp;
   const input = document.getElementById("floating-chat-input");
   if(input) input.onkeydown = (e)=>{ if(e.key==="Enter") handleSendFloatingHelp(); };
+  attachVoiceInput("btn-voice-floating-help", "floating-chat-input");
   const msgBox = document.getElementById("floating-chat-messages");
   if(msgBox) msgBox.scrollTop = msgBox.scrollHeight;
 }
