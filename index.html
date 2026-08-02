@@ -1665,6 +1665,11 @@ function defaultChartOfAccounts(){
     ["1010","Loan Portfolio — Principal Outstanding","Asset","Loan Asset"],
     ["1020","Interest Receivable","Asset","Current Asset"],
     ["1030","Fixed Assets","Asset","Fixed Asset"],
+    // Contra-asset: reduces Fixed Assets on the balance sheet, but
+    // behaves as CREDIT-normal (increases with credits) — the opposite
+    // of a normal asset account, which is why it needs an explicit
+    // override rather than the type-derived default.
+    ["1031","Accumulated Depreciation","Asset","Fixed Asset","Credit"],
     ["1040","Prepaid Expenses","Asset","Current Asset"],
     // Liabilities
     ["2001","Borrowings — Term Loans","Liability","Long-Term Liability"],
@@ -1688,19 +1693,20 @@ function defaultChartOfAccounts(){
     ["5006","Depreciation","Expense","Operating Expense"],
     ["5007","Other Operating Expenses","Expense","Operating Expense"],
   ];
-  return defs.map(([code,name,type,category])=>({
+  return defs.map(([code,name,type,category,normalOverride])=>({
     id: uid("gla"), code, name, accountType: type, category,
-    normalBalance: normalBalanceFor(type), isSystemAccount: true, active: true,
+    normalBalance: normalOverride || normalBalanceFor(type), isSystemAccount: true, active: true,
     createdAt: nowISO(), createdBy: "system-seed"
   }));
 }
 
 async function ensureChartOfAccountsSeeded(){
   const existing = await db.getAll("chartOfAccounts");
-  if(existing.length>0) return existing;
-  const seeded = defaultChartOfAccounts();
-  for(const acc of seeded){ await db.put("chartOfAccounts", acc); }
-  return seeded;
+  const existingCodes = new Set(existing.map(a=>a.code));
+  const defaults = defaultChartOfAccounts();
+  const missing = defaults.filter(a=>!existingCodes.has(a.code));
+  for(const acc of missing){ await db.put("chartOfAccounts", acc); }
+  return missing.length>0 ? [...existing, ...missing] : existing;
 }
 
 async function getNextVoucherNumber(voucherType){
@@ -3647,6 +3653,7 @@ async function renderBankReconTab(){
   const txns = selectedAccountId ? await getReconcilableTransactions(selectedAccountId) : [];
   const matchedTxnIds = new Set(lines.filter(l=>l.matched).map(l=>l.matchedId));
   const unmatchedTxns = txns.filter(t=>!matchedTxnIds.has(t.id));
+  const catConfig = await getCategoryConfig();
 
   return `
     <div class="card">
@@ -3679,7 +3686,13 @@ async function renderBankReconTab(){
                   <option value="">— Link to —</option>
                   ${unmatchedTxns.map(t=>`<option value="${t.id}" data-type="${t.type}">${esc(t.type)}: ${esc(t.description)} (${fmtINR(Math.abs(t.amount))})</option>`).join("")}
                 </select>
-                <button class="btn btn-outline btn-sm mark-no-record-btn" data-line="${l.id}">No System Record</button>
+                ${session.showRecordCategoryFor===l.id ? `
+                  <select class="no-record-category-select" data-line="${l.id}" style="padding:5px 8px; border-radius:6px; border:1px solid var(--line); font-size:12px;">
+                    ${(l.amount<0 ? catConfig.expenseCategories : catConfig.incomeCategories).map(c=>`<option>${esc(c)}</option>`).join("")}
+                  </select>
+                  <button class="btn btn-gold btn-sm confirm-no-record-btn" data-line="${l.id}">Confirm &amp; Post</button>
+                  <button class="btn btn-outline btn-sm cancel-no-record-btn" data-line="${l.id}">Cancel</button>
+                ` : `<button class="btn btn-outline btn-sm mark-no-record-btn" data-line="${l.id}">No System Record</button>`}
               </div>` : ""}
             </td>
           </tr>`).join("")}
@@ -4611,20 +4624,25 @@ async function renderCashFlowCard(){
 async function renderFixedAssetsCard(){
   const assets = await db.getAll("fixedAssets");
   const totalCost = assets.reduce((s,a)=>s+a.cost,0);
-  let totalBookValue = 0;
+  let totalBookValue = 0, totalUnpostedDepreciation = 0;
   const rows = assets.map(a=>{
     const {bookValue, accumulatedDepreciation} = computeAssetBookValue(a);
     totalBookValue += a.status==="Active" ? bookValue : 0;
+    const alreadyPosted = a.lastDepreciationPostedValue || 0;
+    totalUnpostedDepreciation += a.status==="Active" ? Math.max(0, accumulatedDepreciation-alreadyPosted) : 0;
     return {...a, bookValue, accumulatedDepreciation};
   });
   return `
     <div class="card">
       <h2 style="font-size:16px;">Fixed Assets Register</h2>
       <div class="warn-banner" style="background:#FBF1DC;border-color:var(--gold);color:#5C4200;">⚠ Book values here are a simplified annualized approximation (WDV or SLM against the rate you set) — not a Schedule II compliant depreciation schedule. Confirm actual rates and treatment with your auditor before relying on this for statutory accounts.</div>
-      <div class="grid grid-2">
+      <div class="grid grid-3">
         <div class="kpi"><div class="lbl">Total Original Cost</div><div class="val" style="font-size:18px;">${fmtINR(totalCost)}</div></div>
         <div class="kpi"><div class="lbl">Total Current Book Value</div><div class="val" style="font-size:18px;">${fmtINR(Math.round(totalBookValue))}</div></div>
+        <div class="kpi"><div class="lbl">Depreciation Not Yet Posted to GL</div><div class="val" style="font-size:18px;">${fmtINR(Math.round(totalUnpostedDepreciation))}</div></div>
       </div>
+      ${totalUnpostedDepreciation>=1 ? `<button class="btn btn-gold btn-sm" id="btn-post-depreciation">Post Depreciation to General Ledger</button>
+      <p class="small muted" style="margin-top:6px;">Posts the depreciation accrued since the last time this was run, as one consolidated voucher (Dr Depreciation, Cr Accumulated Depreciation) — not per asset, to keep the ledger readable.</p>` : `<p class="small muted">Depreciation is fully posted to the General Ledger as of today.</p>`}
       <table>
         <thead><tr><th>Asset</th><th>Purchased</th><th>Cost</th><th>Method</th><th>Rate</th><th>Book Value Today</th><th>Status</th><th></th></tr></thead>
         <tbody>
@@ -4983,12 +5001,30 @@ async function renderGeneralLedgerTab(){
   return `
     <div class="card">
       <h2>General Ledger</h2>
-      <p class="sub">A real double-entry ledger — every voucher must balance (debits = credits) before it saves, and every balance below is derived from posted vouchers, not adjusted directly. This is a separate module from the operational Accounting tab for now: disbursements, EMI collections, and the existing Journal &amp; Expenses tool don't post here automatically yet — that's deliberate follow-on work once this foundation is in daily use and verified correct.</p>
+      <p class="sub">A real double-entry ledger — every voucher must balance (debits = credits) before it saves, and every balance below is derived from posted vouchers, not adjusted directly. Disbursements, EMI collections, DSA commission payouts, and Journal &amp; Expenses entries now post here automatically; depreciation and NPA provisioning are period-end actions you trigger deliberately, below and in Fixed Assets.</p>
       <div class="tabs" style="margin-bottom:0; border-bottom:none;">
         ${subTabs.map(t=>`<button class="tab ${sub===t.id?'active':''}" data-gltab="${t.id}">${t.label}</button>`).join("")}
       </div>
     </div>
+    ${await renderNpaProvisioningPostingCard()}
     ${body}
+  `;
+}
+
+async function renderNpaProvisioningPostingCard(){
+  const acct = await computeAccountingSummary();
+  const requiredProvisioning = Math.round(acct.npaProvision);
+  const balances = await computeAllLedgerBalances();
+  const provisionAccountBalance = balances.find(b=>b.account.name==="Provision for NPA / Impairment Allowance");
+  const alreadyPosted = Math.round(provisionAccountBalance ? provisionAccountBalance.balance : 0);
+  const delta = requiredProvisioning - alreadyPosted;
+  return `
+    <div class="card">
+      <div class="flex-between">
+        <div><h2 style="font-size:16px;">NPA Provisioning — Period-End True-Up</h2><p class="sub" style="margin-bottom:0;">Currently required (from live DPD classification): ${fmtINR(requiredProvisioning)}. Already reflected in the ledger: ${fmtINR(alreadyPosted)}.</p></div>
+        ${Math.abs(delta)>=1 ? `<button class="btn btn-gold btn-sm" id="btn-post-npa-provisioning">${delta>0?'Post Additional':'Release Excess'} ${fmtINR(Math.abs(delta))}</button>` : `<span class="badge badge-approved">Up to Date</span>`}
+      </div>
+    </div>
   `;
 }
 
@@ -7647,6 +7683,10 @@ function bindEvents(){
   const saveAssetBtn = document.getElementById("btn-save-asset");
   if(saveAssetBtn) saveAssetBtn.onclick = handleSaveFixedAsset;
   document.querySelectorAll(".dispose-asset-btn").forEach(btn=> btn.onclick = ()=> handleDisposeAsset(btn.dataset.asset));
+  const postDepreciationBtn = document.getElementById("btn-post-depreciation");
+  if(postDepreciationBtn) postDepreciationBtn.onclick = handlePostDepreciation;
+  const postNpaProvisioningBtn = document.getElementById("btn-post-npa-provisioning");
+  if(postNpaProvisioningBtn) postNpaProvisioningBtn.onclick = handlePostNpaProvisioning;
 
   // Bank Reconciliation
   const reconAccountSelect = document.getElementById("recon-account");
@@ -7657,6 +7697,12 @@ function bindEvents(){
     sel.onchange = ()=>{ if(sel.value) handleManualMatch(sel.dataset.line, sel.value, sel.selectedOptions[0].dataset.type); };
   });
   document.querySelectorAll(".mark-no-record-btn").forEach(btn=>{
+    btn.onclick = ()=>{ session.showRecordCategoryFor = btn.dataset.line; render(); };
+  });
+  document.querySelectorAll(".cancel-no-record-btn").forEach(btn=>{
+    btn.onclick = ()=>{ session.showRecordCategoryFor = null; render(); };
+  });
+  document.querySelectorAll(".confirm-no-record-btn").forEach(btn=>{
     btn.onclick = ()=> handleMarkNoSystemRecord(btn.dataset.line);
   });
 
@@ -9072,6 +9118,63 @@ async function handleSaveFixedAsset(){
   render();
 }
 
+async function handlePostNpaProvisioning(){
+  const u = session.user;
+  const acct = await computeAccountingSummary();
+  const requiredProvisioning = Math.round(acct.npaProvision);
+  const balances = await computeAllLedgerBalances();
+  const provisionAccountBalance = balances.find(b=>b.account.name==="Provision for NPA / Impairment Allowance");
+  const alreadyPosted = Math.round(provisionAccountBalance ? provisionAccountBalance.balance : 0);
+  const delta = requiredProvisioning - alreadyPosted;
+  if(Math.abs(delta) < 1){ toast("Provisioning is already up to date."); return; }
+
+  const isIncrease = delta > 0;
+  if(!window.confirm(`${isIncrease?'Post additional':'Release excess'} provisioning of ${fmtINR(Math.abs(delta))}?`)) return;
+
+  await postToGeneralLedger({
+    date: todayStr(), voucherType: "Journal Voucher",
+    narration: `NPA Provisioning ${isIncrease?'increase':'release'} — true-up to ${fmtINR(requiredProvisioning)} required`,
+    lineDefs: isIncrease
+      ? [{accountName:"NPA Provisioning / Impairment Expense", side:"debit", amount:Math.abs(delta)}, {accountName:"Provision for NPA / Impairment Allowance", side:"credit", amount:Math.abs(delta)}]
+      : [{accountName:"Provision for NPA / Impairment Allowance", side:"debit", amount:Math.abs(delta)}, {accountName:"NPA Provisioning / Impairment Expense", side:"credit", amount:Math.abs(delta)}],
+    actor: u.name, actorRole: u.role
+  });
+  await logAudit(u.name, u.role, "NPA Provisioning Posted to GL", `${isIncrease?'Increase':'Release'} of ${fmtINR(Math.abs(delta))} — new total ${fmtINR(requiredProvisioning)}`);
+  toast(`${isIncrease?'Posted':'Released'} ${fmtINR(Math.abs(delta))}.`);
+  render();
+}
+
+async function handlePostDepreciation(){
+  const u = session.user;
+  const assets = await db.getAll("fixedAssets");
+  let totalIncrement = 0;
+  const updatedAssets = [];
+  for(const a of assets.filter(x=>x.status==="Active")){
+    const { accumulatedDepreciation } = computeAssetBookValue(a);
+    const alreadyPosted = a.lastDepreciationPostedValue || 0;
+    const increment = accumulatedDepreciation - alreadyPosted;
+    if(increment >= 1){
+      totalIncrement += increment;
+      updatedAssets.push({ ...a, lastDepreciationPostedValue: accumulatedDepreciation });
+    }
+  }
+  if(totalIncrement < 1){ toast("Nothing new to post — depreciation is already up to date."); return; }
+  if(!window.confirm(`Post ${fmtINR(Math.round(totalIncrement))} of accrued depreciation to the General Ledger?`)) return;
+
+  await postToGeneralLedger({
+    date: todayStr(), voucherType: "Journal Voucher", narration: `Depreciation for the period — ${updatedAssets.length} asset(s)`,
+    lineDefs: [
+      { accountName: "Depreciation", side: "debit", amount: Math.round(totalIncrement) },
+      { accountName: "Accumulated Depreciation", side: "credit", amount: Math.round(totalIncrement) },
+    ],
+    actor: u.name, actorRole: u.role
+  });
+  for(const a of updatedAssets){ await db.put("fixedAssets", a); }
+  await logAudit(u.name, u.role, "Depreciation Posted to GL", `${fmtINR(Math.round(totalIncrement))} across ${updatedAssets.length} asset(s)`);
+  toast(`Posted ${fmtINR(Math.round(totalIncrement))} of depreciation.`);
+  render();
+}
+
 async function handleDisposeAsset(assetId){
   const u = session.user;
   const asset = await db.get("fixedAssets", assetId);
@@ -9131,12 +9234,45 @@ async function handleMarkNoSystemRecord(lineId){
   const u = session.user;
   const line = await db.get("bankStatementLines", lineId);
   if(!line) return;
+  const categorySelect = document.querySelector(`.no-record-category-select[data-line="${lineId}"]`);
+  const category = categorySelect ? categorySelect.value : "Other Expense";
+  const fundAccount = await db.get("fundAccounts", line.fundAccountId);
+  const type = line.amount < 0 ? "Expense" : "Income";
+  const amount = Math.abs(line.amount);
+
+  // This bank-side transaction had no matching app record — recording
+  // it now closes the actual gap reconciliation exists to catch,
+  // rather than just acknowledging the line was looked at.
+  const entry = {
+    id: uid("jnl"), type, category, date: line.date, amount, mode: "Bank",
+    description: `Bank reconciliation — ${line.description}`,
+    fundAccountId: line.fundAccountId, fundAccountName: fundAccount?fundAccount.name:"—",
+    createdAt: nowISO(), createdBy: u.name, proposedBy: u.name, proposedByRole: u.role,
+    status: "Posted", approvedBy: u.name, approvedAt: nowISO()
+  };
+  await db.put("journalEntries", entry);
+  if(fundAccount){
+    fundAccount.balance += (type==="Income" ? amount : -amount);
+    await db.put("fundAccounts", fundAccount);
+  }
+  const glAccountName = glAccountForCategory(category, type);
+  await postToGeneralLedger({
+    date: line.date, voucherType: type==="Expense" ? "Payment Voucher" : "Receipt Voucher",
+    narration: `Bank reconciliation — ${line.description}`,
+    lineDefs: type==="Expense"
+      ? [{accountName: glAccountName, side:"debit", amount}, {accountName: glAccountForMode("Bank"), side:"credit", amount}]
+      : [{accountName: glAccountForMode("Bank"), side:"debit", amount}, {accountName: glAccountName, side:"credit", amount}],
+    actor: u.name, actorRole: u.role
+  });
+
   line.matched = true;
   line.matchedType = "No System Record";
   line.matchedId = null;
+  line.recordedCategory = category;
   await db.put("bankStatementLines", line);
-  await logAudit(u.name, u.role, "Bank Statement Line Reconciled (No System Record)", line.description);
-  toast("Marked reconciled.");
+  await logAudit(u.name, u.role, "Bank Statement Line Reconciled — Entry Recorded", `${line.description} — ${category} — ${fmtINR(amount)}`);
+  toast(`Recorded as ${category} and reconciled.`);
+  session.showRecordCategoryFor = null;
   render();
 }
 
