@@ -205,6 +205,22 @@
   .kyc-upload-box img{max-width:100%; max-height:90px; border-radius:4px; margin-top:8px; display:none; object-fit:cover;}
   .kyc-upload-box input[type=file]{font-size:11px; margin-top:6px; width:100%;}
   canvas#sig-pad{border:1px solid var(--line); border-radius:8px; background:#fff; touch-action:none; cursor:crosshair;}
+
+  .print-doc{font-family:'Inter',sans-serif; color:#1a1a1a; max-width:800px; margin:0 auto; padding:20px;}
+  .print-doc h1{font-family:'Fraunces',serif; font-size:22px; border-bottom:2px solid #0E1A30; padding-bottom:8px; margin-bottom:16px;}
+  .print-doc h2{font-size:15px; margin:18px 0 8px; border-bottom:1px solid #ccc; padding-bottom:4px;}
+  .print-doc table{width:100%; border-collapse:collapse; margin-bottom:12px; font-size:12.5px;}
+  .print-doc td, .print-doc th{border:1px solid #ccc; padding:6px 8px; text-align:left;}
+  .print-doc .sig-block{display:flex; justify-content:space-between; margin-top:50px;}
+  .print-doc .sig-line{border-top:1px solid #333; width:220px; padding-top:6px; font-size:12px; text-align:center;}
+  .print-doc .letterhead{text-align:center; margin-bottom:20px;}
+  .print-doc .letterhead .name{font-family:'Fraunces',serif; font-size:20px; font-weight:700;}
+  .print-doc .letterhead .meta{font-size:11.5px; color:#555;}
+  @media print{
+    body *{visibility:hidden;}
+    #print-area, #print-area *{visibility:visible;}
+    #print-area{display:block !important; position:absolute; top:0; left:0; width:100%;}
+  }
   .gps-box{background:var(--paper); border:1px solid var(--line); border-radius:8px; padding:10px 12px; font-size:13px;}
   .action-row{display:flex; gap:8px; flex-wrap:wrap;}
   @media print {
@@ -217,6 +233,7 @@
 </head>
 <body>
 <div id="app"></div>
+<div id="print-area" style="display:none;"></div>
 <script>
 /* =========================================================================
    LEDGER LMS — Phase 1 (shell) + Phase 2 (Lead detail, Customer Management,
@@ -823,7 +840,7 @@ const ALL_COLLECTIONS = [
   "recoveryVisits","apiConfig","aiConfig","nbfcProfile","categoryConfig","journalEntries","complianceItems","rbiReturnFilings",
   "staffSalaries","payrollRuns","dsaAgents","dsaCommissions",
   "shgGroups","shgMembers","shgSavings","shgInternalLoans","microEnterpriseTemplates",
-  "bankStatementLines","bankBorrowings","fixedAssets","projectionAssumptions","documentRegister",
+  "bankStatementLines","bankBorrowings","fixedAssets","projectionAssumptions","documentRegister","rcmItems","auditObservations",
   "auditLog","meta"
 ];
 
@@ -1638,6 +1655,16 @@ const TIMEOUT_WARNING_SECONDS = 60;
 
 function recordActivity(){ lastActivityTime = Date.now(); }
 
+/** Populates the hidden print-area with formatted document HTML, then
+ *  triggers the browser's native print dialog — which on every modern
+ *  phone/desktop offers "Save as PDF" as a print destination. No
+ *  external PDF library, so nothing here depends on a CDN staying up. */
+function printDocument(htmlContent){
+  const area = document.getElementById("print-area");
+  area.innerHTML = `<div class="print-doc">${htmlContent}</div>`;
+  setTimeout(()=>{ window.print(); }, 50);
+}
+
 async function getSessionTimeoutMinutes(){
   const cfg = await db.get("apiConfig","security");
   return (cfg && cfg.sessionTimeoutMinutes) || DEFAULT_SESSION_TIMEOUT_MINUTES;
@@ -1976,6 +2003,8 @@ async function renderStaffShell(){
     tabContent = await renderFinancialStatementsTab();
   } else if(tab === "projections" && canManageFunds){
     tabContent = await renderProjectionsTab();
+  } else if(tab === "treasury" && canManageFunds){
+    tabContent = await renderTreasuryTab();
   } else if(tab === "bankrecon" && canManageFunds){
     tabContent = await renderBankReconTab();
   } else if(tab === "payrolldsa" && canManageFunds){
@@ -2060,6 +2089,7 @@ async function renderStaffShell(){
         ${canManageFunds ? `<button class="tab ${tab==='accounting'?'active':''}" data-tab="accounting">Accounting</button>`:""}
         ${canManageFunds ? `<button class="tab ${tab==='financialstatements'?'active':''}" data-tab="financialstatements">Financial Statements</button>`:""}
         ${canManageFunds ? `<button class="tab ${tab==='projections'?'active':''}" data-tab="projections">Projections</button>`:""}
+        ${canManageFunds ? `<button class="tab ${tab==='treasury'?'active':''}" data-tab="treasury">Treasury</button>`:""}
         ${canManageFunds ? `<button class="tab ${tab==='bankrecon'?'active':''}" data-tab="bankrecon">Bank Reconciliation</button>`:""}
         ${canManageFunds ? `<button class="tab ${tab==='payrolldsa'?'active':''}" data-tab="payrolldsa">Payroll &amp; DSA</button>`:""}
         <button class="tab ${tab==='shgrural'?'active':''}" data-tab="shgrural">SHG / Rural Finance</button>
@@ -2732,6 +2762,10 @@ function renderProductForm(product){
         ` : `<div class="field"><label>Status</label><div class="small muted" style="padding-top:8px;">Only Super Admin can activate a product. This saves as Draft.</div></div>`}
       </div>
 
+      <h3 class="section-h">Required Documents Checklist</h3>
+      <div class="field"><label>One document per line</label><textarea id="pf-required-docs" placeholder="Aadhaar Card&#10;PAN Card&#10;Business Proof&#10;Bank Statement (6 months)&#10;Photograph">${(p.requiredDocuments||[]).join("\n")}</textarea></div>
+      <p class="small muted" style="margin-top:-6px;">Shown as a checklist during Credit Appraisal for applications on this product.</p>
+
       ${isSuperAdmin ? `
       <h3 class="section-h">Straight-Through Processing (Rule Engine)</h3>
       <div class="warn-banner" style="background:#FBE7E8;border-color:var(--danger);color:#7A1F27;">⚠ Enabling this bypasses the human Maker-Checker approval your Credit Policy otherwise requires for this product — every auto-sanction is logged distinctly as machine-decided. Only Super Admin can turn this on.</div>
@@ -2886,6 +2920,7 @@ async function renderAppraisalForm(customers, leads){
       </div>
       <div class="field"><label>Collateral value, if secured (₹)</label><input id="af-collateral" type="number" placeholder="e.g. 200000"></div>
       <div id="ltv-check-box"></div>
+      <div id="doc-checklist-box"></div>
 
       <h3 class="section-h">Field Verification</h3>
       <div class="grid grid-2">
@@ -2977,6 +3012,66 @@ function renderCmaRatiosBlock(r){
   `;
 }
 
+async function generateAppraisalNoteHtml(a, cust, lead){
+  const nbfc = await getNbfcProfile();
+  const decAadhaar = maskAadhaar(await decryptField(cust.kyc.aadhaar));
+  const decPan = maskPAN(await decryptField(cust.kyc.pan));
+  const cmaR = a.cmaRatios || {};
+  return `
+    <div class="letterhead">
+      <div class="name">${esc(nbfc.name||"[NBFC Name Not Set]")}</div>
+      <div class="meta">${esc(nbfc.address||"")} ${nbfc.registrationNumber?" · RBI Reg. "+esc(nbfc.registrationNumber):""}</div>
+    </div>
+    <h1>Credit Appraisal Note</h1>
+    <table>
+      <tr><td><b>Applicant Name</b></td><td>${esc(cust.personal.name)}</td><td><b>Appraisal Date</b></td><td>${esc(a.appraisalDate)}</td></tr>
+      <tr><td><b>Mobile</b></td><td>${esc(cust.personal.mobile)}</td><td><b>Officer</b></td><td>${esc(a.officerName)}</td></tr>
+      <tr><td><b>Aadhaar</b></td><td class="mono">${decAadhaar}</td><td><b>PAN</b></td><td class="mono">${decPan}</td></tr>
+      <tr><td><b>Product Applied For</b></td><td>${esc(lead?.product||"—")}</td><td><b>Amount Requested</b></td><td>${lead?fmtINR(lead.amountRequested):"—"}</td></tr>
+    </table>
+
+    <h2>Field Verification</h2>
+    <table>
+      <tr><td style="width:25%;"><b>Business Verification</b></td><td>${esc(a.businessVerification)||"—"}</td></tr>
+      <tr><td><b>Residence Verification</b></td><td>${esc(a.residenceVerification)||"—"}</td></tr>
+      <tr><td><b>Neighbour Verification</b></td><td>${esc(a.neighbourVerification)||"—"}</td></tr>
+      <tr><td><b>Credit Bureau Report</b></td><td>${esc(a.creditBureauReport)||"—"}</td></tr>
+    </table>
+    ${a.documentChecklist && a.documentChecklist.length>0 ? `
+    <h2>Document Checklist</h2>
+    <table><tr>${a.documentChecklist.map(d=>`<td>${d.checked?'✓':'✗'} ${esc(d.name)}</td>`).join("")}</tr></table>` : ""}
+
+    <h2>Income &amp; Repayment Capacity</h2>
+    <table>
+      <tr><td style="width:25%;"><b>Income Assessment</b></td><td>${esc(a.incomeAssessment)||"—"}</td></tr>
+      <tr><td><b>Cash Flow Assessment</b></td><td>${esc(a.cashFlowAssessment)||"—"}</td></tr>
+      <tr><td><b>Household Expenses</b></td><td>${a.householdExpenses?fmtINR(a.householdExpenses):"—"}</td></tr>
+      <tr><td><b>Assessed Repayment Capacity</b></td><td>${a.repaymentCapacity?fmtINR(a.repaymentCapacity):"—"}</td></tr>
+      <tr><td><b>Collateral Value</b></td><td>${a.collateralValue?fmtINR(a.collateralValue):"—"}</td></tr>
+    </table>
+
+    ${cmaR.netWorth!==undefined ? `
+    <h2>Financial Ratios (CMA)</h2>
+    <table>
+      <tr><td><b>Net Worth</b></td><td>${fmtINR(cmaR.netWorth)}</td><td><b>Current Ratio</b></td><td>${cmaR.currentRatio!==null?cmaR.currentRatio.toFixed(2):"—"}</td></tr>
+      <tr><td><b>Debt-Equity Ratio</b></td><td>${cmaR.debtEquityRatio!==null?cmaR.debtEquityRatio.toFixed(2):"—"}</td><td><b>DSCR</b></td><td>${cmaR.dscr!==null?cmaR.dscr.toFixed(2):"—"}</td></tr>
+      <tr><td><b>FOIR</b></td><td>${cmaR.foirPct!==null?cmaR.foirPct.toFixed(1)+"%":"—"}</td><td><b>Proposed EMI</b></td><td>${fmtINR(cmaR.proposedEmi||0)}</td></tr>
+    </table>` : ""}
+
+    <h2>Risk Rating &amp; Recommendation</h2>
+    <table>
+      <tr><td style="width:25%;"><b>Risk Rating</b></td><td>${esc(a.riskRating)||"—"}</td></tr>
+      <tr><td><b>Officer's Recommendation</b></td><td><b>${esc(a.recommendation)||"—"}</b></td></tr>
+    </table>
+
+    <div class="sig-block">
+      <div class="sig-line">Appraising Officer<br>${esc(a.officerName)}</div>
+      <div class="sig-line">Approving Authority</div>
+    </div>
+    <p style="font-size:10.5px; color:#888; margin-top:30px;">Generated from NBFC LMS on ${fmtDate(nowISO())}. This note reflects data recorded in the system at the time of generation — cross-check against physical documents before relying on it for sanction.</p>
+  `;
+}
+
 async function renderAppraisalDetail(a, customers){
   if(!a) return `<div class="card">Appraisal not found.</div>`;
   const cust = customers.find(c=>c.id===a.customerId);
@@ -2998,7 +3093,10 @@ async function renderAppraisalDetail(a, customers){
     <div class="card">
       <div class="flex-between">
         <h2>Appraisal — ${esc(cust ? cust.personal.name : "Unknown customer")}</h2>
-        <button class="btn btn-outline btn-sm" id="btn-back-to-appraisals">← Back to list</button>
+        <div class="action-row">
+          <button class="btn btn-gold btn-sm" id="btn-generate-appraisal-note" data-appraisal="${a.id}">Generate Appraisal Note (PDF)</button>
+          <button class="btn btn-outline btn-sm" id="btn-back-to-appraisals">← Back to list</button>
+        </div>
       </div>
       <div class="grid grid-3">
         <div><div class="field"><label>Officer</label><div>${esc(a.officerName)}</div></div></div>
@@ -3008,6 +3106,11 @@ async function renderAppraisalDetail(a, customers){
       ${custScore!==null ? `
       <div class="warn-banner" style="background:${custScore>=minCibil?'#E4F3E8':'#FBE7E8'};border-color:${custScore>=minCibil?'var(--ok)':'var(--danger)'};color:${custScore>=minCibil?'#1D4E33':'#7A1F27'};">
         ${custScore>=minCibil?'✓':'⚠'} Credit score ${custScore} — Credit Policy minimum is ${minCibil}. ${custScore>=minCibil?'Meets the minimum.':'Below the policy minimum — a deviation, if approved, should be explicitly noted.'}
+      </div>` : ""}
+      ${a.documentChecklist && a.documentChecklist.length>0 ? `
+      <h3 class="section-h">Document Checklist</h3>
+      <div class="grid grid-3">
+        ${a.documentChecklist.map(d=>`<div class="small">${d.checked?'✅':'⬜'} ${esc(d.name)}</div>`).join("")}
       </div>` : ""}
       <h3 class="section-h">Field Verification</h3>
       <p><b>Business:</b> ${esc(a.businessVerification)||"—"}</p>
@@ -3558,6 +3661,37 @@ function renderLoanAccountsList(loanAccounts, customers){
   `;
 }
 
+async function generateLegalNoticeHtml(acc, cust, dpd, noticeType){
+  const nbfc = await getNbfcProfile();
+  const classification = classifyDPD(dpd);
+  const isFinal = noticeType==="final";
+  return `
+    <div class="letterhead">
+      <div class="name">${esc(nbfc.name||"[NBFC Name Not Set]")}</div>
+      <div class="meta">${esc(nbfc.address||"")} ${nbfc.registrationNumber?" · RBI Reg. "+esc(nbfc.registrationNumber):""}</div>
+    </div>
+    <h1>${isFinal ? "Final Notice Before Legal Action" : "Demand Notice"}</h1>
+    <p>Date: ${fmtDate(nowISO())}</p>
+    <p>To,<br>${esc(cust.personal.name)}<br>${esc(cust.address?.current||"")}</p>
+    <p>Subject: ${isFinal?"Final demand for":"Demand for"} repayment of outstanding dues — Loan Account ${esc(acc.accountNumber)}</p>
+    <table>
+      <tr><td><b>Loan Account No.</b></td><td>${esc(acc.accountNumber)}</td><td><b>Product</b></td><td>${esc(acc.product)}</td></tr>
+      <tr><td><b>Principal Outstanding</b></td><td>${fmtINR(acc.principalOutstanding)}</td><td><b>Days Past Due</b></td><td>${dpd}</td></tr>
+      <tr><td><b>Classification</b></td><td>${esc(classification)}</td><td><b>Disbursed On</b></td><td>${esc(acc.disbursedDate)}</td></tr>
+    </table>
+    <p>Dear ${esc(cust.personal.name)},</p>
+    <p>This is to bring to your notice that your above loan account is overdue by <b>${dpd} days</b>, with a principal outstanding of <b>${fmtINR(acc.principalOutstanding)}</b> as on ${todayStr()}, despite reminders sent to you.</p>
+    ${isFinal ? `
+    <p><b>This is a FINAL notice.</b> You are hereby called upon to clear the entire outstanding dues within <b>15 days</b> from the date of this notice, failing which this Company shall be constrained to initiate appropriate legal proceedings for recovery, including but not limited to civil recovery action, without any further notice to you, and shall also report this default to Credit Information Companies (CIBIL/Experian/CRIF), which may adversely affect your credit standing.</p>` : `
+    <p>You are requested to clear the entire outstanding dues within <b>7 days</b> from the date of this notice. Please treat this as urgent, and contact your nearest branch or the undersigned immediately to discuss repayment or, if applicable, restructuring of your account.</p>`}
+    <p>Please ignore this notice if you have already made the payment.</p>
+    <div class="sig-block">
+      <div class="sig-line">For ${esc(nbfc.name||"the Company")}<br>Authorized Signatory</div>
+    </div>
+    <p style="font-size:10.5px; color:#888; margin-top:30px;">Generated from NBFC LMS on ${fmtDate(nowISO())}. This is a system-generated draft — have it reviewed by legal counsel before sending, especially for the Final Notice, which references potential legal consequences.</p>
+  `;
+}
+
 async function renderLoanAccountDetail(acc, customers){
   if(!acc) return `<div class="card">Loan account not found.</div>`;
   const cust = customers.find(c=>c.id===acc.customerId);
@@ -3566,11 +3700,14 @@ async function renderLoanAccountDetail(acc, customers){
   const totalPaid = payments.reduce((s,p)=>s+p.amount,0);
   const canCorrect = ["Super Admin","Credit Manager"].includes(session.user.role);
   const showCorrectForm = session.showCorrectLoanForm;
+  const dpd = computeDPD(acc);
   return `
     <div class="card">
       <div class="flex-between">
         <h2>Loan Account — ${esc(cust?cust.personal.name:'')} <span class="small mono muted">(${esc(acc.accountNumber)||acc.id})</span></h2>
         <div class="action-row">
+          ${dpd>0 ? `<button class="btn btn-outline btn-sm generate-legal-notice-btn" data-loan="${acc.id}" data-type="demand">Demand Notice</button>` : ""}
+          ${dpd>60 ? `<button class="btn btn-danger btn-sm generate-legal-notice-btn" data-loan="${acc.id}" data-type="final">Final Notice</button>` : ""}
           ${canCorrect ? `<button class="btn btn-outline btn-sm" id="btn-open-correct-loan">Correct Terms</button>` : ""}
           <button class="btn btn-outline btn-sm" id="btn-back-to-loans">← Back to list</button>
         </div>
@@ -4260,6 +4397,134 @@ async function computeProjections(){
   return { assumptions: a, current, years };
 }
 
+const ALM_BUCKETS = [
+  {label:"1–30 days", minDays:0, maxDays:30},
+  {label:"31–90 days", minDays:31, maxDays:90},
+  {label:"3–6 months", minDays:91, maxDays:182},
+  {label:"6–12 months", minDays:183, maxDays:365},
+  {label:"1–3 years", minDays:366, maxDays:1095},
+  {label:"3–5 years", minDays:1096, maxDays:1825},
+  {label:"Over 5 years", minDays:1826, maxDays:Infinity},
+];
+function daysFromToday(dateStr){
+  return Math.round((new Date(dateStr) - new Date(todayStr())) / (1000*60*60*24));
+}
+
+async function computeTreasuryMetrics(){
+  const [loanAccounts, bankBorrowings, staff, sanctions] = await Promise.all([
+    db.getAll("loanAccounts"), db.getAll("bankBorrowings"), db.getAll("staff"), db.getAll("sanctions")
+  ]);
+  const acct = await computeAccountingSummary();
+
+  // ALM: assets = future scheduled principal inflows; liabilities =
+  // borrowings assumed to mature (bullet repayment) at sanctionDate +
+  // tenureMonths — a simplification, since individual repayment
+  // schedules for borrowings aren't tracked in this app.
+  const assetBuckets = ALM_BUCKETS.map(b=>({...b, amount:0}));
+  loanAccounts.filter(a=>a.status==="Active").forEach(acc=>{
+    (acc.schedule||[]).filter(i=>i.status!=="Paid").forEach(inst=>{
+      const d = Math.max(0, daysFromToday(inst.dueDate)); // overdue installments are treated as immediately due, not excluded
+      const bucket = assetBuckets.find(b=>d>=b.minDays && d<=b.maxDays);
+      if(bucket) bucket.amount += inst.principalComponent;
+    });
+  });
+  const liabilityBuckets = ALM_BUCKETS.map(b=>({...b, amount:0}));
+  bankBorrowings.filter(b=>b.status==="Active" && b.tenureMonths).forEach(b=>{
+    const maturityDate = new Date(b.sanctionDate);
+    maturityDate.setMonth(maturityDate.getMonth()+b.tenureMonths);
+    const d = daysFromToday(maturityDate.toISOString().slice(0,10));
+    const bucket = liabilityBuckets.find(x=>d>=x.minDays && d<=x.maxDays);
+    if(bucket) bucket.amount += (b.affectsFundBalance ? b.sanctionedAmount : (b.utilizedAmount||0));
+  });
+
+  // Cost of funds & interest spread
+  const totalBorrowings = bankBorrowings.filter(b=>b.status==="Active").reduce((s,b)=> s+(b.affectsFundBalance?b.sanctionedAmount:(b.utilizedAmount||0)), 0);
+  const financeCosts = sumJournalByCategory(acct.journalEntries, ["Interest on Borrowings"]);
+  const costOfFunds = totalBorrowings>0 ? (financeCosts/totalBorrowings)*100 : 0;
+  const activeLoans = loanAccounts.filter(a=>a.status==="Active");
+  const totalPortfolio = activeLoans.reduce((s,a)=>s+a.principalOutstanding,0);
+  const yieldOnAdvances = totalPortfolio>0 ? (acct.interestIncome/totalPortfolio)*100 : 0;
+  const interestSpread = yieldOnAdvances - costOfFunds;
+
+  // Product-wise profitability: income allocated by each product's
+  // share of the loan book, less its share of NPA provisioning.
+  const byProduct = {};
+  activeLoans.forEach(a=>{ byProduct[a.product] = byProduct[a.product] || {outstanding:0}; byProduct[a.product].outstanding += a.principalOutstanding; });
+  Object.keys(byProduct).forEach(p=>{
+    const share = totalPortfolio>0 ? byProduct[p].outstanding/totalPortfolio : 0;
+    byProduct[p].allocatedIncome = acct.interestIncome*share;
+    byProduct[p].allocatedProvisioning = acct.npaProvision*share;
+    byProduct[p].netContribution = byProduct[p].allocatedIncome - byProduct[p].allocatedProvisioning;
+  });
+
+  // Branch-wise: approximated via the disbursing officer's branch —
+  // this app doesn't tag a fixed branch code directly on the loan
+  // account itself, so treat this as directional, not exact.
+  const staffBranchByName = Object.fromEntries(staff.map(s=>[s.name, s.branch]));
+  const byBranch = {};
+  activeLoans.forEach(a=>{
+    const branch = staffBranchByName[a.createdBy] || "Unassigned";
+    byBranch[branch] = byBranch[branch] || {outstanding:0, count:0};
+    byBranch[branch].outstanding += a.principalOutstanding;
+    byBranch[branch].count += 1;
+  });
+
+  return { assetBuckets, liabilityBuckets, costOfFunds, yieldOnAdvances, interestSpread, byProduct, byBranch, totalBorrowings, totalPortfolio };
+}
+
+async function renderTreasuryTab(){
+  const t = await computeTreasuryMetrics();
+  return `
+    <div class="card">
+      <h2>Treasury &amp; Finance</h2>
+      <p class="sub">Cost of funds, interest spread, and a simplified maturity-ladder view of assets vs. liabilities.</p>
+      <div class="warn-banner" style="background:#FBF1DC;border-color:var(--gold);color:#5C4200;">⚠ The ALM statement assumes each borrowing repays in full (bullet) at the end of its tenure, since individual repayment schedules for borrowings aren't tracked separately in this app — treat the liability side as directional, not a precise regulatory ALM return. Branch figures are approximated via the disbursing officer's assigned branch, not a fixed branch code on the loan itself.</div>
+      <div class="grid grid-3">
+        <div class="kpi"><div class="lbl">Cost of Funds</div><div class="val" style="font-size:18px;">${t.costOfFunds.toFixed(2)}%</div></div>
+        <div class="kpi"><div class="lbl">Yield on Advances</div><div class="val" style="font-size:18px;">${t.yieldOnAdvances.toFixed(2)}%</div></div>
+        <div class="kpi"><div class="lbl">Interest Spread</div><div class="val" style="font-size:18px;">${t.interestSpread.toFixed(2)}%</div></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2 style="font-size:16px;">ALM — Structural Liquidity Statement (Simplified)</h2>
+      <table>
+        <thead><tr><th>Bucket</th><th>Assets (Loan Inflows)</th><th>Liabilities (Borrowing Maturities)</th><th>Gap</th></tr></thead>
+        <tbody>
+        ${t.assetBuckets.map((b,i)=>{
+          const liab = t.liabilityBuckets[i].amount;
+          const gap = b.amount - liab;
+          return `<tr><td>${b.label}</td><td>${fmtINR(Math.round(b.amount))}</td><td>${fmtINR(Math.round(liab))}</td><td style="color:${gap<0?'var(--danger)':'inherit'};">${fmtINR(Math.round(gap))}</td></tr>`;
+        }).join("")}
+        </tbody>
+      </table>
+    </div>
+
+    <div class="grid grid-2">
+      <div class="card">
+        <h2 style="font-size:16px;">Product-wise Profitability</h2>
+        <table>
+          <thead><tr><th>Product</th><th>Outstanding</th><th>Allocated Income</th><th>Net Contribution</th></tr></thead>
+          <tbody>
+          ${Object.entries(t.byProduct).length===0 ? `<tr class="empty-row"><td colspan="4">No active portfolio yet.</td></tr>` :
+            Object.entries(t.byProduct).sort((a,b)=>b[1].outstanding-a[1].outstanding).map(([name,d])=>`<tr><td>${esc(name)}</td><td>${fmtINR(Math.round(d.outstanding))}</td><td>${fmtINR(Math.round(d.allocatedIncome))}</td><td>${fmtINR(Math.round(d.netContribution))}</td></tr>`).join("")}
+          </tbody>
+        </table>
+      </div>
+      <div class="card">
+        <h2 style="font-size:16px;">Branch-wise Portfolio <span class="small muted">(approximated)</span></h2>
+        <table>
+          <thead><tr><th>Branch</th><th>Accounts</th><th>Outstanding</th></tr></thead>
+          <tbody>
+          ${Object.entries(t.byBranch).length===0 ? `<tr class="empty-row"><td colspan="3">No active portfolio yet.</td></tr>` :
+            Object.entries(t.byBranch).sort((a,b)=>b[1].outstanding-a[1].outstanding).map(([name,d])=>`<tr><td>${esc(name)}</td><td>${d.count}</td><td>${fmtINR(Math.round(d.outstanding))}</td></tr>`).join("")}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  `;
+}
+
 async function renderProjectionsTab(){
   const proj = await computeProjections();
   const a = proj.assumptions;
@@ -4666,10 +4931,100 @@ async function renderRatiosComplianceTab(){
     ${await renderRbiReturnsSection()}
 
     ${await renderDocumentRegisterSection()}
+
+    ${await renderRcmSection()}
+
+    ${await renderAuditObservationsSection()}
   `;
 }
 
 const DOCUMENT_CATEGORIES = ["NBFC Registration / License","Insurance (Office/Staff)","Statutory Auditor Appointment","DSA / Vendor Agreement","Lease / Rental Agreement","Staff Certification","Other"];
+
+const RCM_CATEGORIES = ["Credit Risk","Operational Risk","Compliance Risk","Liquidity Risk","Fraud Risk","IT/Data Security","Other"];
+const TEST_FREQUENCIES = ["Monthly","Quarterly","Half-Yearly","Annually"];
+const TEST_RESULTS = ["Not Yet Tested","Effective","Partially Effective","Ineffective"];
+
+async function renderRcmSection(){
+  const items = await db.getAll("rcmItems");
+  const showForm = session.showRcmForm;
+  return `
+    <div class="card">
+      <div class="flex-between">
+        <div><h2 style="font-size:16px;">Risk Control Matrix</h2><p class="sub" style="margin-bottom:0;">Pair each key risk with the control meant to mitigate it, who owns testing it, and how it last performed. A working RCM is standard evidence for both internal and statutory audit.</p></div>
+        <button class="btn btn-gold btn-sm" id="btn-open-rcm-form">+ Add Risk-Control Pair</button>
+      </div>
+      ${showForm ? `
+      <div class="grid grid-3">
+        <div class="field"><label>Risk category</label><select id="rcm-category">${RCM_CATEGORIES.map(c=>`<option>${c}</option>`).join("")}</select></div>
+        <div class="field"><label>Control owner</label><input id="rcm-owner" placeholder="e.g. Branch Manager"></div>
+        <div class="field"><label>Test frequency</label><select id="rcm-frequency">${TEST_FREQUENCIES.map(f=>`<option>${f}</option>`).join("")}</select></div>
+      </div>
+      <div class="field"><label>Risk description</label><textarea id="rcm-risk" placeholder="e.g. Disbursement to a customer who fails KYC checks"></textarea></div>
+      <div class="field"><label>Control description</label><textarea id="rcm-control" placeholder="e.g. Maker-checker on every sanction; KYC duplicate check at customer creation"></textarea></div>
+      <button class="btn btn-gold btn-sm" id="btn-save-rcm">Save</button>
+      ` : ""}
+      <table style="margin-top:10px;">
+        <thead><tr><th>Category</th><th>Risk</th><th>Control</th><th>Owner</th><th>Frequency</th><th>Last Result</th><th></th></tr></thead>
+        <tbody>
+        ${items.length===0 ? `<tr class="empty-row"><td colspan="7">No risk-control pairs recorded yet.</td></tr>` :
+          items.map(i=>`
+          <tr>
+            <td>${esc(i.category)}</td><td>${esc(i.risk)}</td><td>${esc(i.control)}</td><td>${esc(i.owner)}</td><td>${esc(i.frequency)}</td>
+            <td><select class="rcm-result-select" data-rcm="${i.id}">${TEST_RESULTS.map(r=>`<option ${i.lastResult===r?'selected':''}>${r}</option>`).join("")}</select></td>
+            <td><button class="btn btn-danger btn-sm delete-rcm-btn" data-rcm="${i.id}">Delete</button></td>
+          </tr>`).join("")}
+        </tbody>
+      </table>
+    </div>
+  `;
+}
+
+const OBSERVATION_SEVERITIES = ["Low","Medium","High","Critical"];
+const OBSERVATION_STATUSES = ["Open","In Progress","Closed"];
+
+async function renderAuditObservationsSection(){
+  const items = await db.getAll("auditObservations");
+  const showForm = session.showAuditObsForm;
+  const openCount = items.filter(i=>i.status!=="Closed").length;
+  return `
+    <div class="card">
+      <div class="flex-between">
+        <div><h2 style="font-size:16px;">Internal Audit Observations</h2><p class="sub" style="margin-bottom:0;">Log findings from internal, concurrent, or statutory audits, with an action plan, owner, and target date — tracked through to closure.</p></div>
+        <div class="action-row">
+          ${openCount>0 ? `<span class="badge badge-progress">${openCount} Open</span>` : `<span class="badge badge-approved">All Closed</span>`}
+          <button class="btn btn-gold btn-sm" id="btn-open-audit-obs-form">+ Log Observation</button>
+        </div>
+      </div>
+      ${showForm ? `
+      <div class="grid grid-3">
+        <div class="field"><label>Department/Area</label><input id="ao-department" placeholder="e.g. Branch Operations"></div>
+        <div class="field"><label>Severity</label><select id="ao-severity">${OBSERVATION_SEVERITIES.map(s=>`<option>${s}</option>`).join("")}</select></div>
+        <div class="field"><label>Target date</label><input id="ao-target-date" type="date"></div>
+        <div class="field"><label>Responsible person</label><input id="ao-responsible" placeholder="e.g. Ramesh Kulkarni"></div>
+      </div>
+      <div class="field"><label>Observation</label><textarea id="ao-observation" placeholder="What was found"></textarea></div>
+      <div class="field"><label>Action plan</label><textarea id="ao-action-plan" placeholder="What will be done to fix it"></textarea></div>
+      <button class="btn btn-gold btn-sm" id="btn-save-audit-obs">Save</button>
+      ` : ""}
+      <table style="margin-top:10px;">
+        <thead><tr><th>Department</th><th>Observation</th><th>Severity</th><th>Target</th><th>Owner</th><th>Status</th><th></th></tr></thead>
+        <tbody>
+        ${items.length===0 ? `<tr class="empty-row"><td colspan="7">No observations logged yet.</td></tr>` :
+          items.map(i=>`
+          <tr>
+            <td>${esc(i.department)}</td><td>${esc(i.observation)}</td>
+            <td><span class="badge ${i.severity==='Critical'||i.severity==='High'?'badge-rejected':i.severity==='Medium'?'badge-progress':'badge-approved'}">${esc(i.severity)}</span></td>
+            <td>${i.targetDate||"—"}</td><td>${esc(i.responsible)||"—"}</td>
+            <td><select class="audit-obs-status-select" data-obs="${i.id}">${OBSERVATION_STATUSES.map(s=>`<option ${i.status===s?'selected':''}>${s}</option>`).join("")}</select></td>
+            <td><button class="btn btn-danger btn-sm delete-audit-obs-btn" data-obs="${i.id}">Delete</button></td>
+          </tr>`).join("")}
+        </tbody>
+      </table>
+    </div>
+  `;
+}
+
+
 
 async function renderDocumentRegisterSection(){
   const docs = await db.getAll("documentRegister");
@@ -6321,6 +6676,8 @@ function bindEvents(){
   if(openNewAppraisal) openNewAppraisal.onclick = ()=>{ session.appraisalSubview="new"; resetAppraisalDraft(); render(); };
   const cancelAppraisal = document.getElementById("btn-cancel-appraisal");
   if(cancelAppraisal) cancelAppraisal.onclick = ()=>{ session.appraisalSubview="list"; render(); };
+  const generateAppraisalNoteBtn = document.getElementById("btn-generate-appraisal-note");
+  if(generateAppraisalNoteBtn) generateAppraisalNoteBtn.onclick = ()=> handleGenerateAppraisalNote(generateAppraisalNoteBtn.dataset.appraisal);
   const backToAppraisals = document.getElementById("btn-back-to-appraisals");
   if(backToAppraisals) backToAppraisals.onclick = ()=>{ session.appraisalSubview="list"; render(); };
   document.querySelectorAll(".view-appraisal-btn").forEach(btn=>{
@@ -6338,6 +6695,7 @@ function bindEvents(){
     const update = ()=> updateLtvCheck();
     afCollateral.oninput = update; afLead.onchange = update;
   }
+  if(afLead){ afLead.addEventListener("change", updateDocChecklist); updateDocChecklist(); }
   const afRisk = document.getElementById("af-risk");
   if(afRisk){ afRisk.onchange = updatePricingHint; updatePricingHint(); }
 
@@ -6398,6 +6756,7 @@ function bindEvents(){
   document.querySelectorAll(".view-loan-btn").forEach(btn=> btn.onclick = ()=>{ session.loanSubview="view"; session.viewingLoanId=btn.dataset.loan; render(); });
   const backToLoans = document.getElementById("btn-back-to-loans");
   if(backToLoans) backToLoans.onclick = ()=>{ session.loanSubview="list"; render(); };
+  document.querySelectorAll(".generate-legal-notice-btn").forEach(btn=> btn.onclick = ()=> handleGenerateLegalNotice(btn.dataset.loan, btn.dataset.type));
   const openCorrectLoan = document.getElementById("btn-open-correct-loan");
   if(openCorrectLoan) openCorrectLoan.onclick = ()=>{ session.showCorrectLoanForm=true; render(); };
   const cancelCorrectLoan = document.getElementById("btn-cancel-correct-loan");
@@ -6574,6 +6933,18 @@ function bindEvents(){
   const addRbiFilingBtn = document.getElementById("btn-add-rbi-filing");
   const addDocumentBtn = document.getElementById("btn-add-document");
   if(addDocumentBtn) addDocumentBtn.onclick = handleAddDocument;
+  const openRcmFormBtn = document.getElementById("btn-open-rcm-form");
+  if(openRcmFormBtn) openRcmFormBtn.onclick = ()=>{ session.showRcmForm = !session.showRcmForm; render(); };
+  const saveRcmBtn = document.getElementById("btn-save-rcm");
+  if(saveRcmBtn) saveRcmBtn.onclick = handleSaveRcm;
+  document.querySelectorAll(".delete-rcm-btn").forEach(btn=> btn.onclick = ()=> handleDeleteRcm(btn.dataset.rcm));
+  document.querySelectorAll(".rcm-result-select").forEach(sel=> sel.onchange = ()=> handleUpdateRcmResult(sel.dataset.rcm, sel.value));
+  const openAuditObsFormBtn = document.getElementById("btn-open-audit-obs-form");
+  if(openAuditObsFormBtn) openAuditObsFormBtn.onclick = ()=>{ session.showAuditObsForm = !session.showAuditObsForm; render(); };
+  const saveAuditObsBtn = document.getElementById("btn-save-audit-obs");
+  if(saveAuditObsBtn) saveAuditObsBtn.onclick = handleSaveAuditObservation;
+  document.querySelectorAll(".delete-audit-obs-btn").forEach(btn=> btn.onclick = ()=> handleDeleteAuditObservation(btn.dataset.obs));
+  document.querySelectorAll(".audit-obs-status-select").forEach(sel=> sel.onchange = ()=> handleUpdateAuditObsStatus(sel.dataset.obs, sel.value));
   document.querySelectorAll(".delete-document-btn").forEach(btn=> btn.onclick = ()=> handleDeleteDocument(btn.dataset.doc));
   if(addRbiFilingBtn) addRbiFilingBtn.onclick = handleAddRbiFiling;
   document.querySelectorAll(".mark-rbi-submitted-btn").forEach(btn=>{
@@ -6737,6 +7108,7 @@ async function handleSaveProduct(){
     rules: isSuperAdmin ? rules : (existingId ? undefined : []),
     autoSanctionEnabled: isSuperAdmin ? autoSanctionEnabled : undefined,
     dsaCommissionPct: dsaCommissionPct,
+    requiredDocuments: document.getElementById("pf-required-docs").value.split("\n").map(s=>s.trim()).filter(Boolean),
     createdAt: nowISO()
   };
   if(existingId && !isSuperAdmin){
@@ -6854,6 +7226,25 @@ function handleAppraisalCaptureGPS(){
   );
 }
 
+async function updateDocChecklist(){
+  const box = document.getElementById("doc-checklist-box");
+  if(!box) return;
+  const leadId = document.getElementById("af-lead").value;
+  if(!leadId){ box.innerHTML=""; return; }
+  const lead = await db.get("leads", leadId);
+  if(!lead){ box.innerHTML=""; return; }
+  const product = (await db.getAll("products")).find(p=>p.name===lead.product);
+  const docs = product?.requiredDocuments || [];
+  if(docs.length===0){ box.innerHTML=""; return; }
+  box.innerHTML = `
+    <div class="field"><label>Document Checklist — ${esc(lead.product)}</label>
+      <div style="border:1px solid var(--line); border-radius:8px; padding:10px;">
+        ${docs.map((d,i)=>`<label style="display:block; margin-bottom:6px; font-weight:400; text-transform:none; font-size:13px;"><input type="checkbox" class="af-doc-check" data-doc="${esc(d)}" style="width:auto; margin-right:8px;"> ${esc(d)}</label>`).join("")}
+      </div>
+    </div>
+  `;
+}
+
 async function updateLtvCheck(){
   const box = document.getElementById("ltv-check-box");
   if(!box) return;
@@ -6878,6 +7269,27 @@ async function updatePricingHint(){
   const policy = (await db.get("policyConfig","default")) || defaultPolicyConfig();
   const band = policy.pricing.find(p=>p.riskCategory===riskEl.value);
   el.textContent = band ? `Indicative pricing per Credit Policy for ${riskEl.value} risk: ${band.minRate}% – ${band.maxRate}% p.a.` : "";
+}
+
+async function handleGenerateLegalNotice(loanId, noticeType){
+  const acc = await db.get("loanAccounts", loanId);
+  if(!acc) return;
+  const cust = await db.get("customers", acc.customerId);
+  if(!cust){ toast("Customer record not found."); return; }
+  const dpd = computeDPD(acc);
+  const html = await generateLegalNoticeHtml(acc, cust, dpd, noticeType);
+  printDocument(html);
+  await logAudit(session.user.name, session.user.role, "Legal Notice Generated", `${cust.personal.name} — ${acc.accountNumber} — ${noticeType==='final'?'Final Notice':'Demand Notice'}`);
+}
+
+async function handleGenerateAppraisalNote(appraisalId){
+  const a = await db.get("appraisals", appraisalId);
+  if(!a) return;
+  const cust = await db.get("customers", a.customerId);
+  if(!cust){ toast("Customer record not found."); return; }
+  const lead = a.leadId ? await db.get("leads", a.leadId) : null;
+  const html = await generateAppraisalNoteHtml(a, cust, lead);
+  printDocument(html);
 }
 
 async function handleSaveAppraisal(){
@@ -6919,6 +7331,7 @@ async function handleSaveAppraisal(){
     householdExpenses: Number(document.getElementById("af-hh-expenses").value)||null,
     repaymentCapacity: Number(document.getElementById("af-repayment-capacity").value)||null,
     cma, cmaRatios,
+    documentChecklist: Array.from(document.querySelectorAll(".af-doc-check")).map(el=>({name: el.dataset.doc, checked: el.checked})),
     riskRating: document.getElementById("af-risk").value,
     recommendation: document.getElementById("af-recommendation").value,
     photoBase64: appraisalDraft.photoBase64,
@@ -8264,6 +8677,73 @@ async function handleDedupeCompliance(){
 /* ---------------------------------------------------------------------
    RBI Returns Tracker
    --------------------------------------------------------------------- */
+async function handleSaveRcm(){
+  const u = session.user;
+  const risk = document.getElementById("rcm-risk").value.trim();
+  const control = document.getElementById("rcm-control").value.trim();
+  if(!risk || !control){ toast("Enter both a risk and a control description."); return; }
+  await db.put("rcmItems", {
+    id: uid("rcm"), category: document.getElementById("rcm-category").value, risk, control,
+    owner: document.getElementById("rcm-owner").value.trim(), frequency: document.getElementById("rcm-frequency").value,
+    lastResult: "Not Yet Tested", createdAt: nowISO(), createdBy: u.name
+  });
+  await logAudit(u.name, u.role, "RCM Entry Added", risk);
+  toast("Saved.");
+  session.showRcmForm = false;
+  render();
+}
+async function handleDeleteRcm(id){
+  const u = session.user;
+  if(!window.confirm("Delete this risk-control pair?")) return;
+  await db.delete("rcmItems", id);
+  await logAudit(u.name, u.role, "RCM Entry Removed", id);
+  toast("Removed.");
+  render();
+}
+async function handleUpdateRcmResult(id, result){
+  const u = session.user;
+  const item = await db.get("rcmItems", id);
+  if(!item) return;
+  item.lastResult = result; item.lastTestedAt = nowISO(); item.lastTestedBy = u.name;
+  await db.put("rcmItems", item);
+  await logAudit(u.name, u.role, "RCM Test Result Updated", `${item.risk} — ${result}`);
+  render();
+}
+
+async function handleSaveAuditObservation(){
+  const u = session.user;
+  const observation = document.getElementById("ao-observation").value.trim();
+  if(!observation){ toast("Enter the observation."); return; }
+  await db.put("auditObservations", {
+    id: uid("aob"), department: document.getElementById("ao-department").value.trim(), observation,
+    severity: document.getElementById("ao-severity").value, actionPlan: document.getElementById("ao-action-plan").value.trim(),
+    responsible: document.getElementById("ao-responsible").value.trim(), targetDate: document.getElementById("ao-target-date").value,
+    status: "Open", createdAt: nowISO(), createdBy: u.name
+  });
+  await logAudit(u.name, u.role, "Audit Observation Logged", observation);
+  toast("Saved.");
+  session.showAuditObsForm = false;
+  render();
+}
+async function handleDeleteAuditObservation(id){
+  const u = session.user;
+  if(!window.confirm("Delete this audit observation?")) return;
+  await db.delete("auditObservations", id);
+  await logAudit(u.name, u.role, "Audit Observation Removed", id);
+  toast("Removed.");
+  render();
+}
+async function handleUpdateAuditObsStatus(id, status){
+  const u = session.user;
+  const item = await db.get("auditObservations", id);
+  if(!item) return;
+  item.status = status;
+  if(status==="Closed"){ item.closedAt = nowISO(); item.closedBy = u.name; }
+  await db.put("auditObservations", item);
+  await logAudit(u.name, u.role, "Audit Observation Status Updated", `${item.observation} — ${status}`);
+  render();
+}
+
 async function handleAddDocument(){
   const u = session.user;
   const name = document.getElementById("dr-name").value.trim();
