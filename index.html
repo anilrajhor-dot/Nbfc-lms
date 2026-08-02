@@ -858,7 +858,7 @@ const ALL_COLLECTIONS = [
   "recoveryVisits","apiConfig","aiConfig","nbfcProfile","categoryConfig","journalEntries","complianceItems","rbiReturnFilings",
   "staffSalaries","payrollRuns","dsaAgents","dsaCommissions",
   "shgGroups","shgMembers","shgSavings","shgInternalLoans","microEnterpriseTemplates",
-  "bankStatementLines","bankBorrowings","fixedAssets","projectionAssumptions","documentRegister","rcmItems","auditObservations",
+  "bankStatementLines","bankBorrowings","fixedAssets","projectionAssumptions","documentRegister","rcmItems","auditObservations","escalationRules","holidayCalendar",
   "auditLog","meta"
 ];
 
@@ -5400,7 +5400,12 @@ const REPORT_DEFS = [
   {id:"ageing-report", label:"Ageing Report (DPD Buckets)"},
   {id:"product-wise", label:"Product-wise Report"},
   {id:"officer-wise", label:"Officer-wise Report (Collections)"},
+  {id:"staff-productivity", label:"Staff Productivity Report"},
+  {id:"dsa-performance", label:"DSA Performance Report"},
+  {id:"branch-performance", label:"Branch Performance Report (approximated)"},
   {id:"daily-collection", label:"Daily Collection Report"},
+  {id:"daily-mis", label:"Daily MIS"},
+  {id:"monthly-mis", label:"Monthly MIS"},
   {id:"income-report", label:"Income Report"},
   {id:"fund-liquidity", label:"Fund Position / Liquidity Report"},
 ];
@@ -5451,6 +5456,80 @@ async function buildReport(reportId){
     payments.forEach(p=>{ byOfficer[p.collectedBy] = byOfficer[p.collectedBy] || {count:0, amount:0}; byOfficer[p.collectedBy].count++; byOfficer[p.collectedBy].amount += p.amount; });
     return { headers:["Officer","Collections Count","Amount Collected"], rows: Object.entries(byOfficer).map(([k,v])=>[k, v.count, fmtINR(v.amount)]) };
   }
+  if(reportId==="staff-productivity"){
+    const appraisals = await db.getAll("appraisals");
+    const sanctions = await db.getAll("sanctions");
+    const byStaff = {};
+    staff.forEach(s=>{ byStaff[s.name] = {appraisals:0, sanctions:0, disbursements:0, collections:0, collectionAmount:0}; });
+    appraisals.forEach(a=>{ if(byStaff[a.officerName]) byStaff[a.officerName].appraisals++; });
+    sanctions.filter(s=>s.status==="Approved").forEach(s=>{ if(byStaff[s.approvedBy]) byStaff[s.approvedBy].sanctions++; });
+    loanAccounts.forEach(a=>{ if(byStaff[a.createdBy]) byStaff[a.createdBy].disbursements++; });
+    payments.forEach(p=>{ if(byStaff[p.collectedBy]){ byStaff[p.collectedBy].collections++; byStaff[p.collectedBy].collectionAmount += p.amount; } });
+    return { headers:["Staff","Appraisals Done","Sanctions Approved","Disbursements Processed","Collections Made","Amount Collected"],
+      rows: Object.entries(byStaff).filter(([k,v])=>v.appraisals+v.sanctions+v.disbursements+v.collections>0).map(([k,v])=>[k, v.appraisals, v.sanctions, v.disbursements, v.collections, fmtINR(v.collectionAmount)]) };
+  }
+  if(reportId==="dsa-performance"){
+    const dsaAgents = await db.getAll("dsaAgents");
+    const leads = await db.getAll("leads");
+    const dsaCommissions = await db.getAll("dsaCommissions");
+    return { headers:["DSA","Leads Sourced","Loans Disbursed","Commission Accrued","Commission Paid"],
+      rows: dsaAgents.map(d=>{
+        const leadsSourced = leads.filter(l=>l.dsaId===d.id).length;
+        // Commission accrues exactly once per disbursement tied to this
+        // DSA, so its count is an accurate stand-in for loans disbursed.
+        const commissions = dsaCommissions.filter(c=>c.dsaId===d.id);
+        const accrued = commissions.reduce((s,c)=>s+c.commissionAmount,0);
+        const paid = commissions.filter(c=>c.status==="Paid").reduce((s,c)=>s+c.commissionAmount,0);
+        return [d.name, leadsSourced, commissions.length, fmtINR(accrued), fmtINR(paid)];
+      }) };
+  }
+  if(reportId==="branch-performance"){
+    const staffBranchByName = Object.fromEntries(staff.map(s=>[s.name, s.branch]));
+    const byBranch = {};
+    loanAccounts.filter(a=>a.status==="Active").forEach(a=>{
+      const branch = staffBranchByName[a.createdBy] || "Unassigned";
+      byBranch[branch] = byBranch[branch] || {count:0, outstanding:0, overdue:0};
+      byBranch[branch].count++; byBranch[branch].outstanding += a.principalOutstanding;
+      if(computeDPD(a)>0) byBranch[branch].overdue += a.principalOutstanding;
+    });
+    return { headers:["Branch (approximated)","Active Accounts","Outstanding","Overdue Amount"],
+      rows: Object.entries(byBranch).map(([k,v])=>[k, v.count, fmtINR(v.outstanding), fmtINR(v.overdue)]) };
+  }
+  if(reportId==="daily-mis"){
+    const day = session.reportDate || todayStr();
+    const leads = await db.getAll("leads");
+    const newLeadsCount = leads.filter(l=>(l.createdAt||"").slice(0,10)===day).length;
+    const disbursedCount = loanAccounts.filter(a=>a.disbursedDate===day).length;
+    const disbursedAmount = loanAccounts.filter(a=>a.disbursedDate===day).reduce((s,a)=>s+a.principal,0);
+    const collectedAmount = payments.filter(p=>p.date===day).reduce((s,p)=>s+p.amount,0);
+    const collectedCount = payments.filter(p=>p.date===day).length;
+    return { headers:["Metric","Value"], rows: [
+      ["Date", day],
+      ["New Applications", newLeadsCount],
+      ["Loans Disbursed", disbursedCount],
+      ["Amount Disbursed", fmtINR(disbursedAmount)],
+      ["EMIs Collected", collectedCount],
+      ["Amount Collected", fmtINR(collectedAmount)],
+    ]};
+  }
+  if(reportId==="monthly-mis"){
+    const month = session.reportMonth || todayStr().slice(0,7);
+    const leads = await db.getAll("leads");
+    const newLeadsCount = leads.filter(l=>(l.createdAt||"").slice(0,7)===month).length;
+    const disbursedInMonth = loanAccounts.filter(a=>(a.disbursedDate||"").slice(0,7)===month);
+    const collectedInMonth = payments.filter(p=>(p.date||"").slice(0,7)===month);
+    const acct = await computeAccountingSummary();
+    return { headers:["Metric","Value"], rows: [
+      ["Month", month],
+      ["New Applications", newLeadsCount],
+      ["Loans Disbursed", disbursedInMonth.length],
+      ["Amount Disbursed", fmtINR(disbursedInMonth.reduce((s,a)=>s+a.principal,0))],
+      ["EMIs Collected", collectedInMonth.length],
+      ["Amount Collected", fmtINR(collectedInMonth.reduce((s,p)=>s+p.amount,0))],
+      ["Portfolio Outstanding (current)", fmtINR(acct.portfolioOutstanding)],
+      ["NPA Provisioning (current)", fmtINR(Math.round(acct.npaProvision))],
+    ]};
+  }
   if(reportId==="daily-collection"){
     const byDate = {};
     payments.forEach(p=>{ byDate[p.date] = (byDate[p.date]||0) + p.amount; });
@@ -5479,9 +5558,13 @@ async function renderReportsTab(){
   return `
     <div class="card">
       <h2>Reports &amp; MIS</h2>
-      <p class="sub">Branch-wise reporting isn't available yet — staff and customers aren't branch-linked in this build. Regulatory/statutory return formats aren't included; those need sign-off from your compliance team.</p>
-      <div class="field" style="max-width:360px;"><label>Report</label>
-        <select id="report-select">${REPORT_DEFS.map(r=>`<option value="${r.id}" ${r.id===selected?'selected':''}>${r.label}</option>`).join("")}</select>
+      <p class="sub">Branch figures are approximated via the disbursing officer's assigned branch, since loan accounts don't carry a fixed branch code directly. Regulatory/statutory return formats aren't included; those need sign-off from your compliance team.</p>
+      <div class="grid grid-2">
+        <div class="field" style="max-width:360px;"><label>Report</label>
+          <select id="report-select">${REPORT_DEFS.map(r=>`<option value="${r.id}" ${r.id===selected?'selected':''}>${r.label}</option>`).join("")}</select>
+        </div>
+        ${selected==="daily-mis" ? `<div class="field" style="max-width:200px;"><label>Date</label><input id="report-date" type="date" value="${session.reportDate||todayStr()}"></div>` : ""}
+        ${selected==="monthly-mis" ? `<div class="field" style="max-width:200px;"><label>Month</label><input id="report-month" type="month" value="${session.reportMonth||todayStr().slice(0,7)}"></div>` : ""}
       </div>
     </div>
     <div class="card">
@@ -6484,6 +6567,66 @@ async function renderUserManagement(){
         <button class="btn btn-outline btn-sm" id="btn-load-bulk-demo-data">Load Full-Journey Batch</button>
       </div>
     </div>
+
+    ${await renderEscalationMatrixSection()}
+
+    ${await renderHolidayCalendarSection()}
+  `;
+}
+
+async function renderEscalationMatrixSection(){
+  const items = await db.getAll("escalationRules");
+  return `
+    <div class="card">
+      <div class="flex-between">
+        <div><h2>Escalation Matrix</h2><p class="sub" style="margin-bottom:0;">Reference policy for who an item escalates to if not actioned in time — a documented standard for staff to follow. This records the policy; it doesn't automatically re-route pending approvals on its own yet.</p></div>
+        <button class="btn btn-gold btn-sm" id="btn-open-escalation-form">+ Add Rule</button>
+      </div>
+      ${session.showEscalationForm ? `
+      <div class="grid grid-4">
+        <div class="field"><label>Item type</label><input id="esc-item-type" placeholder="e.g. Sanction Approval"></div>
+        <div class="field"><label>First responder role</label><select id="esc-from-role">${ROLES.map(r=>`<option>${r}</option>`).join("")}</select></div>
+        <div class="field"><label>Escalates to</label><select id="esc-to-role">${ROLES.map(r=>`<option>${r}</option>`).join("")}</select></div>
+        <div class="field"><label>If unactioned after (days)</label><input id="esc-days" type="number" value="2"></div>
+      </div>
+      <button class="btn btn-gold btn-sm" id="btn-save-escalation">Save</button>
+      ` : ""}
+      <table style="margin-top:10px;">
+        <thead><tr><th>Item Type</th><th>First Responder</th><th>Escalates To</th><th>After (Days)</th><th></th></tr></thead>
+        <tbody>
+        ${items.length===0 ? `<tr class="empty-row"><td colspan="5">No escalation rules recorded yet.</td></tr>` :
+          items.map(i=>`<tr><td>${esc(i.itemType)}</td><td>${esc(i.fromRole)}</td><td>${esc(i.toRole)}</td><td>${i.days}</td><td><button class="btn btn-danger btn-sm delete-escalation-btn" data-esc="${i.id}">Delete</button></td></tr>`).join("")}
+        </tbody>
+      </table>
+    </div>
+  `;
+}
+
+async function renderHolidayCalendarSection(){
+  const holidays = (await db.getAll("holidayCalendar")).sort((a,b)=>a.date.localeCompare(b.date));
+  const today = todayStr();
+  const upcoming = holidays.filter(h=>h.date>=today).slice(0,5);
+  return `
+    <div class="card">
+      <div class="flex-between">
+        <div><h2>Holiday Calendar</h2><p class="sub" style="margin-bottom:0;">For staff planning and scheduling reference. Not yet wired into automatic due-date shifting (e.g. EMI due dates falling on a holiday aren't auto-adjusted) — a reference calendar, not an automated rule engine.</p></div>
+        <button class="btn btn-gold btn-sm" id="btn-open-holiday-form">+ Add Holiday</button>
+      </div>
+      ${session.showHolidayForm ? `
+      <div class="grid grid-2">
+        <div class="field"><label>Date</label><input id="hol-date" type="date"></div>
+        <div class="field"><label>Occasion</label><input id="hol-name" placeholder="e.g. Diwali"></div>
+      </div>
+      <button class="btn btn-gold btn-sm" id="btn-save-holiday">Save</button>
+      ` : ""}
+      <table style="margin-top:10px;">
+        <thead><tr><th>Date</th><th>Occasion</th><th></th></tr></thead>
+        <tbody>
+        ${holidays.length===0 ? `<tr class="empty-row"><td colspan="3">No holidays added yet.</td></tr>` :
+          holidays.map(h=>`<tr><td>${h.date}</td><td>${esc(h.name)}</td><td><button class="btn btn-danger btn-sm delete-holiday-btn" data-hol="${h.id}">Delete</button></td></tr>`).join("")}
+        </tbody>
+      </table>
+    </div>
   `;
 }
 
@@ -6849,6 +6992,16 @@ function bindEvents(){
 
   const saveSecuritySettingsBtn = document.getElementById("btn-save-security-settings");
   if(saveSecuritySettingsBtn) saveSecuritySettingsBtn.onclick = handleSaveSecuritySettings;
+  const openEscalationFormBtn = document.getElementById("btn-open-escalation-form");
+  if(openEscalationFormBtn) openEscalationFormBtn.onclick = ()=>{ session.showEscalationForm = !session.showEscalationForm; render(); };
+  const saveEscalationBtn = document.getElementById("btn-save-escalation");
+  if(saveEscalationBtn) saveEscalationBtn.onclick = handleSaveEscalationRule;
+  document.querySelectorAll(".delete-escalation-btn").forEach(btn=> btn.onclick = ()=> handleDeleteEscalationRule(btn.dataset.esc));
+  const openHolidayFormBtn = document.getElementById("btn-open-holiday-form");
+  if(openHolidayFormBtn) openHolidayFormBtn.onclick = ()=>{ session.showHolidayForm = !session.showHolidayForm; render(); };
+  const saveHolidayBtn = document.getElementById("btn-save-holiday");
+  if(saveHolidayBtn) saveHolidayBtn.onclick = handleSaveHoliday;
+  document.querySelectorAll(".delete-holiday-btn").forEach(btn=> btn.onclick = ()=> handleDeleteHoliday(btn.dataset.hol));
   const addStaffBtn = document.getElementById("btn-add-staff");
   if(addStaffBtn) addStaffBtn.onclick = handleAddStaff;
   document.querySelectorAll(".remove-staff-btn").forEach(btn=> btn.onclick = ()=> handleRemoveStaff(btn.dataset.staff));
@@ -7235,6 +7388,10 @@ function bindEvents(){
   // Reports
   const reportSelect = document.getElementById("report-select");
   if(reportSelect) reportSelect.onchange = ()=>{ session.selectedReport = reportSelect.value; render(); };
+  const reportDateInput = document.getElementById("report-date");
+  if(reportDateInput) reportDateInput.onchange = ()=>{ session.reportDate = reportDateInput.value; render(); };
+  const reportMonthInput = document.getElementById("report-month");
+  if(reportMonthInput) reportMonthInput.onchange = ()=>{ session.reportMonth = reportMonthInput.value; render(); };
   const exportReportBtn = document.getElementById("btn-export-report");
   if(exportReportBtn) exportReportBtn.onclick = handleExportReport;
 
@@ -9904,6 +10061,49 @@ async function handleBorrowerLogin(){
     console.error(err);
     toast(friendlyAuthError(err));
   }
+}
+
+async function handleSaveEscalationRule(){
+  const u = session.user;
+  const itemType = document.getElementById("esc-item-type").value.trim();
+  if(!itemType){ toast("Enter an item type."); return; }
+  await db.put("escalationRules", {
+    id: uid("esc"), itemType, fromRole: document.getElementById("esc-from-role").value,
+    toRole: document.getElementById("esc-to-role").value, days: Number(document.getElementById("esc-days").value)||1,
+    createdAt: nowISO(), createdBy: u.name
+  });
+  await logAudit(u.name, u.role, "Escalation Rule Added", itemType);
+  toast("Saved.");
+  session.showEscalationForm = false;
+  render();
+}
+async function handleDeleteEscalationRule(id){
+  const u = session.user;
+  if(!window.confirm("Delete this escalation rule?")) return;
+  await db.delete("escalationRules", id);
+  await logAudit(u.name, u.role, "Escalation Rule Removed", id);
+  toast("Removed.");
+  render();
+}
+
+async function handleSaveHoliday(){
+  const u = session.user;
+  const date = document.getElementById("hol-date").value;
+  const name = document.getElementById("hol-name").value.trim();
+  if(!date || !name){ toast("Enter both a date and an occasion name."); return; }
+  await db.put("holidayCalendar", { id: uid("hol"), date, name, createdAt: nowISO(), createdBy: u.name });
+  await logAudit(u.name, u.role, "Holiday Added", `${name} — ${date}`);
+  toast("Saved.");
+  session.showHolidayForm = false;
+  render();
+}
+async function handleDeleteHoliday(id){
+  const u = session.user;
+  if(!window.confirm("Delete this holiday?")) return;
+  await db.delete("holidayCalendar", id);
+  await logAudit(u.name, u.role, "Holiday Removed", id);
+  toast("Removed.");
+  render();
 }
 
 async function handleSaveSecuritySettings(){
