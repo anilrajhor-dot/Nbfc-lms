@@ -1961,6 +1961,54 @@ function renderSessionTimeoutWarningModal(){
 function resetCustomerDraft(){ customerDraft = { photoBase64:null, docImageBase64:null, signatureBase64:null, gpsLat:null, gpsLng:null }; }
 
 function setRoute(r){ route = r; render(); }
+/** Voice-to-text for any text input, using the browser's built-in
+ *  Web Speech API — no external dependency, but a real limit worth
+ *  being upfront about: Apple has never shipped SpeechRecognition in
+ *  Safari on iOS, so this genuinely does nothing on an iPhone. Rather
+ *  than show a mic button that silently fails there, this checks
+ *  support first and disables the button with an honest explanation
+ *  when it isn't available — degrading gracefully instead of
+ *  pretending the feature works everywhere. */
+function isSpeechRecognitionSupported(){
+  return !!(window.SpeechRecognition || window.webkitSpeechRecognition);
+}
+
+function attachVoiceInput(buttonId, targetInputId, options={}){
+  const btn = document.getElementById(buttonId);
+  const target = document.getElementById(targetInputId);
+  if(!btn || !target) return;
+
+  if(!isSpeechRecognitionSupported()){
+    btn.disabled = true;
+    btn.style.opacity = "0.35";
+    btn.style.cursor = "not-allowed";
+    btn.title = "Voice input isn't available in this browser — this is expected on iPhone Safari, which doesn't support it. Try the microphone key on your keyboard instead.";
+    return;
+  }
+
+  const SpeechRecognitionCtor = window.SpeechRecognition || window.webkitSpeechRecognition;
+  const recognition = new SpeechRecognitionCtor();
+  recognition.lang = "en-IN";
+  recognition.interimResults = false;
+  recognition.maxAlternatives = 1;
+  let listening = false;
+
+  btn.onclick = ()=>{
+    if(listening){ recognition.stop(); return; }
+    try{ recognition.start(); } catch(err){ console.error("Voice input failed to start:", err); }
+  };
+  recognition.onstart = ()=>{ listening = true; btn.textContent = "🔴"; btn.title = "Listening… tap to stop"; };
+  recognition.onresult = (event)=>{
+    const transcript = event.results[0][0].transcript;
+    target.value = options.append && target.value ? `${target.value} ${transcript}` : transcript;
+    target.dispatchEvent(new Event("input", {bubbles:true}));
+  };
+  recognition.onerror = (event)=>{
+    if(event.error!=="no-speech" && event.error!=="aborted") toast("Voice input error: "+event.error);
+  };
+  recognition.onend = ()=>{ listening = false; btn.textContent = "🎤"; btn.title = "Tap to speak"; };
+}
+
 function toast(msg){
   const t = document.createElement("div");
   t.className="toast"; t.textContent=msg;
@@ -4924,7 +4972,12 @@ async function renderRecoveryVisitForm(acc, customers){
         <div class="field"><label>Promise to pay — by date</label><input id="rv-ptp-date" type="date"></div>
       </div>
       <div class="field"><label>Settlement proposal (if any)</label><textarea id="rv-settlement-proposal"></textarea></div>
-      <div class="field"><label>Recovery progress notes</label><textarea id="rv-progress"></textarea></div>
+      <div class="field"><label>Recovery progress notes</label>
+        <div style="display:flex; gap:8px; align-items:flex-start;">
+          <textarea id="rv-progress" style="flex:1;"></textarea>
+          <button type="button" class="btn btn-outline btn-sm" id="btn-voice-rv-progress" title="Tap to speak">🎤</button>
+        </div>
+      </div>
 
       <h3 class="section-h">Visit Evidence</h3>
       <div class="kyc-upload-row">
@@ -6793,8 +6846,9 @@ function renderAiAssistant(){
         ${messages.length===0 ? `<p class="small muted">Ask about a policy term, a customer's risk profile, or how to use a module.</p>` :
           messages.map(m=>`<div style="margin-bottom:10px;"><b>${m.role==='user'?'You':'Assistant'}:</b> ${esc(m.content)}</div>`).join("")}
       </div>
-      <div class="grid" style="grid-template-columns:1fr auto; gap:8px;">
+      <div class="grid" style="grid-template-columns:1fr auto auto; gap:8px;">
         <input id="chat-input" placeholder="e.g. What does SMA-2 mean for this NBFC's policy?">
+        <button class="btn btn-outline" id="btn-voice-chat" title="Tap to speak">🎤</button>
         <button class="btn btn-gold" id="btn-send-chat">Send</button>
       </div>
     </div>
@@ -7669,8 +7723,9 @@ function renderBorrowerAdvisor(){
         ${messages.length===0 ? `<p class="small muted">e.g. "What's the difference between a Business Loan and an MSME Loan?"</p>` :
           messages.map(m=>`<div style="margin-bottom:10px;"><b>${m.role==='user'?'You':'Advisor'}:</b> ${esc(m.content)}</div>`).join("")}
       </div>
-      <div class="grid" style="grid-template-columns:1fr auto; gap:8px;">
+      <div class="grid" style="grid-template-columns:1fr auto auto; gap:8px;">
         <input id="borrower-chat-input" placeholder="Ask a question">
+        <button class="btn btn-outline" id="btn-voice-borrower-chat" title="Tap to speak">🎤</button>
         <button class="btn btn-gold" id="btn-send-borrower-chat">Send</button>
       </div>
     </div>
@@ -7949,6 +8004,7 @@ function bindEvents(){
   const borrowerChatInput = document.getElementById("borrower-chat-input");
   if(sendBorrowerChatBtn) sendBorrowerChatBtn.onclick = handleSendBorrowerChat;
   if(borrowerChatInput) borrowerChatInput.onkeydown = (e)=>{ if(e.key==="Enter") handleSendBorrowerChat(); };
+  attachVoiceInput("btn-voice-borrower-chat", "borrower-chat-input");
 
   const saveSecuritySettingsBtn = document.getElementById("btn-save-security-settings");
   if(saveSecuritySettingsBtn) saveSecuritySettingsBtn.onclick = handleSaveSecuritySettings;
@@ -8243,6 +8299,7 @@ function bindEvents(){
   if(rvPhotoInput) rvPhotoInput.onchange = handleRecoveryPhotoUpload;
   const rvGpsBtn = document.getElementById("btn-recovery-gps");
   if(rvGpsBtn) rvGpsBtn.onclick = handleRecoveryCaptureGPS;
+  attachVoiceInput("btn-voice-rv-progress", "rv-progress", {append:true});
   const saveVisitBtn = document.getElementById("btn-save-visit");
   if(saveVisitBtn) saveVisitBtn.onclick = ()=> handleSaveVisit(saveVisitBtn.dataset.loan);
 
@@ -8462,6 +8519,7 @@ function bindEvents(){
   const chatInput = document.getElementById("chat-input");
   if(sendChatBtn) sendChatBtn.onclick = handleSendChat;
   if(chatInput) chatInput.onkeydown = (e)=>{ if(e.key==="Enter") handleSendChat(); };
+  attachVoiceInput("btn-voice-chat", "chat-input");
 
   // Verification API config
   const saveApiConfigBtn = document.getElementById("btn-save-api-config");
