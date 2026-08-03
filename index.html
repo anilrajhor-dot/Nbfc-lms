@@ -395,6 +395,27 @@ const db = {
     delete renderCache[collectionName];
     delete staleCache[collectionName];
   },
+  /** Writes many documents to the same collection using Firestore's
+   *  real batch API — one network round-trip per 500 documents
+   *  (Firestore's own batch limit), run concurrently, instead of one
+   *  round-trip per document awaited sequentially. This is the
+   *  difference between a menu opening instantly and it taking minutes
+   *  once a portfolio has any real size to it — a sequential loop of
+   *  individually-awaited writes is the single most common cause of a
+   *  screen that "won't open" when nothing is actually broken. */
+  async putMany(collectionName, objects){
+    await initFirebase();
+    if(objects.length===0) return;
+    const chunks = [];
+    for(let i=0; i<objects.length; i+=500) chunks.push(objects.slice(i, i+500));
+    await Promise.all(chunks.map(chunk=>{
+      const batch = firestoreDb.batch();
+      chunk.forEach(obj=> batch.set(firestoreDb.collection(collectionName).doc(obj.id), obj));
+      return batch.commit();
+    }));
+    delete renderCache[collectionName];
+    delete staleCache[collectionName];
+  },
 };
 
 function uid(prefix){ return prefix+"_"+Date.now().toString(36)+Math.random().toString(36).slice(2,7); }
@@ -4173,11 +4194,11 @@ async function renderFundsTab(){
       </div>
       <div id="new-borrowing-form-box"></div>
       <table>
-        <thead><tr><th>Bank</th><th>Facility Type</th><th>Sanctioned/Limit</th><th>Rate</th><th>Tenure</th><th>Utilized</th><th>Status</th><th></th></tr></thead>
+        <thead><tr><th>Bank</th><th>Facility Type</th><th>Sanctioned/Limit</th><th>Rate</th><th>Tenure</th><th>EMI</th><th>Utilized</th><th>Status</th><th></th></tr></thead>
         <tbody>
-        ${borrowings.length===0 ? `<tr class="empty-row"><td colspan="8">No bank facilities added yet.</td></tr>` :
-          borrowings.map(b=>`<tr><td>${esc(b.bankName)}</td><td>${esc(b.facilityType)}</td><td>${fmtINR(b.sanctionedAmount)}</td><td>${b.interestRate}% p.a.</td><td>${b.tenureMonths?b.tenureMonths+' mo':'—'}</td>
-          <td>${b.affectsFundBalance ? '<span class="small muted">n/a — full amount is fund balance</span>' : `${fmtINR(b.utilizedAmount||0)} <button class="btn btn-outline btn-sm update-utilization-btn" data-borrowing="${b.id}" style="margin-left:6px;">Update</button>`}</td>
+        ${borrowings.length===0 ? `<tr class="empty-row"><td colspan="9">No bank facilities added yet.</td></tr>` :
+          borrowings.map(b=>`<tr><td>${esc(b.bankName)}</td><td>${esc(b.facilityType)}</td><td>${fmtINR(b.sanctionedAmount)}</td><td>${b.interestRate}% p.a.</td><td>${b.tenureMonths?b.tenureMonths+' mo':'—'}</td><td>${b.emiAmount?fmtINR(b.emiAmount):'—'}</td>
+          <td>${b.affectsFundBalance ? '<span class="small muted">n/a — disbursed as a lump sum, not drawn down</span>' : `${fmtINR(b.utilizedAmount||0)} <button class="btn btn-outline btn-sm update-utilization-btn" data-borrowing="${b.id}" style="margin-left:6px;">Update</button>`}</td>
           <td>${b.status==='Active'?`<span class="badge badge-approved">Active</span>`:`<span class="badge badge-new">Closed</span>`}</td>
           <td><button class="btn btn-danger btn-sm close-borrowing-btn" data-borrowing="${b.id}" ${b.status!=='Active'?'disabled':''}>Close</button></td></tr>`).join("")}
         </tbody>
@@ -4219,22 +4240,38 @@ function renderNewFundForm(){
   `;
 }
 
-function renderNewBorrowingForm(){
+async function renderNewBorrowingForm(){
   const facilityTypes = (session.categoryConfigCache || defaultCategoryConfig()).facilityTypes;
+  const operatingAccounts = (await db.getAll("fundAccounts")).filter(a=>a.type==="Cash"||a.type==="Bank Account"||a.type==="UPI");
+  const isLumpSum = session.newBorrowingIsLumpSum !== false; // defaults to true (Term Loan-like)
   return `
     <div class="card" style="background:var(--paper); border-style:dashed;">
       <div class="grid grid-3">
-        <div class="field"><label>Bank name</label><input id="bb-bank" placeholder="e.g. State Bank of India"></div>
+        <div class="field"><label>Bank / institution name</label><input id="bb-bank" placeholder="e.g. State Bank of India, Northern Arc, MAS Financial"></div>
         <div class="field"><label>Facility type</label><select id="bb-type">${facilityTypes.map(t=>`<option>${t}</option>`).join("")}</select></div>
-        <div class="field"><label>Sanctioned amount / limit (₹)</label><input id="bb-amount" type="number"></div>
-        <div class="field"><label>Interest rate (% p.a.)</label><input id="bb-rate" type="number" step="0.1"></div>
-        <div class="field"><label>Tenure (months, if a term loan)</label><input id="bb-tenure" type="number"></div>
+        <div class="field"><label>Sanctioned amount / limit (₹)</label><input id="bb-amount" type="number" class="bb-emi-input"></div>
+        <div class="field"><label>Interest rate (% p.a.)</label><input id="bb-rate" type="number" step="0.1" class="bb-emi-input"></div>
+        <div class="field"><label>Tenure (months)</label><input id="bb-tenure" type="number" class="bb-emi-input" ${isLumpSum?'':'disabled placeholder="n/a — revolving"'}></div>
         <div class="field"><label>Sanction date</label><input id="bb-date" type="date" value="${todayStr()}"></div>
       </div>
       <label style="display:flex; align-items:center; gap:6px; margin:8px 0;">
-        <input type="checkbox" id="bb-affects-balance" style="width:auto;" checked>
-        This facility credits real cash to a fund account (term loans) — leave unchecked for CC/OD, which is a revolving limit, not cash received
+        <input type="checkbox" id="bb-affects-balance" style="width:auto;" ${isLumpSum?'checked':''}>
+        This is a lump-sum facility that credits real cash on sanction (Term Loan) — leave unchecked for a revolving limit (Cash Credit/Overdraft), which isn't cash received the way a term loan disbursement is
       </label>
+      <div id="bb-lump-sum-fields" style="display:${isLumpSum?'block':'none'};">
+        <div class="grid grid-2">
+          <div class="field"><label>Credited to</label>
+            <select id="bb-credited-account">
+              ${operatingAccounts.length===0 ? `<option value="">No Cash/Bank/UPI account exists yet — add one under Fund Sources first</option>` :
+                operatingAccounts.map(a=>`<option value="${a.id}">${esc(a.name)} (${esc(a.type)}) — currently ${fmtINR(a.balance)}</option>`).join("")}
+            </select>
+          </div>
+          <div class="field"><label>Monthly EMI (auto-calculated)</label><input id="bb-emi-display" readonly style="background:var(--paper-2); font-weight:600;"></div>
+        </div>
+      </div>
+      <div id="bb-revolving-note" style="display:${isLumpSum?'none':'block'};">
+        <p class="small muted">No "Credited to" account and no EMI — a revolving limit isn't disbursed as cash, and doesn't repay on a fixed schedule the way a term loan does. Draw-downs are tracked as "Utilized" once this is saved.</p>
+      </div>
       <div class="field"><label>Notes</label><input id="bb-notes" placeholder="Optional"></div>
       <button class="btn btn-gold btn-sm" id="btn-save-borrowing">Save Facility</button>
     </div>
@@ -4687,6 +4724,8 @@ async function renderReceipt(r){
 async function ensureRemindersUpToDate(loanAccounts, customers){
   const today = todayStr();
   const existingKeys = new Set((await db.getAll("reminders")).map(r=>r.key));
+  const custById = Object.fromEntries(customers.map(c=>[c.id,c]));
+  const newReminders = [];
   for(const acc of loanAccounts){
     if(!acc.schedule) continue;
     for(const inst of acc.schedule){
@@ -4697,8 +4736,8 @@ async function ensureRemindersUpToDate(loanAccounts, customers){
         if(triggerStr > today) continue;
         const key = `${acc.id}_${inst.index}_${rule.offset}`;
         if(existingKeys.has(key)) continue;
-        const cust = customers.find(c=>c.id===acc.customerId);
-        await db.put("reminders", {
+        const cust = custById[acc.customerId];
+        newReminders.push({
           id: uid("rem"), key, loanAccountId: acc.id, customerId: acc.customerId,
           customerName: cust ? cust.personal.name : "—", customerMobile: cust ? cust.personal.mobile : "",
           customerEmail: cust ? cust.personal.email : "",
@@ -4709,6 +4748,7 @@ async function ensureRemindersUpToDate(loanAccounts, customers){
       }
     }
   }
+  await db.putMany("reminders", newReminders);
 }
 
 async function renderRemindersTab(loanAccounts, customers){
@@ -8512,14 +8552,32 @@ function bindEvents(){
   if(openNewFund) openNewFund.onclick = ()=>{ document.getElementById("new-fund-form-box").innerHTML = renderNewFundForm(); document.getElementById("btn-save-fund").onclick = handleSaveFund; };
   document.querySelectorAll(".adjust-fund-btn").forEach(btn=> btn.onclick = ()=> handleAdjustFund(btn.dataset.fund));
   const openNewBorrowing = document.getElementById("btn-open-new-borrowing");
-  if(openNewBorrowing) openNewBorrowing.onclick = ()=>{
-    document.getElementById("new-borrowing-form-box").innerHTML = renderNewBorrowingForm();
+  if(openNewBorrowing) openNewBorrowing.onclick = async ()=>{
+    document.getElementById("new-borrowing-form-box").innerHTML = await renderNewBorrowingForm();
     document.getElementById("btn-save-borrowing").onclick = handleSaveBorrowing;
     const bbType = document.getElementById("bb-type");
     const bbAffects = document.getElementById("bb-affects-balance");
+    const updateEmiPreview = ()=>{
+      const emiField = document.getElementById("bb-emi-display");
+      if(!emiField) return;
+      const amount = Number(document.getElementById("bb-amount").value)||0;
+      const rate = Number(document.getElementById("bb-rate").value)||0;
+      const tenure = Number(document.getElementById("bb-tenure").value)||0;
+      emiField.value = (amount>0 && rate>0 && tenure>0) ? fmtINR(estimateMonthlyEmi(amount, rate, tenure)) : "";
+    };
     if(bbType && bbAffects){
-      bbType.onchange = ()=>{ bbAffects.checked = !/CC|OD|Cash Credit|Overdraft/i.test(bbType.value); };
+      bbType.onchange = ()=>{ bbAffects.checked = !/CC|OD|Cash Credit|Overdraft/i.test(bbType.value); bbAffects.dispatchEvent(new Event("change")); };
+      bbAffects.onchange = ()=>{
+        session.newBorrowingIsLumpSum = bbAffects.checked;
+        const lumpSumFields = document.getElementById("bb-lump-sum-fields");
+        const revolvingNote = document.getElementById("bb-revolving-note");
+        const tenureInput = document.getElementById("bb-tenure");
+        if(lumpSumFields) lumpSumFields.style.display = bbAffects.checked ? "block" : "none";
+        if(revolvingNote) revolvingNote.style.display = bbAffects.checked ? "none" : "block";
+        if(tenureInput) tenureInput.disabled = !bbAffects.checked;
+      };
     }
+    document.querySelectorAll(".bb-emi-input").forEach(el=> el.oninput = updateEmiPreview);
   };
   document.querySelectorAll(".update-utilization-btn").forEach(btn=> btn.onclick = ()=> handleUpdateUtilization(btn.dataset.borrowing));
   document.querySelectorAll(".close-borrowing-btn").forEach(btn=> btn.onclick = ()=> handleCloseBorrowing(btn.dataset.borrowing));
@@ -9618,22 +9676,41 @@ async function handleSaveBorrowing(){
   const sanctionedAmount = Number(document.getElementById("bb-amount").value)||0;
   if(!bankName || sanctionedAmount<=0){ toast("Bank name and sanctioned amount/limit are required."); return; }
   const affectsFundBalance = document.getElementById("bb-affects-balance").checked;
+  const interestRate = Number(document.getElementById("bb-rate").value)||0;
+  const tenureMonths = affectsFundBalance ? (Number(document.getElementById("bb-tenure").value)||null) : null;
+  const emiAmount = (affectsFundBalance && interestRate>0 && tenureMonths>0) ? Math.round(estimateMonthlyEmi(sanctionedAmount, interestRate, tenureMonths)) : null;
+
+  let fundAccountId = null, fundAccountName = null;
+  if(affectsFundBalance){
+    const creditedAccountId = document.getElementById("bb-credited-account")?.value;
+    if(!creditedAccountId){ toast("Select which Cash/Bank/UPI account this credits — add one under Fund Sources first if none exist yet."); return; }
+    const fundAccount = await db.get("fundAccounts", creditedAccountId);
+    if(!fundAccount){ toast("That fund account no longer exists — refresh and try again."); return; }
+    fundAccount.balance += sanctionedAmount;
+    await db.put("fundAccounts", fundAccount);
+    fundAccountId = fundAccount.id; fundAccountName = fundAccount.name;
+  }
+
   const rec = {
-    id: uid("bbr"), bankName, facilityType, sanctionedAmount,
-    interestRate: Number(document.getElementById("bb-rate").value)||0,
-    tenureMonths: Number(document.getElementById("bb-tenure").value)||null,
+    id: uid("bbr"), bankName, facilityType, sanctionedAmount, interestRate, tenureMonths, emiAmount,
     sanctionDate: document.getElementById("bb-date").value, notes: document.getElementById("bb-notes").value.trim(),
-    affectsFundBalance, utilizedAmount: 0, fundAccountId: null, status:"Active",
+    affectsFundBalance, utilizedAmount: 0, fundAccountId, status:"Active",
     createdAt: nowISO(), createdBy: u.name
   };
-  if(affectsFundBalance){
-    const fundAccount = { id: uid("fnd"), name: `${bankName} — ${facilityType}`, type:"Borrowing", balance: sanctionedAmount, createdAt: nowISO(), createdBy: u.name };
-    await db.put("fundAccounts", fundAccount);
-    rec.fundAccountId = fundAccount.id;
-  }
   await db.put("bankBorrowings", rec);
-  await logAudit(u.name, u.role, "Bank Facility Added", `${bankName} — ${facilityType} — ${fmtINR(sanctionedAmount)}${affectsFundBalance ? ' — credited to fund account' : ' — limit only, not added to Cash/Bank'}`);
-  toast(affectsFundBalance ? "Facility added and credited to a new fund account." : "Facility added as a limit — not added to Cash or Bank, as expected for CC/OD.");
+
+  if(affectsFundBalance){
+    await postToGeneralLedger({
+      date: rec.sanctionDate, voucherType: "Receipt Voucher", narration: `Borrowing drawn — ${bankName} — ${facilityType}`,
+      lineDefs: [
+        { accountName: fundAccountName.toLowerCase().includes("cash") ? "Cash in Hand" : "Bank Account — Operating", side: "debit", amount: sanctionedAmount },
+        { accountName: "Borrowings — Term Loans", side: "credit", amount: sanctionedAmount },
+      ],
+      actor: u.name, actorRole: u.role
+    });
+  }
+  await logAudit(u.name, u.role, "Bank Facility Added", `${bankName} — ${facilityType} — ${fmtINR(sanctionedAmount)}${affectsFundBalance ? ' — credited to '+fundAccountName : ' — limit only, not added to Cash/Bank'}`);
+  toast(affectsFundBalance ? `Facility added and credited to ${fundAccountName}.` : "Facility added as a limit — not added to Cash or Bank, as expected for a revolving facility.");
   render();
 }
 
@@ -9990,12 +10067,12 @@ async function handleSendAllDueReminders(auto){
     if(!auto) toast("No reminders due right now.");
     return;
   }
+  const results = await Promise.all(pending.map(r=> sendReminderMessage(r, u)));
   let sentCount = 0, notConfiguredCount = 0;
-  for(const r of pending){
-    const results = await sendReminderMessage(r, u);
-    if(results.some(res=>res.includes("Not Configured"))) notConfiguredCount++;
+  results.forEach(res=>{
+    if(res.some(r=>r.includes("Not Configured"))) notConfiguredCount++;
     else sentCount++;
-  }
+  });
   await logAudit(u.name, u.role, "Bulk Reminders Sent", `${pending.length} reminder(s) processed — ${auto?'auto-triggered on opening Reminders':'manually triggered'}`);
   toast(`${pending.length} reminder(s) processed.${notConfiguredCount>0 ? ' '+notConfiguredCount+' need a WhatsApp/Email provider configured under Integrations to actually go out.' : ''}`);
   if(!auto) render(); // auto-trigger runs inside an in-progress render() pass — calling render() again here would be recursive; the same pass already reflects the updated data since this runs before the pending list is read.
