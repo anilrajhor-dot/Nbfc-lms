@@ -4752,7 +4752,10 @@ async function ensureRemindersUpToDate(loanAccounts, customers){
 }
 
 async function renderRemindersTab(loanAccounts, customers){
-  await ensureRemindersUpToDate(loanAccounts, customers);
+  if(!session.remindersEnsuredThisSession){
+    session.remindersEnsuredThisSession = true;
+    await ensureRemindersUpToDate(loanAccounts, customers);
+  }
   if(!session.remindersAutoSentThisSession){
     session.remindersAutoSentThisSession = true;
     await handleSendAllDueReminders(true);
@@ -9447,6 +9450,7 @@ async function attemptAutoSanction(lead, customer, appraisal){
     sanction.loanAccountId = loanAccount.id;
     await db.put("sanctions", sanction);
     await logAudit("System (Rule Engine)", "System", "Loan Auto-Disbursed", `${customer.personal.name} — ${fmtINR(sanction.sanctionedAmount)} to A/c ${loanAccount.accountNumber} — ${payoutResult.status}`);
+    session.remindersEnsuredThisSession = false; // a new schedule now exists — let Reminders pick it up next visit
     await accrueDsaCommission(lead.id, sanction, sanction.sanctionedAmount, "System (Rule Engine)");
     return { sanctioned:true, disbursed:true, sanction, loanAccount };
   } else {
@@ -9601,6 +9605,7 @@ async function handleConfirmDisbursement(sanctionId){
     actor: u.name, actorRole: u.role
   });
 
+  session.remindersEnsuredThisSession = false; // a new schedule now exists — let Reminders pick it up next visit
   toast("Disbursed. Loan account created.");
   session.sanctionSubview = "list";
   render();
@@ -10023,7 +10028,14 @@ function reminderMessageFor(r){
     `Reminder: your EMI installment #${r.installmentIndex} of ${r.dueDate ? "due "+r.dueDate : ""} needs attention. Please contact your branch.`;
 }
 
-async function sendReminderMessage(r, u){
+/** Does the actual channel-by-channel sending and returns the updated
+ *  record plus results — deliberately does NOT write to Firestore
+ *  itself. That's what lets the bulk path (handleSendAllDueReminders)
+ *  batch hundreds of updates into one write instead of one write per
+ *  reminder, which was the real cause of Reminders being slow to open
+ *  at any real portfolio size — parallelizing the loop wasn't enough
+ *  on its own if each iteration still did its own individual write. */
+async function composeReminderSend(r, u){
   const message = reminderMessageFor(r);
   let sendResults = [];
   for(const channel of (r.channels||[])){
@@ -10034,11 +10046,13 @@ async function sendReminderMessage(r, u){
     const result = await sendMessage(key, to, "Payment Reminder", message);
     sendResults.push(`${channel}: ${result.status}`);
   }
-  r.status = "Sent";
-  r.sentAt = nowISO();
-  r.sentBy = u.name;
-  r.sendResults = sendResults;
-  await db.put("reminders", r);
+  const updated = { ...r, status:"Sent", sentAt: nowISO(), sentBy: u.name, sendResults };
+  return { updated, sendResults };
+}
+
+async function sendReminderMessage(r, u){
+  const { updated, sendResults } = await composeReminderSend(r, u);
+  await db.put("reminders", updated);
   const detail = sendResults.length ? sendResults.join("; ") : "no configured channel — logged only";
   await logAudit(u.name, u.role, "Reminder Sent", `${r.customerName} — ${r.ruleLabel} — ${detail}`);
   return sendResults;
@@ -10067,10 +10081,11 @@ async function handleSendAllDueReminders(auto){
     if(!auto) toast("No reminders due right now.");
     return;
   }
-  const results = await Promise.all(pending.map(r=> sendReminderMessage(r, u)));
+  const composed = await Promise.all(pending.map(r=> composeReminderSend(r, u)));
+  await db.putMany("reminders", composed.map(c=>c.updated));
   let sentCount = 0, notConfiguredCount = 0;
-  results.forEach(res=>{
-    if(res.some(r=>r.includes("Not Configured"))) notConfiguredCount++;
+  composed.forEach(c=>{
+    if(c.sendResults.some(r=>r.includes("Not Configured"))) notConfiguredCount++;
     else sentCount++;
   });
   await logAudit(u.name, u.role, "Bulk Reminders Sent", `${pending.length} reminder(s) processed — ${auto?'auto-triggered on opening Reminders':'manually triggered'}`);
