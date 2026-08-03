@@ -3373,6 +3373,13 @@ function renderProductForm(product){
         ` : `<div class="field"><label>Status</label><div class="small muted" style="padding-top:8px;">Only Super Admin can activate a product. This saves as Draft.</div></div>`}
       </div>
 
+      <h3 class="section-h">Minimum Eligibility Criteria (Borrower Self-Check)</h3>
+      <p class="small muted" style="margin-top:-6px;">Used by the Borrower Portal's "Check Eligibility" tool to give a genuine yes/no — separate from Straight-Through Processing below, so every product can give a clear answer whether or not auto-sanction is enabled for it.</p>
+      <div class="grid grid-2">
+        <div class="field"><label>Minimum monthly income (₹)</label><input id="pf-min-income" type="number" value="${p.minMonthlyIncome||0}"></div>
+        <div class="field"><label>Maximum FOIR — total obligations as % of income</label><input id="pf-max-foir" type="number" step="1" value="${p.maxFoirPct||60}"></div>
+      </div>
+
       <h3 class="section-h">Required Documents Checklist</h3>
       <div class="field"><label>One document per line</label><textarea id="pf-required-docs" placeholder="Aadhaar Card&#10;PAN Card&#10;Business Proof&#10;Bank Statement (6 months)&#10;Photograph">${(p.requiredDocuments||[]).join("\n")}</textarea></div>
       <p class="small muted" style="margin-top:-6px;">Shown as a checklist during Credit Appraisal for applications on this product.</p>
@@ -5545,9 +5552,11 @@ async function renderJournalVoucherSection(){
  *  longer exists, etc.). Deliberately on-demand rather than run on
  *  every page load, since it reads most of the database. */
 async function computeHealthCheck(){
-  const [fundAccounts, glBalances, customers, loanAccounts, payments, sanctions, disbursements, appraisals, leads] = await Promise.all([
+  const [fundAccounts, glBalances, customers, loanAccounts, payments, sanctions, disbursements, appraisals, leads,
+    journalEntries, journalVouchers, fixedAssets] = await Promise.all([
     db.getAll("fundAccounts"), computeAllLedgerBalances(), db.getAll("customers"), db.getAll("loanAccounts"),
-    db.getAll("payments"), db.getAll("sanctions"), db.getAll("disbursements"), db.getAll("appraisals"), db.getAll("leads")
+    db.getAll("payments"), db.getAll("sanctions"), db.getAll("disbursements"), db.getAll("appraisals"), db.getAll("leads"),
+    db.getAll("journalEntries"), db.getAll("journalVouchers"), db.getAll("fixedAssets")
   ]);
 
   // 1. Funds vs GL — the two systems should never drift on Cash/Bank,
@@ -5580,21 +5589,65 @@ async function computeHealthCheck(){
   disbursements.forEach(d=>{ if(!sanctionIds.has(d.sanctionId)) orphans.push(`Disbursement ${d.id} references a missing sanction`); });
   appraisals.forEach(a=>{ if(!custIds.has(a.customerId)) orphans.push(`Appraisal ${a.id} references a missing customer`); });
 
-  // 4. Snapshot
+  // 4. Interest/EMI schedule integrity — regenerate each active
+  // account's schedule from its own stored terms (principal, rate,
+  // tenure, disbursement date) and check it against what's actually
+  // stored. A mismatch means either the terms were edited without
+  // regenerating the schedule, or the stored schedule was hand-edited
+  // — either way, worth knowing about specifically, not just trusting
+  // the stored figures.
+  const scheduleIssues = [];
+  loanAccounts.filter(a=>a.status==="Active").forEach(acc=>{
+    if(!acc.schedule || acc.schedule.length===0) return;
+    const regen = generateEmiSchedule(acc);
+    if(Math.abs(regen.emiAmount - acc.emiAmount) > 1){
+      scheduleIssues.push(`${acc.accountNumber||acc.id}: stored EMI ${fmtINR(acc.emiAmount)} vs recalculated ${fmtINR(regen.emiAmount)} from its own terms — schedule may be stale`);
+    }
+    const lastInst = acc.schedule[acc.schedule.length-1];
+    if(lastInst && lastInst.outstandingAfter !== undefined && Math.abs(lastInst.outstandingAfter) > 1){
+      scheduleIssues.push(`${acc.accountNumber||acc.id}: schedule doesn't fully amortize to zero (₹${fmtINR(lastInst.outstandingAfter)} left at final installment)`);
+    }
+  });
+
+  // 5. NPA Provisioning currency — is the GL's provision balance
+  // actually in step with what the live DPD classification currently
+  // requires, or has the portfolio moved since the last "post/release"?
+  const acct = await computeAccountingSummary();
+  const requiredProvisioning = Math.round(acct.npaProvision);
+  const provisionBalance = glBalances.find(b=>b.account.name==="Provision for NPA / Impairment Allowance");
+  const postedProvisioning = Math.round(provisionBalance ? provisionBalance.balance : 0);
+  const provisioningGap = requiredProvisioning - postedProvisioning;
+
+  // 6. Depreciation currency — same idea, for Fixed Assets.
+  let unpostedDepreciation = 0;
+  fixedAssets.filter(a=>a.status==="Active").forEach(a=>{
+    const { accumulatedDepreciation } = computeAssetBookValue(a);
+    unpostedDepreciation += Math.max(0, accumulatedDepreciation - (a.lastDepreciationPostedValue||0));
+  });
+
+  // 7. Pending approvals — with aging, not just a raw count, so a
+  // stuck item is actually visible rather than buried in a number.
+  const pendingItems = [
+    ...sanctions.filter(s=>s.status==="Pending Approval").map(s=>({label:`Sanction — ${s.product}`, ageDays: daysSince(s.createdAt)})),
+    ...journalEntries.filter(j=>j.status==="Pending Approval").map(j=>({label:`Journal Entry — ${j.category}`, ageDays: daysSince(j.createdAt)})),
+    ...journalVouchers.filter(v=>v.status==="Pending Approval").map(v=>({label:`GL Voucher — ${v.narration}`, ageDays: daysSince(v.createdAt)})),
+  ].sort((a,b)=>b.ageDays-a.ageDays);
+
+  // 8. Snapshot
   const activeLoanAccounts = loanAccounts.filter(a=>a.status==="Active");
-  const pendingApprovals = sanctions.filter(s=>s.status==="Pending Approval").length
-    + (await db.getAll("journalEntries")).filter(j=>j.status==="Pending Approval").length
-    + (await db.getAll("journalVouchers")).filter(v=>v.status==="Pending Approval").length;
 
   return {
     fundCashBank, glCashBank, fundsGlDrift,
     totalDr, totalCr, trialBalanced,
-    orphans,
+    orphans, scheduleIssues,
+    requiredProvisioning, postedProvisioning, provisioningGap,
+    unpostedDepreciation,
+    pendingItems,
     snapshot: {
       customers: customers.length, activeLoans: activeLoanAccounts.length,
       portfolioOutstanding: activeLoanAccounts.reduce((s,a)=>s+a.principalOutstanding,0),
       openLeads: leads.filter(l=>!["Rejected","Converted into Loan Application"].includes(l.status)).length,
-      pendingApprovals
+      pendingApprovals: pendingItems.length
     }
   };
 }
@@ -5604,13 +5657,16 @@ async function renderHealthCheckTab(){
     return `
       <div class="card">
         <h2>System Health Check</h2>
-        <p class="sub">Checks for the kinds of things that can silently go wrong: Funds vs General Ledger drift, Trial Balance status, and orphaned records (a payment pointing at a loan account that no longer exists, that sort of thing). Reads most of the database, so it's run on demand rather than on every page load.</p>
+        <p class="sub">Checks for the kinds of things that can silently go wrong: Funds vs General Ledger drift, Trial Balance status, orphaned records, EMI schedule integrity, whether NPA provisioning and depreciation are currently posted, and any approvals stuck waiting on someone. Reads most of the database, so it's run on demand rather than on every page load.</p>
         <button class="btn btn-gold" id="btn-run-health-check">Run Health Check</button>
       </div>
     `;
   }
   const h = session.healthCheckResult;
   const driftOk = Math.abs(h.fundsGlDrift) < 1;
+  const scheduleOk = h.scheduleIssues.length===0;
+  const provisioningOk = Math.abs(h.provisioningGap) < 1;
+  const depreciationOk = h.unpostedDepreciation < 1;
   return `
     <div class="card">
       <div class="flex-between">
@@ -5631,19 +5687,48 @@ async function renderHealthCheckTab(){
           <div class="lbl">Orphaned Records</div>
           <div class="val" style="font-size:16px; color:${h.orphans.length===0?'inherit':'var(--danger)'};">${h.orphans.length===0 ? '✓ None Found' : `⚠ ${h.orphans.length} Found`}</div>
         </div>
+        <div class="kpi" style="border-top-color:${scheduleOk?'var(--ok)':'var(--danger)'};">
+          <div class="lbl">EMI Schedule Integrity</div>
+          <div class="val" style="font-size:16px; color:${scheduleOk?'inherit':'var(--danger)'};">${scheduleOk ? '✓ All Match Terms' : `⚠ ${h.scheduleIssues.length} Issue(s)`}</div>
+        </div>
+        <div class="kpi" style="border-top-color:${provisioningOk?'var(--ok)':'var(--gold)'};">
+          <div class="lbl">NPA Provisioning Currency</div>
+          <div class="val" style="font-size:16px; color:${provisioningOk?'inherit':'#5C4200'};">${provisioningOk ? '✓ Up to Date' : `⚠ ${fmtINR(Math.abs(h.provisioningGap))} ${h.provisioningGap>0?'needs posting':'needs releasing'}`}</div>
+        </div>
+        <div class="kpi" style="border-top-color:${depreciationOk?'var(--ok)':'var(--gold)'};">
+          <div class="lbl">Depreciation Currency</div>
+          <div class="val" style="font-size:16px; color:${depreciationOk?'inherit':'#5C4200'};">${depreciationOk ? '✓ Up to Date' : `⚠ ${fmtINR(Math.round(h.unpostedDepreciation))} unposted`}</div>
+        </div>
       </div>
       ${h.orphans.length>0 ? `
       <h3 class="section-h">Orphaned Records</h3>
       <ul>${h.orphans.map(o=>`<li class="small">${esc(o)}</li>`).join("")}</ul>
       <p class="small muted">These didn't come from the auto-posting/save paths — they'd only happen from a manual data edit, restore, or an interrupted operation. Worth investigating each one directly rather than deleting blind.</p>
       ` : ""}
+      ${h.scheduleIssues.length>0 ? `
+      <h3 class="section-h">EMI Schedule Issues</h3>
+      <ul>${h.scheduleIssues.map(s=>`<li class="small">${esc(s)}</li>`).join("")}</ul>
+      <p class="small muted">Recalculated from each account's own stored principal/rate/tenure/disbursement date and compared against what's actually saved. A mismatch usually means terms were edited without going through "Correct Terms," which regenerates the schedule properly.</p>
+      ` : ""}
+      ${!provisioningOk || !depreciationOk ? `<p class="small muted" style="margin-top:8px;">Fix these from where they're posted — NPA Provisioning at the top of General Ledger, Depreciation from the Fixed Assets register.</p>` : ""}
+
+      <h3 class="section-h">Pending Approvals ${h.pendingItems.length>0?`<span class="badge badge-progress">${h.pendingItems.length}</span>`:''}</h3>
+      ${h.pendingItems.length===0 ? `<p class="small muted">Nothing waiting on anyone right now.</p>` : `
+      <table>
+        <thead><tr><th>Item</th><th>Age</th></tr></thead>
+        <tbody>
+        ${h.pendingItems.map(p=>`<tr><td>${esc(p.label)}</td><td>${ageingBadge(p.ageDays)}</td></tr>`).join("")}
+        </tbody>
+      </table>
+      <p class="small muted">Same list as My Queue's "Awaiting My Approval," shown here as part of the overall picture. Anything red has been sitting more than 5 days.</p>
+      `}
+
       <h3 class="section-h">Snapshot</h3>
       <div class="grid grid-4">
         <div class="kpi"><div class="lbl">Customers</div><div class="val" style="font-size:18px;">${h.snapshot.customers}</div></div>
         <div class="kpi"><div class="lbl">Active Loans</div><div class="val" style="font-size:18px;">${h.snapshot.activeLoans}</div></div>
         <div class="kpi"><div class="lbl">Portfolio Outstanding</div><div class="val" style="font-size:18px;">${fmtINR(Math.round(h.snapshot.portfolioOutstanding))}</div></div>
         <div class="kpi"><div class="lbl">Open Leads</div><div class="val" style="font-size:18px;">${h.snapshot.openLeads}</div></div>
-        <div class="kpi"><div class="lbl">Pending Approvals</div><div class="val" style="font-size:18px;">${h.snapshot.pendingApprovals}</div></div>
       </div>
     </div>
   `;
@@ -8043,8 +8128,8 @@ async function renderEligibilityChecker(products){
       <button class="btn btn-outline btn-sm" id="btn-print-eligibility" style="margin-top:10px;">${bts("Print In-Principle Letter","सैद्धांतिक पत्र प्रिंट करें")}</button>
       ` : `
       <div class="warn-banner" style="background:#FBF1DC;border-color:var(--gold);color:#5C4200; margin-top:14px;">
-        <p style="margin-bottom:6px;">Indicative eligibility only — up to ${fmtINR(Math.round(r.eligibleAmount))}, subject to full appraisal including credit history and verification.${!r.fullyKnown ? " Some criteria for this product can only be checked once KYC and a credit bureau check are done." : ""}</p>
-        <p style="font-size:0.9em;">केवल अनुमानित पात्रता — ${fmtINR(Math.round(r.eligibleAmount))} तक, क्रेडिट इतिहास और सत्यापन सहित पूर्ण मूल्यांकन के अधीन।${!r.fullyKnown ? " इस उत्पाद के कुछ मानदंड केवाईसी और क्रेडिट ब्यूरो जांच पूरी होने के बाद ही जांचे जा सकते हैं।" : ""}</p>
+        <p style="margin-bottom:6px;">Doesn't currently meet this product's minimum criteria: ${esc((r.failReasons||[]).join("; "))}. You're welcome to apply anyway — a full appraisal considers more than these self-reported figures.</p>
+        <p style="font-size:0.9em;">इस उत्पाद के न्यूनतम मानदंडों को फिलहाल पूरा नहीं करता: ${esc((r.failReasons||[]).join("; "))}. आप फिर भी आवेदन कर सकते हैं — पूर्ण मूल्यांकन में इन स्व-रिपोर्ट किए गए आंकड़ों से अधिक बातें शामिल होती हैं।</p>
       </div>
       `}
       <div id="printable-eligibility" style="margin-top:16px;">
@@ -8079,13 +8164,25 @@ async function handleCheckEligibility(){
   const cappedAmount = product.maxLoanAmount ? Math.min(eligibleAmount, product.maxLoanAmount) : eligibleAmount;
   const foirPct = income>0 ? (maxEmi/income*100) : null;
 
-  const ruleCheck = evaluateProductRulesPartial(product, { monthlyIncome:income, amountRequested:cappedAmount, foirPct });
-  const inPrinciple = product.autoSanctionEnabled && ruleCheck.allKnownPass && cappedAmount>0;
+  // In-principle eligibility is judged against THIS product's own
+  // staff-configured minimums — deliberately independent of whether
+  // Straight-Through auto-sanction happens to be enabled for it, so
+  // every product can give borrowers a genuine yes/no, not just the
+  // handful with auto-sanction turned on.
+  const minIncome = product.minMonthlyIncome || 0;
+  const maxFoir = product.maxFoirPct || 60;
+  const meetsIncome = income >= minIncome;
+  const meetsFoir = foirPct===null || foirPct <= maxFoir;
+  const inPrinciple = meetsIncome && meetsFoir && cappedAmount>0;
+  const failReasons = [];
+  if(!meetsIncome) failReasons.push(`monthly income below this product's minimum of ${fmtINR(minIncome)}`);
+  if(!meetsFoir) failReasons.push(`total obligations would be ${foirPct.toFixed(0)}% of income, above this product's ${maxFoir}% limit`);
+  if(cappedAmount<=0) failReasons.push("no serviceable amount could be computed from the income/expenses entered");
 
   session.eligibilityInputs = {productId, income, expenses};
   session.eligibilityResult = {
     productName: product.name, income, expenses, disposable, maxEmi,
-    eligibleAmount: cappedAmount, inPrinciple, fullyKnown: ruleCheck.fullyKnown
+    eligibleAmount: cappedAmount, inPrinciple, failReasons, fullyKnown: true
   };
   render();
 }
@@ -8896,6 +8993,8 @@ async function handleSaveProduct(){
     autoSanctionEnabled: isSuperAdmin ? autoSanctionEnabled : undefined,
     dsaCommissionPct: dsaCommissionPct,
     requiredDocuments: document.getElementById("pf-required-docs").value.split("\n").map(s=>s.trim()).filter(Boolean),
+    minMonthlyIncome: Number(document.getElementById("pf-min-income").value)||0,
+    maxFoirPct: Number(document.getElementById("pf-max-foir").value)||60,
     createdAt: nowISO()
   };
   if(existingId && !isSuperAdmin){
