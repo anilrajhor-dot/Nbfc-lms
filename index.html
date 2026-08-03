@@ -2462,6 +2462,8 @@ async function renderStaffShell(){
     tabContent = await renderNbfcProfileTab();
   } else if(tab === "datamgmt" && u.role==="Super Admin"){
     tabContent = await renderDataManagementTab();
+  } else if(tab === "healthcheck" && u.role==="Super Admin"){
+    tabContent = await renderHealthCheckTab();
   } else if(tab === "help"){
     tabContent = renderStaffHelpTab();
   } else if(tab === "products" && canManagePolicy){
@@ -2561,6 +2563,7 @@ async function renderStaffShell(){
         ${u.role==="Super Admin" ? `<button class="tab ${tab==='apiconfig'?'active':''}" data-tab="apiconfig">Integrations</button>`:""}
         ${u.role==="Super Admin" ? `<button class="tab ${tab==='nbfcprofile'?'active':''}" data-tab="nbfcprofile">NBFC Profile</button>`:""}
         ${u.role==="Super Admin" ? `<button class="tab ${tab==='datamgmt'?'active':''}" data-tab="datamgmt">Data Management</button>`:""}
+        ${u.role==="Super Admin" ? `<button class="tab ${tab==='healthcheck'?'active':''}" data-tab="healthcheck">Health Check</button>`:""}
         <button class="tab ${tab==='audit'?'active':''}" data-tab="audit">Audit Trail</button>
         ` : ""}
       </div>
@@ -5535,6 +5538,117 @@ async function renderJournalVoucherSection(){
   `;
 }
 
+/** System Health Check — Super Admin, on-demand. Checks the kinds of
+ *  things that can silently go wrong in an app tracking money in more
+ *  than one place: Funds vs General Ledger drift, Trial Balance status,
+ *  and orphaned records (a payment pointing at a loan account that no
+ *  longer exists, etc.). Deliberately on-demand rather than run on
+ *  every page load, since it reads most of the database. */
+async function computeHealthCheck(){
+  const [fundAccounts, glBalances, customers, loanAccounts, payments, sanctions, disbursements, appraisals, leads] = await Promise.all([
+    db.getAll("fundAccounts"), computeAllLedgerBalances(), db.getAll("customers"), db.getAll("loanAccounts"),
+    db.getAll("payments"), db.getAll("sanctions"), db.getAll("disbursements"), db.getAll("appraisals"), db.getAll("leads")
+  ]);
+
+  // 1. Funds vs GL — the two systems should never drift on Cash/Bank,
+  // since every real cash movement should post to both.
+  const fundCashBank = fundAccounts.filter(a=>a.type==="Cash"||a.type==="Bank Account").reduce((s,a)=>s+a.balance,0);
+  const glCash = glBalances.find(b=>b.account.name==="Cash in Hand");
+  const glBank = glBalances.find(b=>b.account.name==="Bank Account — Operating");
+  const glCashBank = (glCash?glCash.balance:0) + (glBank?glBank.balance:0);
+  const fundsGlDrift = Math.round(fundCashBank - glCashBank);
+
+  // 2. Trial Balance status
+  let totalDr = 0, totalCr = 0;
+  glBalances.forEach(b=>{
+    const showAsDr = b.account.normalBalance==="Debit" ? b.balance>=0 : b.balance<0;
+    if(showAsDr) totalDr += Math.abs(b.balance); else totalCr += Math.abs(b.balance);
+  });
+  const trialBalanced = Math.abs(totalDr-totalCr) < 1;
+
+  // 3. Orphaned records — referential integrity
+  const custIds = new Set(customers.map(c=>c.id));
+  const loanIds = new Set(loanAccounts.map(a=>a.id));
+  const sanctionIds = new Set(sanctions.map(s=>s.id));
+  const orphans = [];
+  loanAccounts.forEach(a=>{ if(!custIds.has(a.customerId)) orphans.push(`Loan account ${a.accountNumber||a.id} references a missing customer`); });
+  payments.forEach(p=>{
+    if(!loanIds.has(p.loanAccountId)) orphans.push(`Payment ${p.id} references a missing loan account`);
+    if(!custIds.has(p.customerId)) orphans.push(`Payment ${p.id} references a missing customer`);
+  });
+  sanctions.forEach(s=>{ if(!custIds.has(s.customerId)) orphans.push(`Sanction ${s.id} references a missing customer`); });
+  disbursements.forEach(d=>{ if(!sanctionIds.has(d.sanctionId)) orphans.push(`Disbursement ${d.id} references a missing sanction`); });
+  appraisals.forEach(a=>{ if(!custIds.has(a.customerId)) orphans.push(`Appraisal ${a.id} references a missing customer`); });
+
+  // 4. Snapshot
+  const activeLoanAccounts = loanAccounts.filter(a=>a.status==="Active");
+  const pendingApprovals = sanctions.filter(s=>s.status==="Pending Approval").length
+    + (await db.getAll("journalEntries")).filter(j=>j.status==="Pending Approval").length
+    + (await db.getAll("journalVouchers")).filter(v=>v.status==="Pending Approval").length;
+
+  return {
+    fundCashBank, glCashBank, fundsGlDrift,
+    totalDr, totalCr, trialBalanced,
+    orphans,
+    snapshot: {
+      customers: customers.length, activeLoans: activeLoanAccounts.length,
+      portfolioOutstanding: activeLoanAccounts.reduce((s,a)=>s+a.principalOutstanding,0),
+      openLeads: leads.filter(l=>!["Rejected","Converted into Loan Application"].includes(l.status)).length,
+      pendingApprovals
+    }
+  };
+}
+
+async function renderHealthCheckTab(){
+  if(!session.healthCheckResult){
+    return `
+      <div class="card">
+        <h2>System Health Check</h2>
+        <p class="sub">Checks for the kinds of things that can silently go wrong: Funds vs General Ledger drift, Trial Balance status, and orphaned records (a payment pointing at a loan account that no longer exists, that sort of thing). Reads most of the database, so it's run on demand rather than on every page load.</p>
+        <button class="btn btn-gold" id="btn-run-health-check">Run Health Check</button>
+      </div>
+    `;
+  }
+  const h = session.healthCheckResult;
+  const driftOk = Math.abs(h.fundsGlDrift) < 1;
+  return `
+    <div class="card">
+      <div class="flex-between">
+        <h2>System Health Check</h2>
+        <button class="btn btn-outline btn-sm" id="btn-run-health-check">Re-run</button>
+      </div>
+      <p class="sub">Last run: ${fmtDate(nowISO())}</p>
+      <div class="grid grid-3">
+        <div class="kpi" style="border-top-color:${driftOk?'var(--ok)':'var(--danger)'};">
+          <div class="lbl">Funds vs GL (Cash + Bank)</div>
+          <div class="val" style="font-size:16px; color:${driftOk?'inherit':'var(--danger)'};">${driftOk ? '✓ Matches' : `⚠ Off by ${fmtINR(Math.abs(h.fundsGlDrift))}`}</div>
+        </div>
+        <div class="kpi" style="border-top-color:${h.trialBalanced?'var(--ok)':'var(--danger)'};">
+          <div class="lbl">GL Trial Balance</div>
+          <div class="val" style="font-size:16px; color:${h.trialBalanced?'inherit':'var(--danger)'};">${h.trialBalanced ? '✓ Balanced' : '⚠ Not Balanced'}</div>
+        </div>
+        <div class="kpi" style="border-top-color:${h.orphans.length===0?'var(--ok)':'var(--danger)'};">
+          <div class="lbl">Orphaned Records</div>
+          <div class="val" style="font-size:16px; color:${h.orphans.length===0?'inherit':'var(--danger)'};">${h.orphans.length===0 ? '✓ None Found' : `⚠ ${h.orphans.length} Found`}</div>
+        </div>
+      </div>
+      ${h.orphans.length>0 ? `
+      <h3 class="section-h">Orphaned Records</h3>
+      <ul>${h.orphans.map(o=>`<li class="small">${esc(o)}</li>`).join("")}</ul>
+      <p class="small muted">These didn't come from the auto-posting/save paths — they'd only happen from a manual data edit, restore, or an interrupted operation. Worth investigating each one directly rather than deleting blind.</p>
+      ` : ""}
+      <h3 class="section-h">Snapshot</h3>
+      <div class="grid grid-4">
+        <div class="kpi"><div class="lbl">Customers</div><div class="val" style="font-size:18px;">${h.snapshot.customers}</div></div>
+        <div class="kpi"><div class="lbl">Active Loans</div><div class="val" style="font-size:18px;">${h.snapshot.activeLoans}</div></div>
+        <div class="kpi"><div class="lbl">Portfolio Outstanding</div><div class="val" style="font-size:18px;">${fmtINR(Math.round(h.snapshot.portfolioOutstanding))}</div></div>
+        <div class="kpi"><div class="lbl">Open Leads</div><div class="val" style="font-size:18px;">${h.snapshot.openLeads}</div></div>
+        <div class="kpi"><div class="lbl">Pending Approvals</div><div class="val" style="font-size:18px;">${h.snapshot.pendingApprovals}</div></div>
+      </div>
+    </div>
+  `;
+}
+
 async function renderGeneralLedgerTab(){
   await ensureChartOfAccountsSeeded();
   const sub = session.glSubTab || "voucher";
@@ -6456,6 +6570,7 @@ const REPORT_DEFS = [
   {id:"fund-liquidity", label:"Fund Position / Liquidity Report"},
   {id:"vintage-analysis", label:"Vintage Analysis (by Disbursement Month)"},
   {id:"dpd-migration", label:"DPD Migration (Month-on-Month)"},
+  {id:"dro-statement", label:"Demand — Recovery — Overdue (DRO) Statement"},
 ];
 
 async function buildReport(reportId){
@@ -6632,6 +6747,41 @@ async function buildReport(reportId){
     });
     return { headers:[`${prevMonth} → ${currMonth}`,"Accounts"], rows: Object.entries(matrix).sort((a,b)=>b[1]-a[1]) };
   }
+  if(reportId==="dro-statement"){
+    const reportDate = session.droReportDate || todayStr();
+    // Cumulative from inception — every installment (any account, active
+    // or closed) that fell due on or before the report date, regardless
+    // of when it was actually paid. Recovery = what's actually been
+    // paid against those SAME installments as of today, even if paid
+    // late — this naturally captures all pending demand without
+    // needing a start date, since anything still unpaid from any
+    // earlier period keeps showing up as overdue until it's cleared.
+    const byProduct = {};
+    let totalDemand = 0, totalRecovery = 0;
+    loanAccounts.forEach(acc=>{
+      (acc.schedule||[]).forEach(inst=>{
+        if(inst.dueDate > reportDate) return;
+        byProduct[acc.product] = byProduct[acc.product] || {demand:0, recovery:0};
+        byProduct[acc.product].demand += inst.emiAmount;
+        byProduct[acc.product].recovery += Math.min(inst.paidAmount||0, inst.emiAmount);
+        totalDemand += inst.emiAmount;
+        totalRecovery += Math.min(inst.paidAmount||0, inst.emiAmount);
+      });
+    });
+    const totalOverdue = totalDemand - totalRecovery;
+    const recoveryPct = totalDemand>0 ? (totalRecovery/totalDemand*100) : 0;
+    const rows = [
+      ["Demand (₹)", fmtINR(Math.round(totalDemand))],
+      ["Recovery (₹)", fmtINR(Math.round(totalRecovery))],
+      ["Overdue (₹)", fmtINR(Math.round(totalOverdue))],
+      ["Recovery %", recoveryPct.toFixed(2)+"%"],
+      ["— By Product —", ""],
+      ...Object.entries(byProduct).map(([name,d])=>[
+        name, `Demand ${fmtINR(Math.round(d.demand))} · Recovery ${fmtINR(Math.round(d.recovery))} · ${d.demand>0?((d.recovery/d.demand*100).toFixed(1)):'0'}%`
+      ])
+    ];
+    return { headers:[`As of ${reportDate} (cumulative from inception)`,"Value"], rows };
+  }
   return { headers:[], rows:[] };
 }
 
@@ -6648,7 +6798,11 @@ async function renderReportsTab(){
         </div>
         ${selected==="daily-mis" ? `<div class="field" style="max-width:200px;"><label>Date</label><input id="report-date" type="date" value="${session.reportDate||todayStr()}"></div>` : ""}
         ${selected==="monthly-mis" ? `<div class="field" style="max-width:200px;"><label>Month</label><input id="report-month" type="month" value="${session.reportMonth||todayStr().slice(0,7)}"></div>` : ""}
+        ${selected==="dro-statement" ? `
+        <div class="field" style="max-width:200px;"><label>Report date</label><input id="report-dro-date" type="date" value="${session.droReportDate||todayStr()}"></div>
+        ` : ""}
       </div>
+      ${selected==="dro-statement" ? `<p class="small muted">Demand = every EMI that's fallen due from inception up to this date, across every account — no start date needed, since anything still unpaid keeps showing until it's cleared. Recovery = what's actually been paid against those same installments as of today, even if paid late.</p>` : ""}
       ${selected==="dpd-migration" ? `<button class="btn btn-gold btn-sm" id="btn-capture-dpd-snapshot" style="margin-top:8px;">Capture This Month's Snapshot</button><p class="small muted" style="margin-top:6px;">Freezes every active account's current DPD classification for this month, so next month's capture can show what actually moved. Safe to run again this month — it just updates this month's snapshot rather than duplicating it. Needs at least 2 different months captured before migration shows anything.</p>` : ""}
     </div>
     <div class="card">
@@ -8397,6 +8551,8 @@ function bindEvents(){
   const postDepreciationBtn = document.getElementById("btn-post-depreciation");
   if(postDepreciationBtn) postDepreciationBtn.onclick = handlePostDepreciation;
   const postNpaProvisioningBtn = document.getElementById("btn-post-npa-provisioning");
+  const runHealthCheckBtn = document.getElementById("btn-run-health-check");
+  if(runHealthCheckBtn) runHealthCheckBtn.onclick = handleRunHealthCheck;
   if(postNpaProvisioningBtn) postNpaProvisioningBtn.onclick = handlePostNpaProvisioning;
 
   // Bank Reconciliation
@@ -8539,6 +8695,8 @@ function bindEvents(){
   if(reportDateInput) reportDateInput.onchange = ()=>{ session.reportDate = reportDateInput.value; render(); };
   const reportMonthInput = document.getElementById("report-month");
   if(reportMonthInput) reportMonthInput.onchange = ()=>{ session.reportMonth = reportMonthInput.value; render(); };
+  const reportDroDateInput = document.getElementById("report-dro-date");
+  if(reportDroDateInput) reportDroDateInput.onchange = ()=>{ session.droReportDate = reportDroDateInput.value; render(); };
   const exportReportBtn = document.getElementById("btn-export-report");
   if(exportReportBtn) exportReportBtn.onclick = handleExportReport;
   const captureDpdSnapshotBtn = document.getElementById("btn-capture-dpd-snapshot");
@@ -9120,6 +9278,14 @@ async function attemptAutoSanction(lead, customer, appraisal){
     await db.put("disbursements", disbursement);
     fundAccount.balance -= sanction.sanctionedAmount;
     await db.put("fundAccounts", fundAccount);
+    await postToGeneralLedger({
+      date: todayStr(), voucherType: "Payment Voucher", narration: `Auto-Disbursement — ${sanction.product} — ${loanAccount.accountNumber}`,
+      lineDefs: [
+        { accountName: "Loan Portfolio — Principal Outstanding", side: "debit", amount: sanction.sanctionedAmount },
+        { accountName: glAccountForMode("Bank"), side: "credit", amount: sanction.sanctionedAmount },
+      ],
+      actor: "System (Rule Engine)", actorRole: "System"
+    });
     sanction.disbursementId = disbursement.id;
     sanction.loanAccountId = loanAccount.id;
     await db.put("sanctions", sanction);
@@ -9909,6 +10075,12 @@ async function handleSaveFixedAsset(){
   render();
 }
 
+async function handleRunHealthCheck(){
+  toast("Running…");
+  session.healthCheckResult = await computeHealthCheck();
+  render();
+}
+
 async function handlePostNpaProvisioning(){
   const u = session.user;
   const acct = await computeAccountingSummary();
@@ -10130,6 +10302,14 @@ async function handleRunPayroll(){
     fundAccount.balance -= s.netSalary;
     totalPaid += s.netSalary;
     if(paid) paidCount++; else manualCount++;
+    await postToGeneralLedger({
+      date: todayStr(), voucherType: "Payment Voucher", narration: `Salary — ${s.staffName} — ${month}`,
+      lineDefs: [
+        { accountName: "Salaries & Staff Costs", side: "debit", amount: s.netSalary },
+        { accountName: glAccountForMode("Bank"), side: "credit", amount: s.netSalary },
+      ],
+      actor: u.name, actorRole: u.role
+    });
   }
   await db.put("fundAccounts", fundAccount);
   await logAudit(u.name, u.role, "Payroll Run", `${month} — ${salaries.length} staff — ${fmtINR(totalPaid)} total — ${paidCount} auto-paid, ${manualCount} need manual transfer`);
@@ -11932,7 +12112,18 @@ async function handleLoadDemoData(){
       createdAt: nowISO(), createdBy: u.name
     };
     await db.put("disbursements", disbursement3);
-    if(fundAccount){ fundAccount.balance -= sanction3.sanctionedAmount; await db.put("fundAccounts", fundAccount); }
+    if(fundAccount){
+      fundAccount.balance -= sanction3.sanctionedAmount;
+      await db.put("fundAccounts", fundAccount);
+      await postToGeneralLedger({
+        date: todayStr(), voucherType: "Payment Voucher", narration: `Disbursement — ${sanction3.product} — ${loanAccount3.accountNumber}`,
+        lineDefs: [
+          { accountName: "Loan Portfolio — Principal Outstanding", side: "debit", amount: sanction3.sanctionedAmount },
+          { accountName: glAccountForMode("Bank"), side: "credit", amount: sanction3.sanctionedAmount },
+        ],
+        actor: u.name, actorRole: u.role
+      });
+    }
 
     sanction3.disbursementId = disbursement3.id;
     sanction3.loanAccountId = loanAccount3.id;
