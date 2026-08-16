@@ -2485,6 +2485,8 @@ async function renderStaffShell(){
     tabContent = await renderDataManagementTab();
   } else if(tab === "healthcheck" && u.role==="Super Admin"){
     tabContent = await renderHealthCheckTab();
+  } else if(tab === "storage" && u.role==="Super Admin"){
+    tabContent = await renderStorageTab();
   } else if(tab === "help"){
     tabContent = renderStaffHelpTab();
   } else if(tab === "products" && canManagePolicy){
@@ -2585,6 +2587,7 @@ async function renderStaffShell(){
         ${u.role==="Super Admin" ? `<button class="tab ${tab==='nbfcprofile'?'active':''}" data-tab="nbfcprofile">NBFC Profile</button>`:""}
         ${u.role==="Super Admin" ? `<button class="tab ${tab==='datamgmt'?'active':''}" data-tab="datamgmt">Data Management</button>`:""}
         ${u.role==="Super Admin" ? `<button class="tab ${tab==='healthcheck'?'active':''}" data-tab="healthcheck">Health Check</button>`:""}
+        ${u.role==="Super Admin" ? `<button class="tab ${tab==='storage'?'active':''}" data-tab="storage">Storage</button>`:""}
         <button class="tab ${tab==='audit'?'active':''}" data-tab="audit">Audit Trail</button>
         ` : ""}
       </div>
@@ -5594,6 +5597,75 @@ async function renderJournalVoucherSection(){
  *  and orphaned records (a payment pointing at a loan account that no
  *  longer exists, etc.). Deliberately on-demand rather than run on
  *  every page load, since it reads most of the database. */
+/** Storage usage — this app has no separate file-storage product
+ *  connected (see the Document Vault's own note about that); every
+ *  document, including base64-encoded photos and uploaded files, lives
+ *  directly inside Firestore documents. So "storage" here genuinely
+ *  means Firestore's own storage, measured by summing the actual byte
+ *  size of every document across every collection — not an estimate,
+ *  a real measurement via each document's serialized size. */
+async function computeStorageUsage(){
+  const perCollection = [];
+  let totalBytes = 0;
+  for(const collectionName of ALL_COLLECTIONS){
+    const records = await db.getAll(collectionName);
+    let bytes = 0;
+    records.forEach(r=>{ bytes += new Blob([JSON.stringify(r)]).size; });
+    if(records.length>0){ perCollection.push({ name: collectionName, count: records.length, bytes }); totalBytes += bytes; }
+  }
+  perCollection.sort((a,b)=>b.bytes-a.bytes);
+  return { perCollection, totalBytes };
+}
+function fmtBytes(bytes){
+  if(bytes < 1024) return bytes+" B";
+  if(bytes < 1024*1024) return (bytes/1024).toFixed(1)+" KB";
+  return (bytes/(1024*1024)).toFixed(2)+" MB";
+}
+
+async function renderStorageTab(){
+  if(!session.storageUsageResult){
+    return `
+      <div class="card">
+        <h2>Storage</h2>
+        <p class="sub">This app has no separate file-storage product connected — every record, including uploaded documents and photos, lives directly inside Firestore. This measures actual Firestore storage by reading every collection and summing real document sizes, so it's run on demand rather than automatically.</p>
+        <button class="btn btn-gold" id="btn-calculate-storage">Calculate Storage Usage</button>
+      </div>
+    `;
+  }
+  const s = session.storageUsageResult;
+  // Firestore's free (Spark) tier includes 1 GiB of storage — the one
+  // genuinely fixed reference point available. On the paid (Blaze)
+  // plan there's no hard ceiling at all, just cost that scales with
+  // usage — stated plainly rather than implying a cap that may not
+  // actually apply to this project.
+  const sparkLimitBytes = 1024*1024*1024;
+  const pctOfSparkLimit = (s.totalBytes/sparkLimitBytes)*100;
+  return `
+    <div class="card">
+      <div class="flex-between">
+        <h2>Storage</h2>
+        <button class="btn btn-outline btn-sm" id="btn-calculate-storage">Recalculate</button>
+      </div>
+      <p class="sub">Every record, including uploaded documents and photos, lives directly inside Firestore — there's no separate file-storage product connected. This is a real measurement, not an estimate.</p>
+      <div class="grid grid-2">
+        <div class="kpi"><div class="lbl">Total Used</div><div class="val" style="font-size:22px;">${fmtBytes(s.totalBytes)}</div></div>
+        <div class="kpi"><div class="lbl">Total Documents</div><div class="val" style="font-size:22px;">${s.perCollection.reduce((sum,c)=>sum+c.count,0)}</div></div>
+      </div>
+      <div class="warn-banner" style="background:#FBF1DC;border-color:var(--gold);color:#5C4200; margin-top:14px;">
+        ⚠ Firestore doesn't have a single fixed "disk size" the way a phone does, so "unused" isn't quite the right frame here. The one real reference point: Firestore's <b>free (Spark) plan includes 1 GiB total</b> — you're using approximately <b>${pctOfSparkLimit.toFixed(2)}%</b> of that if you're still on it. If you've since moved to the paid (Blaze) plan, there's no fixed ceiling at all — storage simply costs a small amount per GB used beyond its own free allowance, so "how much is left" isn't really a meaningful question on that plan.
+      </div>
+      <h3 class="section-h">By Collection (largest first)</h3>
+      <table>
+        <thead><tr><th>Collection</th><th>Documents</th><th>Size</th><th>% of Total</th></tr></thead>
+        <tbody>
+        ${s.perCollection.map(c=>`<tr><td>${esc(c.name)}</td><td>${c.count}</td><td>${fmtBytes(c.bytes)}</td><td>${s.totalBytes>0?((c.bytes/s.totalBytes)*100).toFixed(1):'0'}%</td></tr>`).join("")}
+        </tbody>
+      </table>
+      <p class="small muted" style="margin-top:8px;">Documents, KYC photos, and appraisal/recovery-visit photos (all stored as embedded data, not links) are typically the largest contributors — worth checking the Document Vault's own storage note if one particular collection looks unexpectedly large.</p>
+    </div>
+  `;
+}
+
 async function computeHealthCheck(){
   const [fundAccounts, glBalances, customers, loanAccounts, payments, sanctions, disbursements, appraisals, leads,
     journalEntries, journalVouchers, fixedAssets] = await Promise.all([
@@ -8711,6 +8783,8 @@ function bindEvents(){
   const postNpaProvisioningBtn = document.getElementById("btn-post-npa-provisioning");
   const runHealthCheckBtn = document.getElementById("btn-run-health-check");
   if(runHealthCheckBtn) runHealthCheckBtn.onclick = handleRunHealthCheck;
+  const calculateStorageBtn = document.getElementById("btn-calculate-storage");
+  if(calculateStorageBtn) calculateStorageBtn.onclick = handleCalculateStorage;
   if(postNpaProvisioningBtn) postNpaProvisioningBtn.onclick = handlePostNpaProvisioning;
 
   // Bank Reconciliation
@@ -10263,6 +10337,12 @@ async function handleSaveFixedAsset(){
   });
   await logAudit(u.name, u.role, "Fixed Asset Added", `${assetName} — ${fmtINR(cost)}`);
   toast("Asset added.");
+  render();
+}
+
+async function handleCalculateStorage(){
+  toast("Calculating — reading every collection…");
+  session.storageUsageResult = await computeStorageUsage();
   render();
 }
 
